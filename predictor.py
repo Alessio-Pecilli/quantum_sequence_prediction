@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 
 import config
+from embedding import ComplexEmbedding
 
 
 class QuantumFidelityLoss(nn.Module):
@@ -67,7 +68,7 @@ class QuantumStatePredictor(nn.Module):
         amplitudes = torch.sqrt(torch.softmax(amplitudes_raw, dim=-1))
         
         # Fasi: mappate in [-pi, pi] per stabilità
-        phases = torch.tanh(phases_raw) * torch.pi
+        phases = torch.sigmoid(phases_raw) * 2 * torch.pi
         
         # --- STATO COMPLESSO FINALE ---
         # Costruzione a * e^(i * phi)
