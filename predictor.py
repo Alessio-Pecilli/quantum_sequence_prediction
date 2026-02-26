@@ -29,38 +29,37 @@ class QuantumFidelityLoss(nn.Module):
 
 
 class QuantumStatePredictor(nn.Module):
-    def __init__(self, d=config.D_MODEL, num_heads=config.NUM_HEADS, num_layers=config.NUM_LAYERS):
+    def __init__(self, dim_2n=config.DIM_2N, d=config.D_MODEL, num_heads=config.NUM_HEADS, num_layers=config.NUM_LAYERS):
         super().__init__()
         self.d = d
         
         # ------------------------------------------
-        # TODO: Modulo di Embedding (Word + Positional)
-        # Qui implementerai la proiezione dal tuo vettore
-        # di 2^n elementi allo spazio d-dimensionale.
+        # 1. Modulo di Embedding (Da Complesso a Reale latente d)
         # ------------------------------------------
+        self.embedding = ComplexEmbedding(dim_2n=dim_2n, d_model=d)
         
-        # Core: Transformer Encoder (batch_first=True per shape [batch, seq, features])
+        # 2. Core: Transformer Encoder
         encoder_layer = nn.TransformerEncoderLayer(d_model=d, nhead=num_heads, batch_first=True)
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
-        # Output Head: Proietta da d a 2d (d ampiezze + d fasi)
+        # 3. Output Head: Proietta da d a 2d (d ampiezze + d fasi)
         self.output_head = nn.Linear(d, 2 * d)
 
-    def forward(self, x):
+    def forward(self, x_complex):
         """
-        x: Input tensor di shape (batch_size, seq_len, d)
+        x_complex: Input tensor di shape (batch_size, seq_len, dim_2n) (DEVE essere torch.complex64 o complex128)
         Ritorna: Tensore complesso di shape (batch_size, seq_len, d)
         """
-        # TODO: h = self.embedding_module(x_original)
-        h = x # Per ora l'input è già considerato nello spazio d
+        # A. Elaborazione iniziale: trasformiamo il tensore complesso in un embedding reale d-dimensionale
+        h = self.embedding(x_complex)
         
-        # Passaggio nel Transformer
+        # B. Passaggio nel Transformer
         out = self.transformer(h)
         
-        # Estrazione raw features (dimensione 2d)
+        # C. Estrazione raw features (dimensione 2d)
         out_raw = self.output_head(out)
         
-        # Split a metà lungo l'ultima dimensione
+        # D. Split a metà lungo l'ultima dimensione
         amplitudes_raw, phases_raw = torch.chunk(out_raw, chunks=2, dim=-1)
         
         # --- VINCOLI FISICI ---
