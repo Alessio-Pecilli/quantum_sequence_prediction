@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import config
 
+
 class ComplexEmbedding(nn.Module):
     """
     Traduce uno stato quantistico complesso in un vettore reale latente.
