@@ -112,8 +112,12 @@ class QuantumStatePredictor(nn.Module):
         causal_mask = nn.Transformer.generate_square_subsequent_mask(config.SEQ_LEN)
         self.register_buffer("causal_mask", causal_mask)
         
-        # 3. Output Head: Proietta da d a 2*dim_2n (dim_2n reale + dim_2n immaginario)
-        self.output_head = nn.Linear(d, 2 * dim_2n)
+        # 3. Output Head: MLP 2-layer per decompressione graduale d → 2*dim_2n
+        self.output_head = nn.Sequential(
+            nn.Linear(d, d * 2),
+            nn.GELU(),
+            nn.Linear(d * 2, 2 * dim_2n),
+        )
 
     def forward(self, x_complex):
         """

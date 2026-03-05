@@ -6,13 +6,18 @@ import config
 class ComplexEmbedding(nn.Module):
     """
     Traduce uno stato quantistico complesso in un vettore reale latente.
-    Estrae ampiezze e fasi, le concatena e applica una proiezione lineare.
+    Usa un MLP a 2 layer per preservare più informazione nella compressione
+    da 2*dim_2n a d_model (critico per spazi di Hilbert grandi, es. 10 qubit).
     """
     def __init__(self, dim_2n=config.DIM_2N, d_model=config.D_MODEL):
         super().__init__()
-        # In ingresso abbiamo (ampiezze + fasi) concatenate lungo l'ultima dimensione,
-        # quindi il layer lineare deve accettare il doppio delle feature (dim_2n * 2)
-        self.projection = nn.Linear(dim_2n * 2, d_model)
+        input_dim = dim_2n * 2
+        hidden_dim = d_model * 2  # dim intermedia per compressione graduale
+        self.projection = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, d_model),
+        )
 
     def forward(self, x_complex):
         """

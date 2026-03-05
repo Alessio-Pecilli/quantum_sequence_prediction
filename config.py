@@ -1,11 +1,11 @@
 # ===== Configurazione Modello =====
 
 # Dimensione dello spazio di embedding (2^n per n qubit)
-# Per 10 qubit (2048 feature reali) → 320 riduce la compressione a ~6.4:1
-D_MODEL = 320
+# Per 10 qubit (2048 feature reali) → 512 riduce la compressione a ~4:1
+D_MODEL = 512
 
 # Numero di teste di attenzione nel Transformer
-# 320 / 8 = 40 dim per testa (cattura pattern temporali diversi)
+# 512 / 8 = 64 dim per testa (cattura pattern temporali diversi)
 NUM_HEADS = 8
 
 # Numero di layer del Transformer Encoder
@@ -14,7 +14,7 @@ NUM_LAYERS = 6
 
 # Dimensione hidden del Feed-Forward Network nel Transformer
 # Rapporto standard 4× d_model (Vaswani et al.)
-DIM_FEEDFORWARD = 1280
+DIM_FEEDFORWARD = 2048
 
 # Dropout nel Transformer (regolarizzazione)
 # Ridotto: il modello era in underfitting (gap train-test piccolo, fidelity bassa)
@@ -70,8 +70,8 @@ EPOCHS = 200
 # ===== Configurazione Ottimizzatore =====
 
 # Learning rate iniziale (peak dopo warmup)
-# Aumentato: il modello era in underfitting, serve piu' spinta
-LEARNING_RATE = 8e-4
+# Alto per compensare gradienti deboli della fidelity loss in dim=1024
+LEARNING_RATE = 2e-3
 
 # Weight decay per AdamW (regolarizzazione L2)
 # Ridotto: meno regolarizzazione per contrastare l'underfitting
@@ -83,8 +83,8 @@ GRAD_CLIP_MAX_NORM = 1.0
 # ===== Configurazione Learning Rate Scheduler =====
 
 # Warmup: numero di epoche con rampa lineare da 0 → LEARNING_RATE
-# 5 ep. per avviare rapidamente l'apprendimento
-LR_WARMUP_EPOCHS = 5
+# 10 ep. con LR alto per stabilizzare l'inizio
+LR_WARMUP_EPOCHS = 10
 
 # Tipo di scheduler dopo il warmup:
 #   "cosine"            → Cosine Annealing fino a LR_MIN
@@ -136,7 +136,7 @@ CHECKPOINT_EVERY_N_EPOCHS = 0
 #   - Se i parametri salvati sono compatibili (stessa architettura) → riprende
 #   - Se NON sono compatibili (es. d_model diverso, n_qubits diverso) → parte da zero
 # Se False, parte SEMPRE da zero ignorando qualsiasi checkpoint esistente.
-RESUME_TRAINING = True
+RESUME_TRAINING = False
 
 # Path del checkpoint di fallback (salvato automaticamente a ogni epoca)
 LAST_CHECKPOINT_PATH = "results/last_checkpoint.pt"
