@@ -2,19 +2,19 @@
 
 # Dimensione dello spazio di embedding (2^n per n qubit)
 # Per 10 qubit (2048 feature reali) → 320 riduce la compressione a ~6.4:1
-D_MODEL = 128
+D_MODEL = 320
 
 # Numero di teste di attenzione nel Transformer
 # 320 / 8 = 40 dim per testa (cattura pattern temporali diversi)
-NUM_HEADS = 4
+NUM_HEADS = 8
 
 # Numero di layer del Transformer Encoder
 # 6 layer per dinamiche quantistiche complesse con residual connections
-NUM_LAYERS = 4
+NUM_LAYERS = 6
 
 # Dimensione hidden del Feed-Forward Network nel Transformer
 # Rapporto standard 4× d_model (Vaswani et al.)
-DIM_FEEDFORWARD = 512
+DIM_FEEDFORWARD = 1280
 
 # Dropout nel Transformer (regolarizzazione)
 # Ridotto: il modello era in underfitting (gap train-test piccolo, fidelity bassa)
@@ -23,7 +23,7 @@ DROPOUT = 0.05
 # ===== Configurazione Sistema Quantistico =====
 
 # Numero di qubit del sistema
-N_QUBITS = 6
+N_QUBITS = 10
 
 # Dimensione dello spazio di Hilbert (2^n)
 DIM_2N = 2 ** N_QUBITS
@@ -162,7 +162,7 @@ MEMORY_SAFE_MODE = True
 
 # Micro-batch reale processato dal modello per volta.
 # 0 = usa direttamente BATCH_SIZE senza split.
-MICRO_BATCH_SIZE = 8
+MICRO_BATCH_SIZE = 4
 
 # Cleanup periodico Python GC durante train/eval (step).
 # 0 = disabilitato.
