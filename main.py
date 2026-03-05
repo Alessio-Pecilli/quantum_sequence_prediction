@@ -1,6 +1,7 @@
 import math
 import time
 import os
+import gc
 
 import torch
 import numpy as np
@@ -38,7 +39,10 @@ print(f"  Early stopping:  {'ON' if config.EARLY_STOPPING_ENABLED else 'OFF'} (p
 print(f"  EMA:             {'ON' if config.EMA_ENABLED else 'OFF'} (decay={config.EMA_DECAY})")
 print(f"  Grad clip:       {config.GRAD_CLIP_MAX_NORM},  weight decay: {config.WEIGHT_DECAY}")
 print(f"  torch.compile:   {'ON' if config.TORCH_COMPILE else 'OFF'}")
+print(f"  Resume:          {'ON' if config.RESUME_TRAINING else 'OFF'}")
 print(f"  Device:          {config.DEVICE}")
+micro_bs_print = config.MICRO_BATCH_SIZE if config.MICRO_BATCH_SIZE > 0 else config.BATCH_SIZE
+print(f"  Memory safe:     {'ON' if config.MEMORY_SAFE_MODE else 'OFF'} (micro-batch={micro_bs_print})")
 print("=" * 70)
 
 print("\n[1/6] Generando dataset...")
@@ -52,22 +56,25 @@ test_inputs, test_targets = generate_quantum_dynamics_dataset(
 gen_time = time.time() - t0
 print(f"  Train: {train_inputs.shape}  |  Test: {test_inputs.shape}  ({gen_time:.1f}s)")
 
-train_inputs = train_inputs.to(config.DEVICE)
-train_targets = train_targets.to(config.DEVICE)
-test_inputs = test_inputs.to(config.DEVICE)
-test_targets = test_targets.to(config.DEVICE)
+pin_memory = bool(config.PIN_MEMORY and config.DEVICE == "cuda")
+num_workers = 0 if config.MEMORY_SAFE_MODE else config.NUM_WORKERS
+loader_kwargs = dict(
+    batch_size=config.BATCH_SIZE,
+    num_workers=num_workers,
+    pin_memory=pin_memory,
+)
+if num_workers > 0:
+    loader_kwargs["persistent_workers"] = True
 
 train_loader = DataLoader(
     QuantumStateDataset(train_inputs, train_targets),
-    batch_size=config.BATCH_SIZE, shuffle=True,
-    num_workers=config.NUM_WORKERS,
-    persistent_workers=config.NUM_WORKERS > 0,
+    shuffle=True,
+    **loader_kwargs,
 )
 test_loader = DataLoader(
     QuantumStateDataset(test_inputs, test_targets),
-    batch_size=config.BATCH_SIZE, shuffle=False,
-    num_workers=config.NUM_WORKERS,
-    persistent_workers=config.NUM_WORKERS > 0,
+    shuffle=False,
+    **loader_kwargs,
 )
 
 
@@ -90,6 +97,24 @@ trainer = AdvancedTrainer(
 
 
 # ============================================================
+#  2b. RESUME DA CHECKPOINT (se abilitato)
+# ============================================================
+if config.RESUME_TRAINING:
+    print(f"\n  [RESUME] Verifico checkpoint in '{config.LAST_CHECKPOINT_PATH}'...")
+    compatible, msg, ckpt_data = AdvancedTrainer.check_checkpoint_compatibility(
+        config.LAST_CHECKPOINT_PATH
+    )
+    if compatible and ckpt_data is not None:
+        print(f"  [RESUME] {msg}")
+        trainer.resume_from_checkpoint(ckpt_data)
+    else:
+        print(f"  [RESUME] {msg}")
+        print(f"  [RESUME] Si parte da zero.")
+else:
+    print(f"\n  [RESUME] Disabilitato (RESUME_TRAINING=False). Training da zero.")
+
+
+# ============================================================
 #  3. TRAINING (con sistema avanzato)
 # ============================================================
 print(f"\n[3/6] Training avanzato (max {config.EPOCHS} epoche)...\n")
@@ -101,155 +126,79 @@ trainer.print_training_summary()
 
 
 # ============================================================
-#  4. VALUTAZIONE FINALE DETTAGLIATA SUL TEST SET
+#  4. VALUTAZIONE FINALE SUL TEST SET
 # ============================================================
-print(f"\n[4/6] Valutazione finale dettagliata sul Test Set...\n")
+print(f"\n[4/6] Valutazione finale sul Test Set...")
 
+model = trainer.model
 model.eval()
 
-all_fidelities = []        # fidelity per campione e step
-all_losses_per_sample = []  # loss per campione
-all_norms = []              # norma degli stati predetti
+non_blocking = pin_memory
+fid_sum_per_step = torch.zeros(config.SEQ_LEN, dtype=torch.float64)
+fid_sq_sum_per_step = torch.zeros(config.SEQ_LEN, dtype=torch.float64)
+fid_total_sum = 0.0
+total_samples = 0
+sample_fid_means = []
+max_plot_samples = max(1, int(config.MAX_FIDELITY_PLOT_SAMPLES))
+per_step_plot_values = [[] for _ in range(config.SEQ_LEN)]
 
 with torch.no_grad():
-    for x_batch, y_batch in test_loader:
-        pred = model(x_batch)
+    for step, (x_batch_cpu, y_batch_cpu) in enumerate(test_loader, start=1):
+        x_batch = x_batch_cpu.to(config.DEVICE, non_blocking=non_blocking)
+        y_batch = y_batch_cpu.to(config.DEVICE, non_blocking=non_blocking)
 
-        # Fidelity per campione e step: (batch, seq_len)
+        pred = model(x_batch)
         overlap = torch.sum(y_batch.conj() * pred, dim=-1)
         fid_per_step = torch.abs(overlap) ** 2
-        all_fidelities.append(fid_per_step.cpu())
+        fid_cpu = fid_per_step.cpu()
 
-        # Loss per campione: media sugli step
-        loss_per_sample = 1.0 - fid_per_step.mean(dim=-1)
-        all_losses_per_sample.append(loss_per_sample.cpu())
+        fid_sum_per_step += fid_cpu.sum(dim=0, dtype=torch.float64)
+        fid_sq_sum_per_step += (fid_cpu.double().pow(2)).sum(dim=0)
+        fid_total_sum += fid_cpu.sum().item()
+        total_samples += fid_cpu.shape[0]
 
-        # Norma stati predetti
-        norms = torch.norm(pred, dim=-1)
-        all_norms.append(norms.cpu())
+        if len(sample_fid_means) < max_plot_samples:
+            remaining = max_plot_samples - len(sample_fid_means)
+            sample_fid_means.extend(fid_cpu.mean(dim=-1).tolist()[:remaining])
 
-all_fidelities = torch.cat(all_fidelities, dim=0)          # (N_test, seq_len)
-all_losses_per_sample = torch.cat(all_losses_per_sample)    # (N_test,)
-all_norms = torch.cat(all_norms, dim=0)                     # (N_test, seq_len)
+        for t in range(config.SEQ_LEN):
+            if len(per_step_plot_values[t]) < max_plot_samples:
+                remaining = max_plot_samples - len(per_step_plot_values[t])
+                per_step_plot_values[t].extend(fid_cpu[:, t].tolist()[:remaining])
 
-# --- Metriche globali ---
-mean_fid = all_fidelities.mean().item()
-std_fid = all_fidelities.std().item()
-median_fid = all_fidelities.median().item()
-min_fid = all_fidelities.min().item()
-max_fid = all_fidelities.max().item()
-q25_fid = torch.quantile(all_fidelities.float(), 0.25).item()
-q75_fid = torch.quantile(all_fidelities.float(), 0.75).item()
+        del x_batch_cpu, y_batch_cpu, x_batch, y_batch, pred, overlap, fid_per_step, fid_cpu
 
-mean_loss = all_losses_per_sample.mean().item()
-std_loss = all_losses_per_sample.std().item()
+        if config.GC_COLLECT_EVERY_N_STEPS > 0 and step % config.GC_COLLECT_EVERY_N_STEPS == 0:
+            gc.collect()
 
-mean_norm = all_norms.mean().item()
-std_norm = all_norms.std().item()
+gc.collect()
 
-# Fidelity per step temporale
-fid_per_step_mean = all_fidelities.mean(dim=0)  # (seq_len,)
-fid_per_step_std = all_fidelities.std(dim=0)
+total_points = max(1, total_samples * config.SEQ_LEN)
+mean_fid = fid_total_sum / total_points
+mean_loss = 1.0 - mean_fid
+test_ppl = math.exp(mean_loss)
 
-# Percentuale campioni sopra soglie
-pct_above_90 = (all_fidelities.mean(dim=-1) > 0.90).float().mean().item() * 100
-pct_above_80 = (all_fidelities.mean(dim=-1) > 0.80).float().mean().item() * 100
-pct_above_50 = (all_fidelities.mean(dim=-1) > 0.50).float().mean().item() * 100
+print(f"  Loss: {mean_loss:.6f}  |  PPL: {test_ppl:.6f}")
 
-print(f"  {'-' * 50}")
-print(f"  METRICHE TEST SET ({len(all_losses_per_sample)} campioni)")
-print(f"  {'-' * 50}")
-print()
-print(f"  FIDELITY (quanto lo stato predetto somiglia al target)")
-print(f"    Media:     {mean_fid:.6f}")
-print(f"    Std:       {std_fid:.6f}")
-print(f"    Mediana:   {median_fid:.6f}")
-print(f"    Min:       {min_fid:.6f}")
-print(f"    Max:       {max_fid:.6f}")
-print(f"    Q25:       {q25_fid:.6f}")
-print(f"    Q75:       {q75_fid:.6f}")
-print()
-print(f"  LOSS (1 - Fidelity)")
-print(f"    Media:     {mean_loss:.6f}")
-print(f"    Std:       {std_loss:.6f}")
-print(f"    PPL:       {math.exp(mean_loss):.6f}")
-print()
-print(f"  NORMA STATI PREDETTI (deve essere ~ 1.0)")
-print(f"    Media:     {mean_norm:.6f}")
-print(f"    Std:       {std_norm:.6f}")
-print()
-print(f"  SOGLIE FIDELITY")
-print(f"    Campioni con Fid > 0.90:  {pct_above_90:5.1f}%")
-print(f"    Campioni con Fid > 0.80:  {pct_above_80:5.1f}%")
-print(f"    Campioni con Fid > 0.50:  {pct_above_50:5.1f}%")
-print()
-print(f"  FIDELITY PER STEP TEMPORALE")
-for t in range(config.SEQ_LEN):
-    bar = "#" * int(fid_per_step_mean[t].item() * 40)
-    print(f"    t={t:2d}:  {fid_per_step_mean[t].item():.4f} +/- {fid_per_step_std[t].item():.4f}  {bar}")
-
-# --- Confronto Train vs Test (generalization gap) ---
+# Dati per grafici
 actual_epochs = len(history["train_loss"])
-print()
-print(f"  {'-' * 50}")
-print(f"  GENERALIZATION GAP")
-print(f"  {'-' * 50}")
+den = max(1, total_samples)
+fid_per_step_mean = (fid_sum_per_step / den).float()
+fid_var_per_step = (fid_sq_sum_per_step / den) - fid_per_step_mean.double().pow(2)
+fid_per_step_std = torch.sqrt(torch.clamp(fid_var_per_step, min=0.0)).float()
+
 final_tr_loss = history["train_loss"][-1]
-final_tr_fid = history["train_fidelity"][-1]
 final_te_loss = history["test_loss"][-1]
+final_tr_fid = history["train_fidelity"][-1]
 final_te_fid = history["test_fidelity"][-1]
-gap_loss = final_te_loss - final_tr_loss
-gap_fid = final_tr_fid - final_te_fid
-
-print(f"    {'':18s} {'Loss':>10s} {'Fidelity':>10s} {'PPL':>10s}")
-print(f"    {'-' * 50}")
-print(f"    {'Train (finale)':18s} {final_tr_loss:10.4f} {final_tr_fid:10.4f} {math.exp(final_tr_loss):10.4f}")
-print(f"    {'Test  (finale)':18s} {final_te_loss:10.4f} {final_te_fid:10.4f} {math.exp(final_te_loss):10.4f}")
-print(f"    {'Gap':18s} {gap_loss:+10.4f} {-gap_fid:+10.4f} {math.exp(final_te_loss)-math.exp(final_tr_loss):+10.4f}")
-print()
-
-if gap_fid < 0.02:
-    verdict = "Eccellente generalizzazione (gap < 2%)"
-elif gap_fid < 0.05:
-    verdict = "Buona generalizzazione (gap < 5%)"
-elif gap_fid < 0.15:
-    verdict = "Gap moderato -- valutare regolarizzazione o piu' dati"
-else:
-    verdict = "Overfitting significativo -- il modello memorizza il training"
-print(f"    Verdetto: {verdict}")
-
-# --- Learning dynamics ---
-print()
-print(f"  {'-' * 50}")
-print(f"  DINAMICA DI APPRENDIMENTO")
-print(f"  {'-' * 50}")
-first_fid = history["train_fidelity"][0]
 best_test_fid = max(history["test_fidelity"])
 best_test_epoch = history["test_fidelity"].index(best_test_fid) + 1
-improvement = history["train_fidelity"][-1] - first_fid
-
-print(f"    Fidelity iniziale (epoca 1):       {first_fid:.4f}")
-print(f"    Fidelity finale (epoca {actual_epochs}):      {history['train_fidelity'][-1]:.4f}")
-print(f"    Miglioramento totale:              {improvement:+.4f}")
-print(f"    Miglior test fidelity:             {best_test_fid:.4f} (epoca {best_test_epoch})")
-print(f"    Tempo totale training:             {total_train_time:.1f}s")
-print(f"    Tempo medio per epoca:             {total_train_time / max(1, actual_epochs):.2f}s")
-
-# Convergenza: quante epoche per raggiungere 80% del miglioramento finale
-target_80 = first_fid + improvement * 0.8
-epoch_80 = None
-for i, f in enumerate(history["train_fidelity"]):
-    if f >= target_80:
-        epoch_80 = i + 1
-        break
-if epoch_80:
-    print(f"    Epoche per 80% miglioramento:      {epoch_80}")
 
 
 # ============================================================
 #  5. GRAFICI
 # ============================================================
-print(f"\n[5/6] Generando grafici in '{RESULTS_DIR}/'...")
+print(f"\n[5/6] Generando grafici...")
 
 epochs_range = range(1, actual_epochs + 1)
 
@@ -332,10 +281,11 @@ fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 fig.suptitle("Distribuzione Fidelity sul Test Set", fontsize=13, fontweight="bold")
 
 ax = axes[0]
-fid_means = all_fidelities.mean(dim=-1).numpy()
+fid_means = np.asarray(sample_fid_means, dtype=np.float32)
+if fid_means.size == 0:
+    fid_means = np.array([0.0], dtype=np.float32)
 ax.hist(fid_means, bins=40, alpha=0.7, color="steelblue", edgecolor="navy")
 ax.axvline(mean_fid, color="red", linestyle="--", linewidth=2, label=f"Media: {mean_fid:.4f}")
-ax.axvline(median_fid, color="orange", linestyle="--", linewidth=2, label=f"Mediana: {median_fid:.4f}")
 ax.set_xlabel("Fidelity media per campione")
 ax.set_ylabel("Conteggio")
 ax.set_title("Istogramma Fidelity")
@@ -343,7 +293,8 @@ ax.legend()
 ax.grid(True, alpha=0.3)
 
 ax = axes[1]
-ax.boxplot([all_fidelities[:, t].numpy() for t in range(config.SEQ_LEN)],
+boxplot_data = [vals if vals else [0.0] for vals in per_step_plot_values]
+ax.boxplot(boxplot_data,
            tick_labels=[str(t) for t in range(config.SEQ_LEN)])
 ax.set_xlabel("Step temporale")
 ax.set_ylabel("Fidelity")
@@ -386,29 +337,17 @@ plt.tight_layout()
 plt.savefig(os.path.join(RESULTS_DIR, "lr_analysis.png"), dpi=150, bbox_inches="tight")
 plt.close()
 
-print(f"  Salvati:")
-print(f"    - {RESULTS_DIR}/training_report.png")
-print(f"    - {RESULTS_DIR}/fidelity_distribution.png")
-print(f"    - {RESULTS_DIR}/lr_analysis.png")
+print(f"  Salvati in {RESULTS_DIR}/")
 
 
 # ============================================================
 #  6. RIEPILOGO FINALE
 # ============================================================
+gap_fid = final_tr_fid - final_te_fid
 print(f"\n[6/6] RIEPILOGO FINALE")
-print("=" * 70)
-print(f"  Fidelity Test (media):    {mean_fid:.4f} +/- {std_fid:.4f}")
-print(f"  Loss Test (media):        {mean_loss:.4f} +/- {std_loss:.4f}")
-print(f"  PPL Test:                 {math.exp(mean_loss):.4f}")
-print(f"  Generalization gap:       {gap_fid:+.4f}")
-print(f"  Miglior test fidelity:    {best_test_fid:.4f} (epoca {best_test_epoch})")
-print(f"  Campioni Fid > 0.90:      {pct_above_90:.1f}%")
-print(f"  Campioni Fid > 0.80:      {pct_above_80:.1f}%")
-print(f"  Epoche effettive:         {actual_epochs}/{config.EPOCHS}")
-if actual_epochs < config.EPOCHS:
-    print(f"  Early stopping:           Attivato (risparmiato {config.EPOCHS - actual_epochs} epoche)")
-if "lr" in history:
-    print(f"  LR finale:                {history['lr'][-1]:.2e}")
-print(f"  Tempo totale:             {total_train_time:.1f}s")
-print(f"  Verdetto:                 {verdict}")
-print("=" * 70)
+print("=" * 50)
+print(f"  Test Loss:   {mean_loss:.4f}   PPL: {math.exp(mean_loss):.4f}")
+print(f"  Train Loss:  {final_tr_loss:.4f}   PPL: {math.exp(final_tr_loss):.4f}")
+print(f"  Gap fidelity: {gap_fid:+.4f}")
+print(f"  Tempo:        {total_train_time:.1f}s  ({actual_epochs} ep.)")
+print("=" * 50)

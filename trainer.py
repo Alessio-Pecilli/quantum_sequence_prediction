@@ -16,6 +16,8 @@ import math
 import time
 import copy
 import os
+import gc
+import random
 from collections import defaultdict
 
 import torch
@@ -78,17 +80,12 @@ class EarlyStopping:
             self.best_model_state = copy.deepcopy(model.state_dict())
         else:
             self.counter += 1
-            if self.verbose and self.counter > 0:
-                print(
-                    f"    [!] EarlyStopping: nessun miglioramento da {self.counter}/{self.patience} epoche "
-                    f"(best {self.metric}={self.best_score:.6f} @ epoca {self.best_epoch})"
-                )
             if self.counter >= self.patience:
                 self.early_stop = True
                 if self.verbose:
                     print(
-                        f"    [X] EarlyStopping ATTIVATO: training fermato dopo {epoch} epoche. "
-                        f"Miglior {self.metric}={self.best_score:.6f} @ epoca {self.best_epoch}"
+                        f"  >> EarlyStopping dopo {epoch} ep. "
+                        f"(best {self.metric}={self.best_score:.6f} @ ep.{self.best_epoch})"
                     )
 
         return self.early_stop
@@ -97,7 +94,6 @@ class EarlyStopping:
         """Ripristina i pesi del miglior modello trovato."""
         if self.best_model_state is not None:
             model.load_state_dict(self.best_model_state)
-            print(f"    [OK] Modello ripristinato ai pesi dell'epoca {self.best_epoch}")
 
 
 # ============================================================
@@ -394,7 +390,9 @@ class AdvancedTrainer:
         self.device = device
 
         # --- torch.compile per velocizzare (PyTorch 2.0+) ---
-        if config.TORCH_COMPILE and hasattr(torch, 'compile'):
+        # In MEMORY_SAFE_MODE lo disattiviamo per evitare picchi memoria in compilazione.
+        compile_enabled = config.TORCH_COMPILE and not config.MEMORY_SAFE_MODE
+        if compile_enabled and hasattr(torch, 'compile'):
             try:
                 self.model = torch.compile(
                     self.model,
@@ -406,6 +404,8 @@ class AdvancedTrainer:
                 print(f"  [WARN] torch.compile fallito ({e}), proseguo senza compilazione")
                 self._compiled = False
         else:
+            if config.TORCH_COMPILE and config.MEMORY_SAFE_MODE:
+                print("  [MEM] MEMORY_SAFE_MODE attivo: torch.compile disabilitato.")
             self._compiled = False
 
         # --- Ottimizzatore: AdamW (Adam con weight decay decoupled) ---
@@ -418,7 +418,7 @@ class AdvancedTrainer:
         )
         if device == "cuda":
             optimizer_kwargs["fused"] = True
-        self.optimizer = torch.optim.AdamW(model.parameters(), **optimizer_kwargs)
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), **optimizer_kwargs)
 
         # --- LR Scheduler ---
         self.scheduler = WarmupCosineScheduler(self.optimizer)
@@ -431,7 +431,7 @@ class AdvancedTrainer:
         # --- EMA ---
         self.ema = None
         if config.EMA_ENABLED:
-            self.ema = ModelEMA(model)
+            self.ema = ModelEMA(self.model)
 
         # --- Mixed Precision (solo su CUDA, su CPU e' overhead inutile) ---
         self.use_amp = config.AMP_ENABLED and device == "cuda"
@@ -453,6 +453,142 @@ class AdvancedTrainer:
         self.best_test_fid = 0.0
         self.best_test_epoch = 0
 
+        # --- Memory management ---
+        if config.MICRO_BATCH_SIZE <= 0:
+            self.micro_batch_size = config.BATCH_SIZE
+        else:
+            self.micro_batch_size = min(config.MICRO_BATCH_SIZE, config.BATCH_SIZE)
+
+        self.pin_memory = bool(config.PIN_MEMORY and device == "cuda")
+        self.non_blocking = self.pin_memory
+        self.gc_every_n_steps = max(0, int(config.GC_COLLECT_EVERY_N_STEPS))
+        self.cuda_cache_every_n_steps = max(0, int(config.CUDA_EMPTY_CACHE_EVERY_N_STEPS))
+        self._checkpoint_warned = False
+        self._current_epoch = 0
+
+    def _iter_micro_batches(self, x_batch: torch.Tensor, y_batch: torch.Tensor):
+        """
+        Suddivide un batch in micro-batch per ridurre il picco memoria.
+        """
+        batch_size = x_batch.shape[0]
+        micro_bs = max(1, min(self.micro_batch_size, batch_size))
+
+        for start in range(0, batch_size, micro_bs):
+            end = min(start + micro_bs, batch_size)
+            x_micro = x_batch[start:end]
+            y_micro = y_batch[start:end]
+            weight = x_micro.shape[0] / batch_size
+            yield x_micro, y_micro, weight
+
+    def _periodic_memory_cleanup(self, step: int):
+        """Cleanup periodico per evitare crescita della memoria durante loop lunghi."""
+        do_gc = self.gc_every_n_steps > 0 and step % self.gc_every_n_steps == 0
+        do_cuda = (
+            self.device == "cuda"
+            and self.cuda_cache_every_n_steps > 0
+            and step % self.cuda_cache_every_n_steps == 0
+        )
+
+        if do_gc:
+            gc.collect()
+        if do_cuda:
+            torch.cuda.empty_cache()
+
+    def _force_memory_cleanup(self):
+        """Cleanup completo a fine epoca/fase."""
+        gc.collect()
+        if self.device == "cuda":
+            torch.cuda.empty_cache()
+            if hasattr(torch.cuda, "ipc_collect"):
+                torch.cuda.ipc_collect()
+
+    @staticmethod
+    def _atomic_torch_save(obj: dict, path: str):
+        """
+        Salvataggio atomico per evitare checkpoint corrotti.
+        Scrive su file temporaneo e poi fa replace atomico.
+        """
+        tmp_path = f"{path}.tmp"
+        torch.save(obj, tmp_path)
+        os.replace(tmp_path, path)
+
+    @staticmethod
+    def _collect_rng_state() -> dict:
+        """
+        Snapshot degli RNG states per resume riproducibile.
+        """
+        state = {
+            "python_random_state": random.getstate(),
+            "torch_random_state": torch.random.get_rng_state(),
+        }
+        if torch.cuda.is_available():
+            state["cuda_random_state_all"] = torch.cuda.get_rng_state_all()
+        return state
+
+    @staticmethod
+    def _restore_rng_state(state: dict | None):
+        """Ripristina RNG states se disponibili nel checkpoint."""
+        if not state:
+            return
+
+        py_state = state.get("python_random_state")
+        if py_state is not None:
+            random.setstate(py_state)
+
+        torch_state = state.get("torch_random_state")
+        if torch_state is not None:
+            torch.random.set_rng_state(torch_state)
+
+        cuda_state = state.get("cuda_random_state_all")
+        if cuda_state is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(cuda_state)
+
+    def _build_checkpoint_payload(self, epoch: int, reason: str | None = None) -> dict:
+        """Costruisce payload completo del checkpoint (ultimo/best/emergency)."""
+        checkpoint = {
+            "epoch": epoch,
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state": {
+                "current_epoch": self.scheduler.current_epoch,
+                "lr_history": self.scheduler.lr_history,
+            },
+            "history": dict(self.history),
+            "best_test_fid": self.best_test_fid,
+            "best_test_epoch": self.best_test_epoch,
+            "architecture_signature": self._get_architecture_signature(),
+            "rng_state": self._collect_rng_state(),
+            "saved_at_unix": time.time(),
+        }
+        if reason is not None:
+            checkpoint["save_reason"] = reason
+
+        if self.ema is not None:
+            checkpoint["ema_shadow"] = self.ema.shadow
+        if self.scaler is not None:
+            checkpoint["scaler_state_dict"] = self.scaler.state_dict()
+        if self.early_stopper is not None:
+            checkpoint["early_stopping"] = {
+                "best_score": self.early_stopper.best_score,
+                "counter": self.early_stopper.counter,
+                "best_epoch": self.early_stopper.best_epoch,
+            }
+
+        return checkpoint
+
+    def _save_emergency_checkpoint(self, epoch: int, reason: str):
+        """
+        Salva un checkpoint di emergenza in caso di interruzione/errore runtime.
+        """
+        try:
+            checkpoint = self._build_checkpoint_payload(epoch=epoch, reason=reason)
+            os.makedirs("results", exist_ok=True)
+            path = os.path.join("results", f"emergency_{reason}.pt")
+            self._atomic_torch_save(checkpoint, path)
+            print(f"  [SAFE] Checkpoint emergenza salvato: {path}")
+        except Exception as e:
+            print(f"  [WARN] Impossibile salvare checkpoint emergenza ({reason}): {e}")
+
     def _train_one_epoch(self) -> tuple[float, float]:
         """
         Esegue una singola epoca di training.
@@ -467,49 +603,53 @@ class AdvancedTrainer:
 
         n_batches = len(self.train_loader)
 
-        if self.use_amp and self.scaler is not None:
-            # === Path CUDA con AMP ===
-            for step, (x_batch, y_batch) in enumerate(self.train_loader):
-                with torch.amp.autocast(self.device):
-                    pred = self.model(x_batch)
-                    loss, fid = self.criterion(pred, y_batch)
-                    loss_scaled = loss / self.grad_accum_steps
+        for step, (x_batch_cpu, y_batch_cpu) in enumerate(self.train_loader, start=1):
+            batch_loss, batch_fid = 0.0, 0.0
 
-                self.scaler.scale(loss_scaled).backward()
+            for x_micro_cpu, y_micro_cpu, weight in self._iter_micro_batches(x_batch_cpu, y_batch_cpu):
+                x_micro = x_micro_cpu.to(self.device, non_blocking=self.non_blocking)
+                y_micro = y_micro_cpu.to(self.device, non_blocking=self.non_blocking)
 
-                if (step + 1) % self.grad_accum_steps == 0 or (step + 1) == n_batches:
-                    if self.grad_clip > 0:
+                if self.use_amp and self.scaler is not None:
+                    with torch.amp.autocast(self.device):
+                        pred = self.model(x_micro)
+                        loss, fid = self.criterion(pred, y_micro)
+                        loss_scaled = (loss * weight) / self.grad_accum_steps
+                    self.scaler.scale(loss_scaled).backward()
+                else:
+                    pred = self.model(x_micro)
+                    loss, fid = self.criterion(pred, y_micro)
+                    loss_scaled = (loss * weight) / self.grad_accum_steps
+                    loss_scaled.backward()
+
+                batch_loss += loss.item() * weight
+                batch_fid += fid.item() * weight
+
+                del x_micro, y_micro, pred, loss, fid, loss_scaled
+
+            if step % self.grad_accum_steps == 0 or step == n_batches:
+                if self.grad_clip > 0:
+                    if self.use_amp and self.scaler is not None:
                         self.scaler.unscale_(self.optimizer)
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip)
+
+                if self.use_amp and self.scaler is not None:
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
-                    self.optimizer.zero_grad(set_to_none=True)
-                    if self.ema is not None:
-                        self.ema.update(self.model)
-
-                loss_acc += loss.item()
-                fid_acc += fid.item()
-        else:
-            # === Path CPU: niente AMP/Scaler, minimo overhead ===
-            for step, (x_batch, y_batch) in enumerate(self.train_loader):
-                pred = self.model(x_batch)
-                loss, fid = self.criterion(pred, y_batch)
-
-                if self.grad_accum_steps > 1:
-                    (loss / self.grad_accum_steps).backward()
                 else:
-                    loss.backward()
-
-                if (step + 1) % self.grad_accum_steps == 0 or (step + 1) == n_batches:
-                    if self.grad_clip > 0:
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip)
                     self.optimizer.step()
-                    self.optimizer.zero_grad(set_to_none=True)
-                    if self.ema is not None:
-                        self.ema.update(self.model)
 
-                loss_acc += loss.item()
-                fid_acc += fid.item()
+                self.optimizer.zero_grad(set_to_none=True)
+                if self.ema is not None:
+                    self.ema.update(self.model)
+
+            loss_acc += batch_loss
+            fid_acc += batch_fid
+
+            del x_batch_cpu, y_batch_cpu
+            self._periodic_memory_cleanup(step)
+
+        self._force_memory_cleanup()
 
         avg_loss = loss_acc / n_batches
         avg_fid = fid_acc / n_batches
@@ -530,40 +670,179 @@ class AdvancedTrainer:
         self.model.eval()
         loss_acc, fid_acc = 0.0, 0.0
 
-        for x_batch, y_batch in self.test_loader:
-            pred = self.model(x_batch)
-            loss, fid = self.criterion(pred, y_batch)
-            loss_acc += loss.item()
-            fid_acc += fid.item()
+        for step, (x_batch_cpu, y_batch_cpu) in enumerate(self.test_loader, start=1):
+            batch_loss, batch_fid = 0.0, 0.0
+
+            for x_micro_cpu, y_micro_cpu, weight in self._iter_micro_batches(x_batch_cpu, y_batch_cpu):
+                x_micro = x_micro_cpu.to(self.device, non_blocking=self.non_blocking)
+                y_micro = y_micro_cpu.to(self.device, non_blocking=self.non_blocking)
+
+                pred = self.model(x_micro)
+                loss, fid = self.criterion(pred, y_micro)
+
+                batch_loss += loss.item() * weight
+                batch_fid += fid.item() * weight
+
+                del x_micro, y_micro, pred, loss, fid
+
+            loss_acc += batch_loss
+            fid_acc += batch_fid
+
+            del x_batch_cpu, y_batch_cpu
+            self._periodic_memory_cleanup(step)
 
         # Ripristina pesi originali
         if use_ema and self.ema is not None:
             self.ema.restore(self.model)
 
+        self._force_memory_cleanup()
+
         avg_loss = loss_acc / len(self.test_loader)
         avg_fid = fid_acc / len(self.test_loader)
         return avg_loss, avg_fid
 
+    @staticmethod
+    def _get_architecture_signature() -> dict:
+        """
+        Raccoglie tutti i parametri di configurazione che definiscono l'architettura
+        del modello. Se uno qualsiasi di questi cambia, i pesi salvati NON sono
+        compatibili e bisogna ripartire da zero.
+        """
+        return {
+            "D_MODEL": config.D_MODEL,
+            "NUM_HEADS": config.NUM_HEADS,
+            "NUM_LAYERS": config.NUM_LAYERS,
+            "DIM_FEEDFORWARD": config.DIM_FEEDFORWARD,
+            "N_QUBITS": config.N_QUBITS,
+            "DIM_2N": config.DIM_2N,
+            "SEQ_LEN": config.SEQ_LEN,
+            "DROPOUT": config.DROPOUT,
+        }
+
+    @staticmethod
+    def check_checkpoint_compatibility(checkpoint_path: str) -> tuple[bool, str, dict | None]:
+        """
+        Verifica se un checkpoint salvato è compatibile con la configurazione corrente.
+
+        Ritorna:
+            (compatibile, messaggio, checkpoint_data)
+            - compatibile: True se i pesi possono essere riutilizzati
+            - messaggio: spiegazione leggibile del risultato
+            - checkpoint_data: il checkpoint caricato (None se non esiste o non valido)
+        """
+        if not os.path.exists(checkpoint_path):
+            return False, f"Nessun checkpoint trovato in '{checkpoint_path}'", None
+
+        try:
+            checkpoint = torch.load(checkpoint_path, weights_only=False, map_location="cpu")
+        except Exception as e:
+            return False, f"Checkpoint corrotto o illeggibile: {e}", None
+
+        # Verifica che il checkpoint contenga i campi necessari
+        required_keys = {"epoch", "model_state_dict", "optimizer_state_dict", "history"}
+        if not required_keys.issubset(checkpoint.keys()):
+            missing = required_keys - checkpoint.keys()
+            return False, f"Checkpoint incompleto, campi mancanti: {missing}", None
+
+        # Verifica compatibilità architettura
+        saved_arch = checkpoint.get("architecture_signature")
+        if saved_arch is None:
+            return False, "Checkpoint senza firma architettura (versione precedente), incompatibile", None
+
+        current_arch = AdvancedTrainer._get_architecture_signature()
+        mismatches = []
+        for key in current_arch:
+            saved_val = saved_arch.get(key)
+            current_val = current_arch[key]
+            if saved_val != current_val:
+                mismatches.append(f"  {key}: salvato={saved_val} → attuale={current_val}")
+
+        if mismatches:
+            detail = "\n".join(mismatches)
+            n_saved = sum(p.numel() for p in checkpoint["model_state_dict"].values())
+            msg = (
+                f"Architettura INCOMPATIBILE ({len(mismatches)} differenze):\n{detail}\n"
+                f"  Parametri salvati: {n_saved:,} — Si riparte da zero."
+            )
+            return False, msg, None
+
+        saved_epoch = checkpoint["epoch"]
+        saved_fid = checkpoint.get("best_test_fid", 0.0)
+        msg = (
+            f"Checkpoint COMPATIBILE trovato (epoca {saved_epoch}, "
+            f"best fidelity={saved_fid:.6f}). Riprendo il training."
+        )
+        return True, msg, checkpoint
+
     def _save_checkpoint(self, epoch: int, is_best: bool = False):
         """Salva un checkpoint del modello."""
-        checkpoint = {
-            "epoch": epoch,
-            "model_state_dict": self.model.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "history": dict(self.history),
-            "best_test_fid": self.best_test_fid,
-        }
-        if self.ema is not None:
-            checkpoint["ema_shadow"] = self.ema.shadow
+        checkpoint = self._build_checkpoint_payload(epoch=epoch, reason="epoch")
 
-        if is_best and config.SAVE_BEST_MODEL:
-            os.makedirs(os.path.dirname(config.BEST_MODEL_PATH), exist_ok=True)
-            torch.save(checkpoint, config.BEST_MODEL_PATH)
+        # Salva SEMPRE l'ultimo checkpoint (fallback per crash/spegnimento)
+        try:
+            os.makedirs(os.path.dirname(config.LAST_CHECKPOINT_PATH) or ".", exist_ok=True)
+            self._atomic_torch_save(checkpoint, config.LAST_CHECKPOINT_PATH)
 
-        if config.CHECKPOINT_EVERY_N_EPOCHS > 0 and epoch % config.CHECKPOINT_EVERY_N_EPOCHS == 0:
-            path = f"results/checkpoint_epoch_{epoch}.pt"
-            os.makedirs("results", exist_ok=True)
-            torch.save(checkpoint, path)
+            if is_best and config.SAVE_BEST_MODEL:
+                os.makedirs(os.path.dirname(config.BEST_MODEL_PATH) or ".", exist_ok=True)
+                best_checkpoint = dict(checkpoint)
+                best_checkpoint["save_reason"] = "best"
+                self._atomic_torch_save(best_checkpoint, config.BEST_MODEL_PATH)
+
+            if config.CHECKPOINT_EVERY_N_EPOCHS > 0 and epoch % config.CHECKPOINT_EVERY_N_EPOCHS == 0:
+                path = f"results/checkpoint_epoch_{epoch}.pt"
+                os.makedirs("results", exist_ok=True)
+                periodic_checkpoint = dict(checkpoint)
+                periodic_checkpoint["save_reason"] = "periodic"
+                self._atomic_torch_save(periodic_checkpoint, path)
+        except Exception as e:
+            if not self._checkpoint_warned:
+                print(f"  [WARN] Checkpoint non salvato: {e}")
+                self._checkpoint_warned = True
+
+    def resume_from_checkpoint(self, checkpoint: dict):
+        """
+        Ripristina lo stato completo del trainer da un checkpoint compatibile.
+        Deve essere chiamato PRIMA di train().
+        """
+        # Modello
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+
+        # Ottimizzatore
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+        # Scheduler
+        if "scheduler_state" in checkpoint:
+            self.scheduler.current_epoch = checkpoint["scheduler_state"]["current_epoch"]
+            self.scheduler.lr_history = checkpoint["scheduler_state"]["lr_history"]
+
+        # History
+        saved_history = checkpoint.get("history", {})
+        for key, values in saved_history.items():
+            self.history[key] = list(values)
+
+        # Best tracking
+        self.best_test_fid = checkpoint.get("best_test_fid", 0.0)
+        self.best_test_epoch = checkpoint.get("best_test_epoch", 0)
+
+        # EMA
+        if self.ema is not None and "ema_shadow" in checkpoint:
+            self.ema.shadow = checkpoint["ema_shadow"]
+        if self.scaler is not None and "scaler_state_dict" in checkpoint:
+            self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
+
+        # Early Stopping
+        if self.early_stopper is not None and "early_stopping" in checkpoint:
+            es_data = checkpoint["early_stopping"]
+            self.early_stopper.best_score = es_data.get("best_score")
+            self.early_stopper.counter = es_data.get("counter", 0)
+            self.early_stopper.best_epoch = es_data.get("best_epoch", 0)
+
+        # RNG states (se presenti)
+        self._restore_rng_state(checkpoint.get("rng_state"))
+
+        # Epoca di partenza
+        self._resume_epoch = checkpoint["epoch"]
 
     def train(self, epochs: int = config.EPOCHS, verbose: bool = True) -> dict:
         """
@@ -575,86 +854,92 @@ class AdvancedTrainer:
 
         Ritorna: Dizionario con la history completa del training
         """
-        if verbose:
-            features = []
-            if config.EARLY_STOPPING_ENABLED:
-                features.append(f"EarlyStop(patience={config.EARLY_STOPPING_PATIENCE})")
-            features.append(f"LR={config.LR_SCHEDULER_TYPE}(warmup={config.LR_WARMUP_EPOCHS})")
-            if config.GRAD_CLIP_MAX_NORM > 0:
-                features.append(f"GradClip({config.GRAD_CLIP_MAX_NORM})")
-            if config.EMA_ENABLED:
-                features.append(f"EMA({config.EMA_DECAY})")
-            if self.use_amp:
-                features.append("AMP")
-            if self.grad_accum_steps > 1:
-                features.append(f"GradAccum(x{self.grad_accum_steps})")
-            features.append(f"WeightDecay={config.WEIGHT_DECAY}")
-            if self._compiled:
-                features.append("torch.compile")
-            print(f"  Features: {', '.join(features)}\n")
+        start_epoch = getattr(self, "_resume_epoch", 0) + 1
 
-        for epoch in range(1, epochs + 1):
-            t_epoch = time.time()
+        if start_epoch > 1 and verbose:
+            print(f"  >> Ripresa dal checkpoint: epoca {start_epoch}/{epochs}")
+            print(f"     Best fidelity finora: {self.best_test_fid:.6f} (ep.{self.best_test_epoch})")
+            print()
 
-            # --- Train ---
-            train_loss, train_fid = self._train_one_epoch()
-            train_ppl = math.exp(min(train_loss, 20))  # clamp per evitare overflow
+        if start_epoch > epochs:
+            print(f"  >> Il checkpoint (epoca {start_epoch - 1}) ha già completato {epochs} epoche. Nulla da fare.")
+            return dict(self.history)
 
-            # --- Evaluate ---
-            test_loss, test_fid = self._evaluate(use_ema=config.EMA_ENABLED)
-            test_ppl = math.exp(min(test_loss, 20))
+        try:
+            for epoch in range(start_epoch, epochs + 1):
+                self._current_epoch = epoch
+                t_epoch = time.time()
 
-            epoch_time = time.time() - t_epoch
-            self.total_train_time += epoch_time
+                # --- Train ---
+                train_loss, train_fid = self._train_one_epoch()
+                train_ppl = math.exp(min(train_loss, 20))  # clamp per evitare overflow
 
-            # --- LR Scheduling ---
-            current_lr = self.scheduler.step(epoch, val_loss=test_loss)
+                # --- Evaluate ---
+                test_loss, test_fid = self._evaluate(use_ema=config.EMA_ENABLED)
+                test_ppl = math.exp(min(test_loss, 20))
 
-            # --- History ---
-            self.history["train_loss"].append(train_loss)
-            self.history["train_fidelity"].append(train_fid)
-            self.history["train_ppl"].append(train_ppl)
-            self.history["test_loss"].append(test_loss)
-            self.history["test_fidelity"].append(test_fid)
-            self.history["test_ppl"].append(test_ppl)
-            self.history["lr"].append(current_lr)
-            self.history["epoch_time"].append(epoch_time)
+                epoch_time = time.time() - t_epoch
+                self.total_train_time += epoch_time
 
-            # --- Best model tracking ---
-            is_best = test_fid > self.best_test_fid
-            if is_best:
-                self.best_test_fid = test_fid
-                self.best_test_epoch = epoch
+                # --- LR Scheduling ---
+                current_lr = self.scheduler.step(epoch, val_loss=test_loss)
 
-            # --- Checkpointing ---
-            self._save_checkpoint(epoch, is_best=is_best)
+                # --- History ---
+                self.history["train_loss"].append(train_loss)
+                self.history["train_fidelity"].append(train_fid)
+                self.history["train_ppl"].append(train_ppl)
+                self.history["test_loss"].append(test_loss)
+                self.history["test_fidelity"].append(test_fid)
+                self.history["test_ppl"].append(test_ppl)
+                self.history["lr"].append(current_lr)
+                self.history["epoch_time"].append(epoch_time)
 
-            # --- LR Diagnostics ---
-            self.lr_diagnostics.update(epoch, current_lr, train_loss, test_loss, test_fid)
+                # --- Best model tracking ---
+                is_best = test_fid > self.best_test_fid
+                if is_best:
+                    self.best_test_fid = test_fid
+                    self.best_test_epoch = epoch
 
-            # --- Stampa progresso ---
-            if verbose:
-                lr_str = f"{current_lr:.2e}"
-                marker = " *" if is_best else ""
-                print(
-                    f"  Epoca {epoch:3d}/{epochs}  "
-                    f"| Train L:{train_loss:.4f} F:{train_fid:.4f}  "
-                    f"| Test L:{test_loss:.4f} F:{test_fid:.4f}  "
-                    f"| LR:{lr_str}  "
-                    f"| {epoch_time:.1f}s{marker}"
-                )
+                # --- Checkpointing ---
+                self._save_checkpoint(epoch, is_best=is_best)
 
-            # --- Early Stopping ---
-            if self.early_stopper is not None:
-                es_metric = (
-                    test_fid
-                    if config.EARLY_STOPPING_METRIC == "test_fidelity"
-                    else test_loss
-                )
-                if self.early_stopper(es_metric, epoch, self.model):
-                    break
+                # --- LR Diagnostics ---
+                self.lr_diagnostics.update(epoch, current_lr, train_loss, test_loss, test_fid)
 
-            self.actual_epochs = epoch
+                # --- Stampa progresso ---
+                if verbose:
+                    marker = " *" if is_best else ""
+                    print(
+                        f"  Ep {epoch:3d}/{epochs}  "
+                        f"Train [Loss {train_loss:.4f}  PPL {train_ppl:.4f}]  "
+                        f"Test [Loss {test_loss:.4f}  PPL {test_ppl:.4f}]{marker}"
+                    )
+
+                # --- Early Stopping ---
+                if self.early_stopper is not None:
+                    es_metric = (
+                        test_fid
+                        if config.EARLY_STOPPING_METRIC == "test_fidelity"
+                        else test_loss
+                    )
+                    if self.early_stopper(es_metric, epoch, self.model):
+                        break
+
+                self.actual_epochs = epoch
+        except KeyboardInterrupt:
+            print("\n  [INTERRUPT] Training interrotto dall'utente.")
+            self._save_emergency_checkpoint(
+                epoch=max(start_epoch, self._current_epoch),
+                reason="keyboard_interrupt",
+            )
+            raise
+        except Exception as e:
+            print(f"\n  [ERROR] Eccezione durante il training: {e}")
+            self._save_emergency_checkpoint(
+                epoch=max(start_epoch, self._current_epoch),
+                reason="runtime_error",
+            )
+            raise
 
         # --- Post-training ---
         # Ripristina il miglior modello
@@ -663,60 +948,16 @@ class AdvancedTrainer:
         elif config.SAVE_BEST_MODEL and os.path.exists(config.BEST_MODEL_PATH):
             checkpoint = torch.load(config.BEST_MODEL_PATH, weights_only=False)
             self.model.load_state_dict(checkpoint["model_state_dict"])
-            if verbose:
-                print(f"    [OK] Modello ripristinato dal checkpoint (epoca {checkpoint['epoch']})")
 
         return dict(self.history)
 
     def print_training_summary(self):
-        """Stampa un riepilogo dettagliato del training."""
+        """Stampa un riepilogo conciso del training."""
         h = self.history
         n = len(h["train_loss"])
+        if n == 0 or self.best_test_epoch <= 0:
+            print(f"\n  Training interrotto senza epoche complete salvate (tempo: {self.total_train_time:.1f}s).")
+            return
 
-        print(f"\n  {'-' * 56}")
-        print(f"  RIEPILOGO TRAINING AVANZATO")
-        print(f"  {'-' * 56}")
-        print(f"    Epoche completate:     {n}/{config.EPOCHS}")
-        if n < config.EPOCHS and config.EARLY_STOPPING_ENABLED:
-            print(f"    Early stopping:        SÌ (patience={config.EARLY_STOPPING_PATIENCE})")
-        print(f"    Tempo totale:          {self.total_train_time:.1f}s")
-        print(f"    Tempo medio/epoca:     {self.total_train_time / max(1, n):.2f}s")
-        print()
-
-        # Fidelity
-        print(f"    Train Fidelity finale: {h['train_fidelity'][-1]:.6f}")
-        print(f"    Test  Fidelity finale: {h['test_fidelity'][-1]:.6f}")
-        print(f"    Miglior Test Fidelity: {self.best_test_fid:.6f} (epoca {self.best_test_epoch})")
-        miglioramento = h["train_fidelity"][-1] - h["train_fidelity"][0]
-        print(f"    Miglioramento totale:  {miglioramento:+.6f}")
-        print()
-
-        # Learning Rate
-        print(f"    LR iniziale:           {h['lr'][0]:.2e}")
-        print(f"    LR finale:             {h['lr'][-1]:.2e}")
-        print(f"    LR minimo raggiunto:   {min(h['lr']):.2e}")
-        print(f"    LR massimo raggiunto:  {max(h['lr']):.2e}")
-
-        # Numero di riduzioni LR (cambi significativi)
-        lr_changes = 0
-        for i in range(1, len(h["lr"])):
-            if abs(h["lr"][i] - h["lr"][i - 1]) / max(h["lr"][i - 1], 1e-10) > 0.01:
-                lr_changes += 1
-        print(f"    Cambi LR significativi: {lr_changes}")
-        print()
-
-        # Generalization gap
-        gap = h["train_fidelity"][-1] - h["test_fidelity"][-1]
-        print(f"    Generalization gap:    {gap:+.6f}")
-        if gap < 0.02:
-            print(f"    Verdetto:              Eccellente generalizzazione")
-        elif gap < 0.05:
-            print(f"    Verdetto:              Buona generalizzazione")
-        elif gap < 0.15:
-            print(f"    Verdetto:              Gap moderato — valutare regolarizzazione")
-        else:
-            print(f"    Verdetto:              Overfitting significativo")
-
-        # Diagnostica LR
-        print()
-        self.lr_diagnostics.print_report()
+        print(f"\n  Training completato: {n}/{config.EPOCHS} ep. in {self.total_train_time:.1f}s")
+        print(f"  Best test: Loss={h['test_loss'][self.best_test_epoch-1]:.4f}  PPL={h['test_ppl'][self.best_test_epoch-1]:.4f}  (ep.{self.best_test_epoch})")

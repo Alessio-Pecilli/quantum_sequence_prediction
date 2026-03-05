@@ -18,16 +18,16 @@ class ComplexEmbedding(nn.Module):
         """
         x_complex: Tensore complesso di shape (batch_size, seq_len, dim_2n)
         """
-        # 1. Estrazione fisica: Modulo (ampiezza) e Angolo (fase)
-        amplitudes = torch.abs(x_complex)
-        phases = torch.angle(x_complex)
+        # 1. Estrazione parti reale e immaginaria (continua, nessuna discontinuità)
+        #    Rispetto a amp/fase: evita instabilità quando amp→0 (fase indefinita)
+        #    e fornisce gradienti più lisci alla rete
+        real_part = x_complex.real
+        imag_part = x_complex.imag
         
-        # 2. Concatenazione. 
-        # Da shape (batch, seq, dim_2n) passiamo a (batch, seq, dim_2n * 2)
-        x_real = torch.cat([amplitudes, phases], dim=-1)
+        # 2. Concatenazione: (batch, seq, dim_2n) → (batch, seq, dim_2n * 2)
+        x_real = torch.cat([real_part, imag_part], dim=-1)
         
         # 3. Proiezione Lineare verso lo spazio latente d
-        # Ora la rete lavora con feature puramente reali in R^d
         h = self.projection(x_real)
         
         return h

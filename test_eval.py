@@ -5,6 +5,7 @@ Usa parametri piccoli per velocità (~30s su CPU).
 """
 import math
 import time
+import gc
 
 import torch
 from torch.utils.data import DataLoader
@@ -41,17 +42,35 @@ test_in, test_tgt = generate_quantum_dynamics_dataset(B=B_TEST, S=S_TEST)
 print(f"    Generazione: {time.time() - t0:.2f}s")
 print(f"    Train: {train_in.shape}  Test: {test_in.shape}")
 
-train_in = train_in.to(config.DEVICE)
-train_tgt = train_tgt.to(config.DEVICE)
-test_in = test_in.to(config.DEVICE)
-test_tgt = test_tgt.to(config.DEVICE)
+pin_memory = bool(config.PIN_MEMORY and config.DEVICE == "cuda")
+num_workers = 0 if config.MEMORY_SAFE_MODE else config.NUM_WORKERS
+loader_kwargs = dict(batch_size=BATCH_SIZE, pin_memory=pin_memory)
+if num_workers > 0:
+    loader_kwargs["num_workers"] = num_workers
+    loader_kwargs["persistent_workers"] = True
+else:
+    loader_kwargs["num_workers"] = 0
 
 train_loader = DataLoader(
-    QuantumStateDataset(train_in, train_tgt), batch_size=BATCH_SIZE, shuffle=True
+    QuantumStateDataset(train_in, train_tgt), shuffle=True, **loader_kwargs
 )
 test_loader = DataLoader(
-    QuantumStateDataset(test_in, test_tgt), batch_size=BATCH_SIZE, shuffle=False
+    QuantumStateDataset(test_in, test_tgt), shuffle=False, **loader_kwargs
 )
+
+micro_batch_size = config.MICRO_BATCH_SIZE if config.MICRO_BATCH_SIZE > 0 else BATCH_SIZE
+non_blocking = pin_memory
+
+
+def iter_micro_batches(x_batch, y_batch, micro_bs):
+    batch_size = x_batch.shape[0]
+    micro_bs = max(1, min(micro_bs, batch_size))
+    for start in range(0, batch_size, micro_bs):
+        end = min(start + micro_bs, batch_size)
+        x_micro = x_batch[start:end]
+        y_micro = y_batch[start:end]
+        weight = x_micro.shape[0] / batch_size
+        yield x_micro, y_micro, weight
 
 
 # --- 2. Modello ---
@@ -72,14 +91,31 @@ for epoch in range(EPOCHS_EVAL):
     model.train()
     loss_acc, fid_acc = 0.0, 0.0
 
-    for x_batch, y_batch in train_loader:
-        optimizer.zero_grad()
-        pred = model(x_batch)
-        loss, fid = criterion(pred, y_batch)
-        loss.backward()
+    for step, (x_batch_cpu, y_batch_cpu) in enumerate(train_loader, start=1):
+        optimizer.zero_grad(set_to_none=True)
+        batch_loss, batch_fid = 0.0, 0.0
+
+        for x_micro_cpu, y_micro_cpu, weight in iter_micro_batches(x_batch_cpu, y_batch_cpu, micro_batch_size):
+            x_micro = x_micro_cpu.to(config.DEVICE, non_blocking=non_blocking)
+            y_micro = y_micro_cpu.to(config.DEVICE, non_blocking=non_blocking)
+
+            pred = model(x_micro)
+            loss, fid = criterion(pred, y_micro)
+            (loss * weight).backward()
+
+            batch_loss += loss.item() * weight
+            batch_fid += fid.item() * weight
+
+            del x_micro, y_micro, pred, loss, fid
+
         optimizer.step()
-        loss_acc += loss.item()
-        fid_acc += fid.item()
+
+        loss_acc += batch_loss
+        fid_acc += batch_fid
+
+        del x_batch_cpu, y_batch_cpu
+        if config.GC_COLLECT_EVERY_N_STEPS > 0 and step % config.GC_COLLECT_EVERY_N_STEPS == 0:
+            gc.collect()
 
     avg_loss = loss_acc / len(train_loader)
     avg_fid = fid_acc / len(train_loader)
@@ -102,18 +138,35 @@ per_step_fid = torch.zeros(config.SEQ_LEN)
 per_step_count = 0
 
 with torch.no_grad():
-    for x_batch, y_batch in test_loader:
-        pred = model(x_batch)
-        loss, fid = criterion(pred, y_batch)
-        test_loss_acc += loss.item()
-        test_fid_acc += fid.item()
-        n_batches += 1
+    for step, (x_batch_cpu, y_batch_cpu) in enumerate(test_loader, start=1):
+        batch_loss, batch_fid = 0.0, 0.0
+        batch_step_fid = torch.zeros(config.SEQ_LEN)
 
-        # Fidelity per step temporale
-        overlap = torch.sum(y_batch.conj() * pred, dim=-1)  # (batch, seq_len)
-        step_fid = torch.abs(overlap) ** 2  # (batch, seq_len)
-        per_step_fid += step_fid.mean(dim=0).cpu()
+        for x_micro_cpu, y_micro_cpu, weight in iter_micro_batches(x_batch_cpu, y_batch_cpu, micro_batch_size):
+            x_micro = x_micro_cpu.to(config.DEVICE, non_blocking=non_blocking)
+            y_micro = y_micro_cpu.to(config.DEVICE, non_blocking=non_blocking)
+
+            pred = model(x_micro)
+            loss, fid = criterion(pred, y_micro)
+
+            batch_loss += loss.item() * weight
+            batch_fid += fid.item() * weight
+
+            overlap = torch.sum(y_micro.conj() * pred, dim=-1)  # (micro_batch, seq_len)
+            step_fid = torch.abs(overlap) ** 2
+            batch_step_fid += step_fid.mean(dim=0).cpu() * weight
+
+            del x_micro, y_micro, pred, loss, fid, overlap, step_fid
+
+        test_loss_acc += batch_loss
+        test_fid_acc += batch_fid
+        n_batches += 1
+        per_step_fid += batch_step_fid
         per_step_count += 1
+
+        del x_batch_cpu, y_batch_cpu
+        if config.GC_COLLECT_EVERY_N_STEPS > 0 and step % config.GC_COLLECT_EVERY_N_STEPS == 0:
+            gc.collect()
 
 avg_test_loss = test_loss_acc / n_batches
 avg_test_fid = test_fid_acc / n_batches

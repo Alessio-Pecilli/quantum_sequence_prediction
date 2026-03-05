@@ -99,10 +99,20 @@ class QuantumStatePredictor(nn.Module):
         self.rope = RotaryPositionalEncoding(d_model=d, max_seq_len=config.SEQ_LEN)
         
         # 2. Core: Transformer Encoder
-        encoder_layer = nn.TransformerEncoderLayer(d_model=d, nhead=num_heads, batch_first=True)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d,
+            nhead=num_heads,
+            dim_feedforward=config.DIM_FEEDFORWARD,
+            dropout=config.DROPOUT,
+            batch_first=True
+        )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
-        # 3. Output Head: Proietta da d a 2*dim_2n (dim_2n ampiezze + dim_2n fasi)
+        # 2b. Maschera causale: posizione t vede solo 0..t (predizione autoregressiva)
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(config.SEQ_LEN)
+        self.register_buffer("causal_mask", causal_mask)
+        
+        # 3. Output Head: Proietta da d a 2*dim_2n (dim_2n reale + dim_2n immaginario)
         self.output_head = nn.Linear(d, 2 * dim_2n)
 
     def forward(self, x_complex):
@@ -116,24 +126,22 @@ class QuantumStatePredictor(nn.Module):
         # A2. Iniezione informazione posizionale temporale (RoPE)
         h = self.rope(h)
         
-        # B. Passaggio nel Transformer
-        out = self.transformer(h)
+        # B. Passaggio nel Transformer (con maschera causale)
+        seq_len = h.shape[1]
+        out = self.transformer(h, mask=self.causal_mask[:seq_len, :seq_len])
         
         # C. Estrazione raw features (dimensione 2*dim_2n)
         out_raw = self.output_head(out)
         
-        # D. Split a metà lungo l'ultima dimensione
-        amplitudes_raw, phases_raw = torch.chunk(out_raw, chunks=2, dim=-1)
+        # D. Split: parte reale e immaginaria
+        real_raw, imag_raw = torch.chunk(out_raw, chunks=2, dim=-1)
         
-        # --- VINCOLI FISICI ---
-        # Ampiezze: normalizzate (somma dei quadrati = 1) e positive
-        amplitudes = torch.sqrt(torch.softmax(amplitudes_raw, dim=-1))
+        # --- STATO COMPLESSO + VINCOLO FISICO ---
+        # Costruiamo lo stato complesso da Re/Im (gradienti diretti, no bottleneck softmax)
+        complex_state = torch.complex(real_raw, imag_raw)
         
-        # Fasi: mappate in [-pi, pi] per stabilità
-        phases = torch.sigmoid(phases_raw) * 2 * torch.pi
-        
-        # --- STATO COMPLESSO FINALE ---
-        # Costruzione a * e^(i * phi)
-        complex_state = amplitudes * torch.exp(1j * phases)
+        # Normalizzazione L2 a norma unitaria: ||ψ||² = 1
+        norm = torch.linalg.vector_norm(complex_state, dim=-1, keepdim=True).clamp(min=1e-8)
+        complex_state = complex_state / norm
         
         return complex_state
