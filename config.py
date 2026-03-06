@@ -1,5 +1,30 @@
 # ===== Configurazione Modello =====
 
+# Nota: alcuni parametri (es. SEQ_LEN, T1, T2) possono essere sovrascritti via env var.
+# Convenzione:
+#   - QSP_SEQ_LEN      -> lunghezza totale della sequenza generata dal dataset (max_seq_len del modello)
+#   - QSP_N_QUBITS     -> numero di qubit del sistema
+#   - QSP_T1           -> lookback window / context length (numero di stati osservati)
+#   - QSP_T2           -> forecast horizon (numero di step futuri da predire in rollout)
+#   - QSP_B_TRAIN      -> n. Hamiltoniane training
+#   - QSP_S_TRAIN      -> n. stati iniziali per Hamiltoniana (train)
+#   - QSP_B_TEST       -> n. Hamiltoniane test
+#   - QSP_S_TEST       -> n. stati iniziali per Hamiltoniana (test)
+#   - QSP_BATCH_SIZE   -> batch size
+#   - QSP_EPOCHS       -> epoche training
+#   - QSP_OBS_PLOT_SAMPLES -> n. traiettorie per plot osservabili
+import os
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError as e:
+        raise ValueError(f"Env var {name} deve essere un intero, ricevuto: {raw!r}") from e
+
 # Dimensione dello spazio di embedding (2^n per n qubit)
 # Per 10 qubit (2048 feature reali) → 512 riduce la compressione a ~4:1
 D_MODEL = 512
@@ -23,7 +48,8 @@ DROPOUT = 0.05
 # ===== Configurazione Sistema Quantistico =====
 
 # Numero di qubit del sistema
-N_QUBITS = 10
+# Default ridotto a 6 per test veloci; usa env QSP_N_QUBITS per cambiare.
+N_QUBITS = _env_int("QSP_N_QUBITS", 6)
 
 # Dimensione dello spazio di Hilbert (2^n)
 DIM_2N = 2 ** N_QUBITS
@@ -49,23 +75,44 @@ HAMILTONIAN_TYPE = "TFIM"
 # --- Training ---
 # Numero di Hamiltoniane casuali da campionare (B)
 # Aumentato per migliore generalizzazione e diversita' del dataset
-B_TRAIN = 100
+B_TRAIN = _env_int("QSP_B_TRAIN", 100)
 # Numero di stati iniziali per Hamiltoniana (S)
-S_TRAIN = 30
+S_TRAIN = _env_int("QSP_S_TRAIN", 30)
 
 # --- Test ---
 # Nuove Hamiltoniane e nuovi stati (generati indipendentemente dal training)
-B_TEST = 20
-S_TEST = 20
+B_TEST = _env_int("QSP_B_TEST", 20)
+S_TEST = _env_int("QSP_S_TEST", 20)
 
-# Lunghezza della sequenza temporale
-SEQ_LEN = 100
+# Lunghezza totale della sequenza temporale generata (max seq len del modello).
+# Nota: per valutazioni "rollout" serve che SEQ_LEN + 1 >= T1 + T2 (perche' nel dataset ci sono SEQ_LEN+1 stati).
+SEQ_LEN = _env_int("QSP_SEQ_LEN", 100)
+if SEQ_LEN < 2:
+    raise ValueError(f"SEQ_LEN deve essere >= 2, ricevuto: {SEQ_LEN}")
+
+# Struttura finestra temporale per rollout / testing:
+#   T1: lookback window (context)
+#   T2: forecast horizon (step futuri da predire autoregressivamente)
+_t1_default = min(10, SEQ_LEN - 1)
+T1 = _env_int("QSP_T1", _t1_default)
+_t2_default = max(1, SEQ_LEN - T1)
+T2 = _env_int("QSP_T2", _t2_default)
+
+if T1 < 1:
+    raise ValueError(f"T1 deve essere >= 1, ricevuto: {T1}")
+if T2 < 1:
+    raise ValueError(f"T2 deve essere >= 1, ricevuto: {T2}")
+if T1 + T2 > SEQ_LEN + 1:
+    raise ValueError(
+        f"Configurazione non valida: T1+T2={T1 + T2} > SEQ_LEN+1={SEQ_LEN + 1}. "
+        f"Aumenta SEQ_LEN (env QSP_SEQ_LEN) o riduci T1/T2 (env QSP_T1/QSP_T2)."
+    )
 
 # Dimensione del batch (su CPU batch grandi riducono l'overhead per iterazione)
-BATCH_SIZE = 32
+BATCH_SIZE = _env_int("QSP_BATCH_SIZE", 32)
 
 # Numero di epoche di addestramento
-EPOCHS = 200
+EPOCHS = _env_int("QSP_EPOCHS", 200)
 
 # ===== Configurazione Ottimizzatore =====
 
@@ -200,6 +247,15 @@ PIN_MEMORY = True
 # Limite massimo di campioni da conservare per grafici distribuzionali.
 # Serve a evitare crescita memoria durante valutazione finale.
 MAX_FIDELITY_PLOT_SAMPLES = 4096
+
+# ===== Plot Osservabili (rollout) =====
+# Se True, il training pipeline genera anche grafici di osservabili fisiche
+# (magnetizzazioni e correlazioni) confrontando rollout del modello vs traiettoria esatta.
+OBSERVABLE_PLOTS_ENABLED = True
+
+# Numero di traiettorie (dal training set) usate per stimare media/std degli osservabili.
+# Se <= 0 usa tutto il training set (puo' essere lento).
+OBSERVABLE_PLOT_SAMPLES = _env_int("QSP_OBS_PLOT_SAMPLES", 256)
 
 # Device (gpu o cpu) - determinato al momento dell'uso
 def get_device():

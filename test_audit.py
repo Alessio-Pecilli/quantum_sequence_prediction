@@ -131,8 +131,8 @@ print(f"  Default n_qubits/seq_len/dt da config: OK")
 # ========== 3. EMBEDDING ==========
 print("\n[3] EMBEDDING — ComplexEmbedding")
 emb = ComplexEmbedding()
-assert emb.projection.in_features == config.DIM_2N * 2, f"in_features {emb.projection.in_features}"
-assert emb.projection.out_features == config.D_MODEL, f"out_features {emb.projection.out_features}"
+assert emb.projection[0].in_features == config.DIM_2N * 2, f"in_features {emb.projection[0].in_features}"
+assert emb.projection[-1].out_features == config.D_MODEL, f"out_features {emb.projection[-1].out_features}"
 passed += 2
 print(f"  Linear({config.DIM_2N * 2} -> {config.D_MODEL}): OK")
 
@@ -145,8 +145,8 @@ print(f"  Output shape {h.shape}, dtype float32: OK")
 
 # 3b. Verifica con dim_2n custom
 emb_custom = ComplexEmbedding(dim_2n=8, d_model=32)
-assert emb_custom.projection.in_features == 16
-assert emb_custom.projection.out_features == 32
+assert emb_custom.projection[0].in_features == 16
+assert emb_custom.projection[-1].out_features == 32
 passed += 2
 print(f"  Parametrizzazione custom (8, 32): OK")
 
@@ -202,8 +202,8 @@ passed += 2
 print(f"  dim_2n={model.dim_2n}, d={model.d}: OK")
 
 # 5b. Output head dimensione corretta
-assert model.output_head.in_features == config.D_MODEL
-assert model.output_head.out_features == 2 * config.DIM_2N
+assert model.output_head[0].in_features == config.D_MODEL
+assert model.output_head[-1].out_features == 2 * config.DIM_2N
 passed += 2
 print(f"  Output head Linear({config.D_MODEL} -> {2 * config.DIM_2N}): OK")
 
@@ -255,7 +255,7 @@ loss_perf, fid_perf = criterion(target_norm, target_norm)
 assert fid_perf.item() > 0.99, f"Fidelity con se stesso = {fid_perf.item()}"
 assert loss_perf.item() < 0.01
 passed += 2
-print(f"  Fidelity(x, x) = {fid_perf.item():.6f} ≈ 1: OK")
+print(f"  Fidelity(x, x) = {fid_perf.item():.6f} ~ 1: OK")
 
 # 6d. loss + fidelity = 1
 assert abs(loss.item() + fid.item() - 1.0) < 1e-5

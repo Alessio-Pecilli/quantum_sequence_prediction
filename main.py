@@ -2,6 +2,8 @@ import math
 import time
 import os
 import gc
+import json
+import sys
 
 import torch
 import numpy as np
@@ -14,11 +16,13 @@ import config
 from input import QuantumStateDataset, generate_quantum_dynamics_dataset
 from predictor import QuantumStatePredictor, QuantumFidelityLoss
 from trainer import AdvancedTrainer
+from observables import precompute_observables, batch_observables
 
 
 # ===== Directory per i risultati =====
 RESULTS_DIR = "results"
 os.makedirs(RESULTS_DIR, exist_ok=True)
+generated_plots = []
 
 
 # ============================================================
@@ -29,7 +33,8 @@ print("  QUANTUM SEQUENCE PREDICTION — TRAINING PIPELINE")
 print("=" * 70)
 print(f"  Hamiltoniana:    {config.HAMILTONIAN_TYPE} (fissata)")
 print(f"  Qubit:           {config.N_QUBITS}  (dim. Hilbert: {config.DIM_2N})")
-print(f"  Sequenza:        {config.SEQ_LEN} step  (dt={config.DT})")
+print(f"  Sequenza:        SEQ_LEN={config.SEQ_LEN} (stati totali={config.SEQ_LEN + 1})  (dt={config.DT})")
+print(f"  Rollout:         T1={config.T1} (context)  T2={config.T2} (horizon)  (max={config.SEQ_LEN + 1})")
 print(f"  Modello:         d={config.D_MODEL}, heads={config.NUM_HEADS}, layers={config.NUM_LAYERS}")
 print(f"  Training data:   {config.B_TRAIN} H × {config.S_TRAIN} stati = {config.B_TRAIN * config.S_TRAIN}")
 print(f"  Test data:       {config.B_TEST} H × {config.S_TEST} stati = {config.B_TEST * config.S_TEST}")
@@ -196,6 +201,147 @@ best_test_epoch = history["test_fidelity"].index(best_test_fid) + 1
 
 
 # ============================================================
+#  4b. ROLLOUT AUTOREGRESSIVO (FIDELITY + OSSERVABILI) SU TRAIN/TEST
+# ============================================================
+obs_curves = None
+test_rollout_curves = None
+if config.OBSERVABLE_PLOTS_ENABLED:
+    print(f"\n[4b/6] Rollout autoregressivo: fidelity + osservabili (Train/Test)...")
+
+    t1 = int(config.T1)
+    t2 = int(config.T2)
+    device = torch.device(config.DEVICE)
+
+    z_eigs, zz_nn_eigs, x_flip_idx = precompute_observables(config.N_QUBITS, device=device)
+
+    max_samples = int(config.OBSERVABLE_PLOT_SAMPLES)
+    if max_samples > 0:
+        print(f"  Max traiettorie per split: {max_samples}")
+    else:
+        print(f"  Max traiettorie per split: ALL (puo' essere lento)")
+
+    def _rollout_curves(data_loader, split_name: str):
+        fid_sum = torch.zeros(t2, device=device, dtype=torch.float64)
+        fid_sumsq = torch.zeros(t2, device=device, dtype=torch.float64)
+
+        mz_pred_sum = torch.zeros(t2, device=device, dtype=torch.float64)
+        mz_pred_sumsq = torch.zeros(t2, device=device, dtype=torch.float64)
+        mz_true_sum = torch.zeros(t2, device=device, dtype=torch.float64)
+        mz_true_sumsq = torch.zeros(t2, device=device, dtype=torch.float64)
+
+        mx_pred_sum = torch.zeros(t2, device=device, dtype=torch.float64)
+        mx_pred_sumsq = torch.zeros(t2, device=device, dtype=torch.float64)
+        mx_true_sum = torch.zeros(t2, device=device, dtype=torch.float64)
+        mx_true_sumsq = torch.zeros(t2, device=device, dtype=torch.float64)
+
+        cz_pred_sum = torch.zeros(t2, device=device, dtype=torch.float64)
+        cz_pred_sumsq = torch.zeros(t2, device=device, dtype=torch.float64)
+        cz_true_sum = torch.zeros(t2, device=device, dtype=torch.float64)
+        cz_true_sumsq = torch.zeros(t2, device=device, dtype=torch.float64)
+
+        count = 0
+
+        model.eval()
+        with torch.no_grad():
+            for step, (x_batch_cpu, y_batch_cpu) in enumerate(data_loader, start=1):
+                if max_samples > 0 and count >= max_samples:
+                    break
+
+                if max_samples > 0:
+                    remaining = max(0, max_samples - count)
+                    if remaining == 0:
+                        break
+                    x_batch_cpu = x_batch_cpu[:remaining]
+                    y_batch_cpu = y_batch_cpu[:remaining]
+
+                batch_size = x_batch_cpu.shape[0]
+                count += batch_size
+
+                x_batch = x_batch_cpu.to(config.DEVICE, non_blocking=non_blocking)
+                # target[t] corrisponde allo stato a tempo (t+1); vogliamo tempi T1..T1+T2-1
+                y_future = y_batch_cpu[:, t1 - 1 : t1 - 1 + t2, :].to(
+                    config.DEVICE, non_blocking=non_blocking
+                )
+
+                # Finestra iniziale (ground-truth): stati a tempi 0..T1-1
+                window = x_batch[:, :t1, :].clone()
+                window_buf = torch.empty_like(window)
+
+                for k in range(t2):
+                    pred_seq = model(window)  # (batch, T1, dim), pred_seq[:, t] ~ state(t+1)
+                    next_pred = pred_seq[:, -1, :]  # (batch, dim)
+                    next_true = y_future[:, k, :]  # (batch, dim)
+
+                    overlap = torch.sum(next_true.conj() * next_pred, dim=-1)  # (batch,)
+                    fid = (torch.abs(overlap) ** 2).double()  # (batch,)
+                    fid_sum[k] += fid.sum()
+                    fid_sumsq[k] += fid.pow(2).sum()
+
+                    mz_p, mx_p, cz_p = batch_observables(next_pred, z_eigs, zz_nn_eigs, x_flip_idx)
+                    mz_t, mx_t, cz_t = batch_observables(next_true, z_eigs, zz_nn_eigs, x_flip_idx)
+
+                    mz_pred_sum[k] += mz_p.double().sum()
+                    mz_pred_sumsq[k] += mz_p.double().pow(2).sum()
+                    mz_true_sum[k] += mz_t.double().sum()
+                    mz_true_sumsq[k] += mz_t.double().pow(2).sum()
+
+                    mx_pred_sum[k] += mx_p.double().sum()
+                    mx_pred_sumsq[k] += mx_p.double().pow(2).sum()
+                    mx_true_sum[k] += mx_t.double().sum()
+                    mx_true_sumsq[k] += mx_t.double().pow(2).sum()
+
+                    cz_pred_sum[k] += cz_p.double().sum()
+                    cz_pred_sumsq[k] += cz_p.double().pow(2).sum()
+                    cz_true_sum[k] += cz_t.double().sum()
+                    cz_true_sumsq[k] += cz_t.double().pow(2).sum()
+
+                    # Shift a finestra fissa (T1): drop del primo, append del predetto
+                    if t1 > 1:
+                        window_buf[:, :-1, :] = window[:, 1:, :]
+                    window_buf[:, -1, :] = next_pred
+                    window, window_buf = window_buf, window
+
+                    del pred_seq, next_pred, next_true, overlap, fid, mz_p, mx_p, cz_p, mz_t, mx_t, cz_t
+
+                del x_batch_cpu, y_batch_cpu, x_batch, y_future, window, window_buf
+                if config.GC_COLLECT_EVERY_N_STEPS > 0 and step % config.GC_COLLECT_EVERY_N_STEPS == 0:
+                    gc.collect()
+
+        den_roll = max(1, count)
+
+        def _mean_std(sum_, sumsq_):
+            mean_ = sum_ / den_roll
+            var_ = (sumsq_ / den_roll) - mean_.pow(2)
+            std_ = torch.sqrt(torch.clamp(var_, min=0.0))
+            return mean_.cpu().float().numpy(), std_.cpu().float().numpy()
+
+        curves = {
+            "fid": _mean_std(fid_sum, fid_sumsq),
+            "mz_pred": _mean_std(mz_pred_sum, mz_pred_sumsq),
+            "mz_true": _mean_std(mz_true_sum, mz_true_sumsq),
+            "mx_pred": _mean_std(mx_pred_sum, mx_pred_sumsq),
+            "mx_true": _mean_std(mx_true_sum, mx_true_sumsq),
+            "cz_pred": _mean_std(cz_pred_sum, cz_pred_sumsq),
+            "cz_true": _mean_std(cz_true_sum, cz_true_sumsq),
+            "n_samples": count,
+        }
+
+        fid_mean = curves["fid"][0]
+        if fid_mean.size > 0:
+            print(
+                f"  [ROLL] {split_name:5s} n={count:4d}  "
+                f"F_mean={float(fid_mean.mean()):.4f}  F_last={float(fid_mean[-1]):.4f}"
+            )
+        else:
+            print(f"  [ROLL] {split_name:5s} n={count:4d}  (no data)")
+
+        return curves
+
+    obs_curves = _rollout_curves(train_loader, "Train")
+    test_rollout_curves = _rollout_curves(test_loader, "Test")
+
+
+# ============================================================
 #  5. GRAFICI
 # ============================================================
 print(f"\n[5/6] Generando grafici...")
@@ -273,8 +419,170 @@ ax.set_title("Generalization Gap")
 ax.grid(True, alpha=0.3)
 
 plt.tight_layout()
-plt.savefig(os.path.join(RESULTS_DIR, "training_report.png"), dpi=150, bbox_inches="tight")
+training_report_path = os.path.join(RESULTS_DIR, "training_report.png")
+plt.savefig(training_report_path, dpi=150, bbox_inches="tight")
 plt.close()
+generated_plots.append(training_report_path)
+print(f"  [PLOT] {training_report_path}")
+
+# --- Fig OBS: Osservabili su rollout (train) ---
+if obs_curves is not None:
+    fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+    fig.suptitle(
+        f"Osservabili su rollout (Train Set)  -  n={obs_curves['n_samples']}",
+        fontsize=13,
+        fontweight="bold",
+    )
+
+    t_axis = (np.arange(config.T2, dtype=np.float32) + config.T1) * float(config.DT)
+
+    # m^z
+    ax = axes[0]
+    mz_pred_mean, mz_pred_std = obs_curves["mz_pred"]
+    mz_true_mean, mz_true_std = obs_curves["mz_true"]
+    ax.plot(t_axis, mz_true_mean, label="Esatto", color="black", linewidth=2)
+    ax.fill_between(t_axis, mz_true_mean - mz_true_std, mz_true_mean + mz_true_std, color="black", alpha=0.15)
+    ax.plot(t_axis, mz_pred_mean, label="Rollout Modello", color="tab:blue", linewidth=2)
+    ax.fill_between(
+        t_axis,
+        mz_pred_mean - mz_pred_std,
+        mz_pred_mean + mz_pred_std,
+        color="tab:blue",
+        alpha=0.20,
+    )
+    ax.set_ylabel("m^z")
+    ax.set_title(r"$m^z(t)=\frac{1}{N}\sum_i \langle Z_i\rangle$")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    # m^x
+    ax = axes[1]
+    mx_pred_mean, mx_pred_std = obs_curves["mx_pred"]
+    mx_true_mean, mx_true_std = obs_curves["mx_true"]
+    ax.plot(t_axis, mx_true_mean, label="Esatto", color="black", linewidth=2)
+    ax.fill_between(t_axis, mx_true_mean - mx_true_std, mx_true_mean + mx_true_std, color="black", alpha=0.15)
+    ax.plot(t_axis, mx_pred_mean, label="Rollout Modello", color="tab:orange", linewidth=2)
+    ax.fill_between(
+        t_axis,
+        mx_pred_mean - mx_pred_std,
+        mx_pred_mean + mx_pred_std,
+        color="tab:orange",
+        alpha=0.20,
+    )
+    ax.set_ylabel("m^x")
+    ax.set_title(r"$m^x(t)=\frac{1}{N}\sum_i \langle X_i\rangle$")
+    ax.grid(True, alpha=0.3)
+
+    # c^z (nearest neighbor)
+    ax = axes[2]
+    cz_pred_mean, cz_pred_std = obs_curves["cz_pred"]
+    cz_true_mean, cz_true_std = obs_curves["cz_true"]
+    ax.plot(t_axis, cz_true_mean, label="Esatto", color="black", linewidth=2)
+    ax.fill_between(t_axis, cz_true_mean - cz_true_std, cz_true_mean + cz_true_std, color="black", alpha=0.15)
+    ax.plot(t_axis, cz_pred_mean, label="Rollout Modello", color="tab:green", linewidth=2)
+    ax.fill_between(
+        t_axis,
+        cz_pred_mean - cz_pred_std,
+        cz_pred_mean + cz_pred_std,
+        color="tab:green",
+        alpha=0.20,
+    )
+    ax.set_ylabel("c^z")
+    ax.set_xlabel("Tempo (t)")
+    ax.set_title(r"$c^z(t)=\frac{1}{N-1}\sum_i \langle Z_i Z_{i+1}\rangle$")
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    observables_path = os.path.join(RESULTS_DIR, "observables_rollout_train.png")
+    plt.savefig(observables_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    generated_plots.append(observables_path)
+    print(f"  [PLOT] {observables_path}")
+
+# --- Fig ROLL: Fidelity + osservabili su rollout (test) ---
+if test_rollout_curves is not None:
+    fig, axes = plt.subplots(4, 1, figsize=(12, 13), sharex=True)
+    fig.suptitle(
+        f"Rollout (Test Set)  -  n={test_rollout_curves['n_samples']}  (T1={config.T1}, T2={config.T2})",
+        fontsize=13,
+        fontweight="bold",
+    )
+
+    t_axis = (np.arange(config.T2, dtype=np.float32) + config.T1) * float(config.DT)
+
+    # Fidelity
+    ax = axes[0]
+    fid_mean, fid_std = test_rollout_curves["fid"]
+    ax.plot(t_axis, fid_mean, label="Fidelity rollout", color="tab:purple", linewidth=2)
+    ax.fill_between(t_axis, fid_mean - fid_std, fid_mean + fid_std, color="tab:purple", alpha=0.20)
+    ax.set_ylabel("Fidelity")
+    ax.set_ylim(0.0, 1.0)
+    ax.set_title(r"$F(t)=|\langle \psi_{\mathrm{true}}(t) | \psi_{\mathrm{pred}}(t)\rangle|^2$")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    # m^z
+    ax = axes[1]
+    mz_pred_mean, mz_pred_std = test_rollout_curves["mz_pred"]
+    mz_true_mean, mz_true_std = test_rollout_curves["mz_true"]
+    ax.plot(t_axis, mz_true_mean, label="Esatto", color="black", linewidth=2)
+    ax.fill_between(t_axis, mz_true_mean - mz_true_std, mz_true_mean + mz_true_std, color="black", alpha=0.15)
+    ax.plot(t_axis, mz_pred_mean, label="Rollout Modello", color="tab:blue", linewidth=2)
+    ax.fill_between(
+        t_axis,
+        mz_pred_mean - mz_pred_std,
+        mz_pred_mean + mz_pred_std,
+        color="tab:blue",
+        alpha=0.20,
+    )
+    ax.set_ylabel("m^z")
+    ax.set_title(r"$m^z(t)=\frac{1}{N}\sum_i \langle Z_i\rangle$")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    # m^x
+    ax = axes[2]
+    mx_pred_mean, mx_pred_std = test_rollout_curves["mx_pred"]
+    mx_true_mean, mx_true_std = test_rollout_curves["mx_true"]
+    ax.plot(t_axis, mx_true_mean, label="Esatto", color="black", linewidth=2)
+    ax.fill_between(t_axis, mx_true_mean - mx_true_std, mx_true_mean + mx_true_std, color="black", alpha=0.15)
+    ax.plot(t_axis, mx_pred_mean, label="Rollout Modello", color="tab:orange", linewidth=2)
+    ax.fill_between(
+        t_axis,
+        mx_pred_mean - mx_pred_std,
+        mx_pred_mean + mx_pred_std,
+        color="tab:orange",
+        alpha=0.20,
+    )
+    ax.set_ylabel("m^x")
+    ax.set_title(r"$m^x(t)=\frac{1}{N}\sum_i \langle X_i\rangle$")
+    ax.grid(True, alpha=0.3)
+
+    # c^z (nearest neighbor)
+    ax = axes[3]
+    cz_pred_mean, cz_pred_std = test_rollout_curves["cz_pred"]
+    cz_true_mean, cz_true_std = test_rollout_curves["cz_true"]
+    ax.plot(t_axis, cz_true_mean, label="Esatto", color="black", linewidth=2)
+    ax.fill_between(t_axis, cz_true_mean - cz_true_std, cz_true_mean + cz_true_std, color="black", alpha=0.15)
+    ax.plot(t_axis, cz_pred_mean, label="Rollout Modello", color="tab:green", linewidth=2)
+    ax.fill_between(
+        t_axis,
+        cz_pred_mean - cz_pred_std,
+        cz_pred_mean + cz_pred_std,
+        color="tab:green",
+        alpha=0.20,
+    )
+    ax.set_ylabel("c^z")
+    ax.set_xlabel("Tempo (t)")
+    ax.set_title(r"$c^z(t)=\frac{1}{N-1}\sum_i \langle Z_i Z_{i+1}\rangle$")
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    rollout_test_path = os.path.join(RESULTS_DIR, "rollout_test_report.png")
+    plt.savefig(rollout_test_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    generated_plots.append(rollout_test_path)
+    print(f"  [PLOT] {rollout_test_path}")
 
 # --- Fig 5: Distribuzione fidelity sul test set ---
 fig, axes = plt.subplots(1, 2, figsize=(12, 5))
@@ -302,8 +610,11 @@ ax.set_title("Boxplot Fidelity per step")
 ax.grid(True, alpha=0.3, axis="y")
 
 plt.tight_layout()
-plt.savefig(os.path.join(RESULTS_DIR, "fidelity_distribution.png"), dpi=150, bbox_inches="tight")
+fid_dist_path = os.path.join(RESULTS_DIR, "fidelity_distribution.png")
+plt.savefig(fid_dist_path, dpi=150, bbox_inches="tight")
 plt.close()
+generated_plots.append(fid_dist_path)
+print(f"  [PLOT] {fid_dist_path}")
 
 # --- Fig 7: LR vs Loss (fase space) ---
 fig, axes = plt.subplots(1, 2, figsize=(12, 5))
@@ -334,10 +645,102 @@ if "lr" in history:
     ax.grid(True, alpha=0.3)
 
 plt.tight_layout()
-plt.savefig(os.path.join(RESULTS_DIR, "lr_analysis.png"), dpi=150, bbox_inches="tight")
+lr_analysis_path = os.path.join(RESULTS_DIR, "lr_analysis.png")
+plt.savefig(lr_analysis_path, dpi=150, bbox_inches="tight")
 plt.close()
+generated_plots.append(lr_analysis_path)
+print(f"  [PLOT] {lr_analysis_path}")
 
-print(f"  Salvati in {RESULTS_DIR}/")
+print(f"  Plot salvati in {RESULTS_DIR}/ ({len(generated_plots)} file)")
+for p in generated_plots:
+    print(f"    - {p}")
+
+summary = {
+    "results_dir": RESULTS_DIR,
+    "plots": [os.path.basename(p) for p in generated_plots],
+    "device": config.DEVICE,
+    "python": sys.version.split()[0],
+    "torch": getattr(torch, "__version__", "unknown"),
+    "numpy": getattr(np, "__version__", "unknown"),
+    "config": {
+        "HAMILTONIAN_TYPE": config.HAMILTONIAN_TYPE,
+        "N_QUBITS": int(config.N_QUBITS),
+        "DIM_2N": int(config.DIM_2N),
+        "DT": float(config.DT),
+        "SEQ_LEN": int(config.SEQ_LEN),
+        "T1": int(config.T1),
+        "T2": int(config.T2),
+        "B_TRAIN": int(config.B_TRAIN),
+        "S_TRAIN": int(config.S_TRAIN),
+        "B_TEST": int(config.B_TEST),
+        "S_TEST": int(config.S_TEST),
+        "BATCH_SIZE": int(config.BATCH_SIZE),
+        "EPOCHS": int(config.EPOCHS),
+        "D_MODEL": int(config.D_MODEL),
+        "NUM_HEADS": int(config.NUM_HEADS),
+        "NUM_LAYERS": int(config.NUM_LAYERS),
+    },
+    "training": {
+        "actual_epochs": int(actual_epochs),
+        "total_train_time_s": float(total_train_time),
+        "best_test_epoch": int(best_test_epoch),
+        "final_train_loss": float(final_tr_loss),
+        "final_test_loss": float(final_te_loss),
+        "final_train_fidelity": float(final_tr_fid),
+        "final_test_fidelity": float(final_te_fid),
+    },
+    "test_eval": {
+        "mean_fidelity": float(mean_fid),
+        "mean_loss": float(mean_loss),
+        "test_ppl": float(test_ppl),
+    },
+    "observables_rollout_train": {
+        "enabled": bool(config.OBSERVABLE_PLOTS_ENABLED),
+        "n_samples": int(obs_curves["n_samples"]) if obs_curves is not None else 0,
+        "obs_plot_samples_cfg": int(config.OBSERVABLE_PLOT_SAMPLES),
+    },
+    "rollout_test": {
+        "enabled": bool(config.OBSERVABLE_PLOTS_ENABLED),
+        "n_samples": int(test_rollout_curves["n_samples"]) if test_rollout_curves is not None else 0,
+        "fidelity_mean_over_horizon": float(test_rollout_curves["fid"][0].mean())
+        if test_rollout_curves is not None
+        else None,
+        "fidelity_last_step": float(test_rollout_curves["fid"][0][-1])
+        if test_rollout_curves is not None
+        else None,
+    },
+}
+
+summary_json_path = os.path.join(RESULTS_DIR, "run_summary.json")
+with open(summary_json_path, "w", encoding="utf-8") as f:
+    json.dump(summary, f, indent=2, ensure_ascii=False)
+print(f"  [SUMMARY] {summary_json_path}")
+
+summary_txt_path = os.path.join(RESULTS_DIR, "run_summary.txt")
+with open(summary_txt_path, "w", encoding="utf-8") as f:
+    f.write("QUANTUM SEQUENCE PREDICTION - RUN SUMMARY\n")
+    f.write("=" * 60 + "\n")
+    f.write(f"Device: {summary['device']}\n")
+    f.write(f"Python: {summary['python']}  Torch: {summary['torch']}  Numpy: {summary['numpy']}\n")
+    f.write("\nConfig:\n")
+    for k, v in summary["config"].items():
+        f.write(f"  {k}: {v}\n")
+    f.write("\nTraining:\n")
+    for k, v in summary["training"].items():
+        f.write(f"  {k}: {v}\n")
+    f.write("\nTest eval:\n")
+    for k, v in summary["test_eval"].items():
+        f.write(f"  {k}: {v}\n")
+    f.write("\nObservables rollout (train):\n")
+    for k, v in summary["observables_rollout_train"].items():
+        f.write(f"  {k}: {v}\n")
+    f.write("\nRollout (test):\n")
+    for k, v in summary["rollout_test"].items():
+        f.write(f"  {k}: {v}\n")
+    f.write("\nPlots:\n")
+    for p in summary["plots"]:
+        f.write(f"  - {p}\n")
+print(f"  [SUMMARY] {summary_txt_path}")
 
 
 # ============================================================
