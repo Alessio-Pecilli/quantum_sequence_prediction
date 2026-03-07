@@ -391,7 +391,7 @@ class AdvancedTrainer:
 
         # --- torch.compile per velocizzare (PyTorch 2.0+) ---
         # In MEMORY_SAFE_MODE lo disattiviamo per evitare picchi memoria in compilazione.
-        compile_enabled = config.TORCH_COMPILE and not config.MEMORY_SAFE_MODE
+        compile_enabled = config.TORCH_COMPILE and not config.MEMORY_SAFE_MODE and device == "cuda"
         if compile_enabled and hasattr(torch, 'compile'):
             try:
                 self.model = torch.compile(
@@ -406,6 +406,8 @@ class AdvancedTrainer:
         else:
             if config.TORCH_COMPILE and config.MEMORY_SAFE_MODE:
                 print("  [MEM] MEMORY_SAFE_MODE attivo: torch.compile disabilitato.")
+            if config.TORCH_COMPILE and device != "cuda":
+                print("  [INFO] torch.compile abilitato in config ma device!=cuda: compilazione disabilitata.")
             self._compiled = False
 
         # --- Ottimizzatore: AdamW (Adam con weight decay decoupled) ---

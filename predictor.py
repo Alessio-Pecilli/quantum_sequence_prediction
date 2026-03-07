@@ -5,6 +5,33 @@ import config
 from embedding import ComplexEmbedding
 
 
+def _dynamo_disable(fn):
+    disable = getattr(torch, "_dynamo", None)
+    if disable is not None and hasattr(disable, "disable"):
+        return disable.disable(fn)
+    compiler = getattr(torch, "compiler", None)
+    if compiler is not None and hasattr(compiler, "disable"):
+        return compiler.disable(fn)
+    return fn
+
+
+@_dynamo_disable
+def _complex_to_real_features(x_complex: torch.Tensor) -> torch.Tensor:
+    # (B, T, D) complex -> (B, T, 2D) float without triggering Inductor complex lowering.
+    return torch.view_as_real(x_complex).flatten(-2)
+
+
+@_dynamo_disable
+def _normalize_and_pack_complex(real_raw: torch.Tensor, imag_raw: torch.Tensor) -> torch.Tensor:
+    # Normalizzazione L2 a norma unitaria: ||psi||^2 = 1 (in FP32 per stabilità + AMP compatibility).
+    real_f32 = real_raw.float()
+    imag_f32 = imag_raw.float()
+    norm = torch.sqrt((real_f32.square() + imag_f32.square()).sum(dim=-1, keepdim=True)).clamp(min=1e-8)
+    real_f32 = real_f32 / norm
+    imag_f32 = imag_f32 / norm
+    return torch.complex(real_f32, imag_f32)
+
+
 class RotaryPositionalEncoding(nn.Module):
     """
     Rotary Positional Encoding (RoPE) â€” Su, Lu et al. 2021.
@@ -123,8 +150,11 @@ class QuantumStatePredictor(nn.Module):
         x_complex: Input tensor di shape (batch_size, seq_len, dim_2n) (DEVE essere torch.complex64 o complex128)
         Ritorna: Tensore complesso di shape (batch_size, seq_len, dim_2n)
         """
-        # A. Elaborazione iniziale: trasformiamo il tensore complesso in un embedding reale d-dimensionale
-        h = self.embedding(x_complex)
+        # A. Convertiamo complesso -> reale fuori dal grafo compilato (TorchInductor non supporta complessi).
+        x_real = _complex_to_real_features(x_complex)
+
+        # A2. Proiezione verso lo spazio latente d-dimensionale
+        h = self.embedding.projection(x_real)
 
         # A2. Iniezione informazione posizionale temporale (RoPE)
         h = self.rope(h)
@@ -140,11 +170,5 @@ class QuantumStatePredictor(nn.Module):
         real_raw, imag_raw = torch.chunk(out_raw, chunks=2, dim=-1)
 
         # --- STATO COMPLESSO + VINCOLO FISICO ---
-        # Costruiamo lo stato complesso da Re/Im (gradienti diretti, no bottleneck softmax)
-        complex_state = torch.complex(real_raw, imag_raw)
-
-        # Normalizzazione L2 a norma unitaria: ||Ïˆ||Â² = 1
-        norm = torch.linalg.vector_norm(complex_state, dim=-1, keepdim=True).clamp(min=1e-8)
-        complex_state = complex_state / norm
-
-        return complex_state
+        # Pack + normalizzazione fuori dal grafo compilato (evita lowering complessi).
+        return _normalize_and_pack_complex(real_raw, imag_raw)
