@@ -25,8 +25,9 @@ def _env_int(name: str, default: int) -> int:
     except ValueError as e:
         raise ValueError(f"Env var {name} deve essere un intero, ricevuto: {raw!r}") from e
 
+
 # Dimensione dello spazio di embedding (2^n per n qubit)
-# Per 10 qubit (2048 feature reali) → 512 riduce la compressione a ~4:1
+# Per 10 qubit (2048 feature reali) â†’ 512 riduce la compressione a ~4:1
 D_MODEL = 512
 
 # Numero di teste di attenzione nel Transformer
@@ -38,7 +39,7 @@ NUM_HEADS = 8
 NUM_LAYERS = 6
 
 # Dimensione hidden del Feed-Forward Network nel Transformer
-# Rapporto standard 4× d_model (Vaswani et al.)
+# Rapporto standard 4Ã— d_model (Vaswani et al.)
 DIM_FEEDFORWARD = 2048
 
 # Dropout nel Transformer (regolarizzazione)
@@ -52,7 +53,7 @@ DROPOUT = 0.05
 N_QUBITS = _env_int("QSP_N_QUBITS", 6)
 
 # Dimensione dello spazio di Hilbert (2^n)
-DIM_2N = 2 ** N_QUBITS
+DIM_2N = 2**N_QUBITS
 
 # Parametri dell'Hamiltoniana TFIM
 J_RANGE = (0.5, 1.5)
@@ -124,19 +125,19 @@ LEARNING_RATE = 2e-3
 # Ridotto: meno regolarizzazione per contrastare l'underfitting
 WEIGHT_DECAY = 1e-4
 
-# Gradient clipping (max norm) — stabilizza il training dei Transformer
+# Gradient clipping (max norm) â€” stabilizza il training dei Transformer
 GRAD_CLIP_MAX_NORM = 1.0
 
 # ===== Configurazione Learning Rate Scheduler =====
 
-# Warmup: numero di epoche con rampa lineare da 0 → LEARNING_RATE
+# Warmup: numero di epoche con rampa lineare da 0 â†’ LEARNING_RATE
 # 10 ep. con LR alto per stabilizzare l'inizio
 LR_WARMUP_EPOCHS = 10
 
 # Tipo di scheduler dopo il warmup:
-#   "cosine"            → Cosine Annealing fino a LR_MIN
-#   "plateau"           → ReduceLROnPlateau (reattivo alla loss)
-#   "cosine+plateau"    → Cosine Annealing + fallback ReduceLROnPlateau
+#   "cosine"            â†’ Cosine Annealing fino a LR_MIN
+#   "plateau"           â†’ ReduceLROnPlateau (reattivo alla loss)
+#   "cosine+plateau"    â†’ Cosine Annealing + fallback ReduceLROnPlateau
 # Solo cosine: plateau puo' ridurre il LR troppo presto causando stagnazione
 LR_SCHEDULER_TYPE = "cosine"
 
@@ -179,9 +180,9 @@ CHECKPOINT_EVERY_N_EPOCHS = 0
 # ===== Configurazione Resume Training =====
 
 # Se True, PROVA a riprendere il training dall'ultimo checkpoint salvato.
-# Il sistema verifica automaticamente la compatibilità dell'architettura:
-#   - Se i parametri salvati sono compatibili (stessa architettura) → riprende
-#   - Se NON sono compatibili (es. d_model diverso, n_qubits diverso) → parte da zero
+# Il sistema verifica automaticamente la compatibilitÃ  dell'architettura:
+#   - Se i parametri salvati sono compatibili (stessa architettura) â†’ riprende
+#   - Se NON sono compatibili (es. d_model diverso, n_qubits diverso) â†’ parte da zero
 # Se False, parte SEMPRE da zero ignorando qualsiasi checkpoint esistente.
 RESUME_TRAINING = False
 
@@ -190,7 +191,7 @@ LAST_CHECKPOINT_PATH = "results/last_checkpoint.pt"
 
 # ===== Configurazione EMA (Exponential Moving Average) =====
 
-# Attiva EMA dei pesi del modello per una valutazione più stabile
+# Attiva EMA dei pesi del modello per una valutazione piÃ¹ stabile
 EMA_ENABLED = True
 
 # Decay factor per EMA (tipicamente 0.999 - 0.9999)
@@ -205,19 +206,19 @@ AMP_ENABLED = True
 # ===== Memory Management =====
 
 # Modalita' conservativa: riduce i picchi di memoria a costo di throughput.
-MEMORY_SAFE_MODE = True
+MEMORY_SAFE_MODE = False
 
 # Micro-batch reale processato dal modello per volta.
 # 0 = usa direttamente BATCH_SIZE senza split.
-MICRO_BATCH_SIZE = 4
+MICRO_BATCH_SIZE = 0
 
 # Cleanup periodico Python GC durante train/eval (step).
 # 0 = disabilitato.
-GC_COLLECT_EVERY_N_STEPS = 25
+GC_COLLECT_EVERY_N_STEPS = 0
 
 # Svuota la cache CUDA periodicamente (utile su sessioni lunghe).
 # 0 = disabilitato.
-CUDA_EMPTY_CACHE_EVERY_N_STEPS = 50
+CUDA_EMPTY_CACHE_EVERY_N_STEPS = 0
 
 # ===== Gradient Accumulation =====
 
@@ -233,13 +234,13 @@ GRAD_ACCUMULATION_STEPS = 3
 TORCH_COMPILE = True
 
 # Backend per torch.compile: "inductor" (richiede compilatore C++), "aot_eager" (no dipendenze esterne)
-TORCH_COMPILE_BACKEND = "aot_eager"
+TORCH_COMPILE_BACKEND = "inductor"
 
 # ===== DataLoader =====
 
 # Numero di worker per il caricamento dati (0 = main process)
 # Su CPU con dati gia' in memoria, 0 e' ottimale (evita overhead IPC)
-NUM_WORKERS = 0
+NUM_WORKERS = 2
 
 # Pin memory accelera il trasferimento CPU->GPU quando il device e' CUDA.
 PIN_MEMORY = True
@@ -257,12 +258,15 @@ OBSERVABLE_PLOTS_ENABLED = True
 # Se <= 0 usa tutto il training set (puo' essere lento).
 OBSERVABLE_PLOT_SAMPLES = _env_int("QSP_OBS_PLOT_SAMPLES", 256)
 
+
 # Device (gpu o cpu) - determinato al momento dell'uso
 def get_device():
     try:
         import torch
+
         return "cuda" if torch.cuda.is_available() else "cpu"
     except ImportError:
         return "cpu"
+
 
 DEVICE = get_device()
