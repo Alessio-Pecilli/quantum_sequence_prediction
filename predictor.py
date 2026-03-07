@@ -100,12 +100,12 @@ class QuantumFidelityLoss(nn.Module):
         super().__init__()
 
     def forward(self, state_pred, state_target):
-        loss = torch.mean(torch.abs(state_pred - state_target) ** 2)
-
-        with torch.no_grad():
-            overlap = torch.sum(state_target.conj() * state_pred, dim=-1)
-            fidelity = torch.abs(overlap) ** 2
-            mean_fidelity = fidelity.mean()
+        # Loss = infidelity = 1 - F, dove F = |<target|pred>|² (overlap al quadrato).
+        # Metrica naturale per stati quantistici: 0 = perfetto, 1 = ortogonali.
+        overlap = torch.sum(state_target.conj() * state_pred, dim=-1)  # (batch, seq)
+        fidelity = torch.abs(overlap) ** 2  # (batch, seq)
+        mean_fidelity = fidelity.mean()
+        loss = 1.0 - mean_fidelity
 
         return loss, mean_fidelity
 

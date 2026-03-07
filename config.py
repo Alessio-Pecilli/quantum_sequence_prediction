@@ -109,8 +109,9 @@ if T1 + T2 > SEQ_LEN + 1:
         f"Aumenta SEQ_LEN (env QSP_SEQ_LEN) o riduci T1/T2 (env QSP_T1/QSP_T2)."
     )
 
-# Dimensione del batch (su CPU batch grandi riducono l'overhead per iterazione)
-BATCH_SIZE = _env_int("QSP_BATCH_SIZE", 32)
+# Dimensione del batch. T4 (16GB) regge batch=64 con d_model=512, seq_len=100.
+# Piu' grande = meno iterazioni per epoca = piu' veloce.
+BATCH_SIZE = _env_int("QSP_BATCH_SIZE", 64)
 
 # Numero di epoche di addestramento
 EPOCHS = _env_int("QSP_EPOCHS", 200)
@@ -118,8 +119,8 @@ EPOCHS = _env_int("QSP_EPOCHS", 200)
 # ===== Configurazione Ottimizzatore =====
 
 # Learning rate iniziale (peak dopo warmup)
-# Alto per compensare gradienti deboli della fidelity loss in dim=1024
-LEARNING_RATE = 2e-3
+# Loss = infidelity (1 - F), range [0, 1]. LR standard per Transformer.
+LEARNING_RATE = 1e-3
 
 # Weight decay per AdamW (regolarizzazione L2)
 # Ridotto: meno regolarizzazione per contrastare l'underfitting
@@ -175,7 +176,8 @@ SAVE_BEST_MODEL = True
 BEST_MODEL_PATH = "results/best_model.pt"
 
 # Salva checkpoint periodici ogni N epoche (0 = disabilitato)
-CHECKPOINT_EVERY_N_EPOCHS = 0
+# Colab puo' disconnettere in qualsiasi momento: salvare spesso!
+CHECKPOINT_EVERY_N_EPOCHS = 5
 
 # ===== Configurazione Resume Training =====
 
@@ -184,7 +186,8 @@ CHECKPOINT_EVERY_N_EPOCHS = 0
 #   - Se i parametri salvati sono compatibili (stessa architettura) â†’ riprende
 #   - Se NON sono compatibili (es. d_model diverso, n_qubits diverso) â†’ parte da zero
 # Se False, parte SEMPRE da zero ignorando qualsiasi checkpoint esistente.
-RESUME_TRAINING = False
+# Su Colab: True per riprendere dopo disconnessioni.
+RESUME_TRAINING = True
 
 # Path del checkpoint di fallback (salvato automaticamente a ogni epoca)
 LAST_CHECKPOINT_PATH = "results/last_checkpoint.pt"
@@ -213,19 +216,19 @@ MEMORY_SAFE_MODE = False
 MICRO_BATCH_SIZE = 0
 
 # Cleanup periodico Python GC durante train/eval (step).
-# 0 = disabilitato.
-GC_COLLECT_EVERY_N_STEPS = 0
+# Previene memory creep su sessioni Colab lunghe.
+GC_COLLECT_EVERY_N_STEPS = 50
 
 # Svuota la cache CUDA periodicamente (utile su sessioni lunghe).
-# 0 = disabilitato.
-CUDA_EMPTY_CACHE_EVERY_N_STEPS = 0
+# Evita OOM su T4 16GB.
+CUDA_EMPTY_CACHE_EVERY_N_STEPS = 100
 
 # ===== Gradient Accumulation =====
 
 # Numero di step di accumulo prima di aggiornare i pesi
 # Simula un batch_size effettivo = BATCH_SIZE * GRAD_ACCUMULATION_STEPS
-# Con BATCH_SIZE=32, effettivo=96 per gradienti piu' stabili
-GRAD_ACCUMULATION_STEPS = 3
+# Con BATCH_SIZE=64 su T4 non serve accumulare: 1 = zero overhead.
+GRAD_ACCUMULATION_STEPS = 1
 
 # ===== Compilazione Modello =====
 

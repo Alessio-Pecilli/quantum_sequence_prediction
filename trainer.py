@@ -498,8 +498,9 @@ class AdvancedTrainer:
 
     def _force_memory_cleanup(self):
         """Cleanup completo a fine epoca/fase."""
-        gc.collect()
-        if self.device == "cuda":
+        if self.gc_every_n_steps > 0:
+            gc.collect()
+        if self.device == "cuda" and self.cuda_cache_every_n_steps > 0:
             torch.cuda.empty_cache()
             if hasattr(torch.cuda, "ipc_collect"):
                 torch.cuda.ipc_collect()
@@ -600,13 +601,15 @@ class AdvancedTrainer:
         Ritorna: (avg_loss, avg_fidelity)
         """
         self.model.train()
-        loss_acc, fid_acc = 0.0, 0.0
+        loss_acc = torch.zeros((), device=self.device, dtype=torch.float32)
+        fid_acc = torch.zeros((), device=self.device, dtype=torch.float32)
         self.optimizer.zero_grad(set_to_none=True)  # set_to_none=True e' piu' veloce
 
         n_batches = len(self.train_loader)
 
         for step, (x_batch_cpu, y_batch_cpu) in enumerate(self.train_loader, start=1):
-            batch_loss, batch_fid = 0.0, 0.0
+            batch_loss = torch.zeros((), device=self.device, dtype=torch.float32)
+            batch_fid = torch.zeros((), device=self.device, dtype=torch.float32)
 
             for x_micro_cpu, y_micro_cpu, weight in self._iter_micro_batches(x_batch_cpu, y_batch_cpu):
                 x_micro = x_micro_cpu.to(self.device, non_blocking=self.non_blocking)
@@ -624,8 +627,9 @@ class AdvancedTrainer:
                     loss_scaled = (loss * weight) / self.grad_accum_steps
                     loss_scaled.backward()
 
-                batch_loss += loss.item() * weight
-                batch_fid += fid.item() * weight
+                # Evita sync CPU-GPU: accumula su device e fai .item() solo a fine epoca.
+                batch_loss = batch_loss + (loss.detach() * weight)
+                batch_fid = batch_fid + (fid * weight)
 
                 del x_micro, y_micro, pred, loss, fid, loss_scaled
 
@@ -653,8 +657,8 @@ class AdvancedTrainer:
 
         self._force_memory_cleanup()
 
-        avg_loss = loss_acc / n_batches
-        avg_fid = fid_acc / n_batches
+        avg_loss = (loss_acc / n_batches).item()
+        avg_fid = (fid_acc / n_batches).item()
         return avg_loss, avg_fid
 
     @torch.no_grad()
@@ -670,10 +674,12 @@ class AdvancedTrainer:
             self.ema.apply_shadow(self.model)
 
         self.model.eval()
-        loss_acc, fid_acc = 0.0, 0.0
+        loss_acc = torch.zeros((), device=self.device, dtype=torch.float32)
+        fid_acc = torch.zeros((), device=self.device, dtype=torch.float32)
 
         for step, (x_batch_cpu, y_batch_cpu) in enumerate(self.test_loader, start=1):
-            batch_loss, batch_fid = 0.0, 0.0
+            batch_loss = torch.zeros((), device=self.device, dtype=torch.float32)
+            batch_fid = torch.zeros((), device=self.device, dtype=torch.float32)
 
             for x_micro_cpu, y_micro_cpu, weight in self._iter_micro_batches(x_batch_cpu, y_batch_cpu):
                 x_micro = x_micro_cpu.to(self.device, non_blocking=self.non_blocking)
@@ -682,8 +688,8 @@ class AdvancedTrainer:
                 pred = self.model(x_micro)
                 loss, fid = self.criterion(pred, y_micro)
 
-                batch_loss += loss.item() * weight
-                batch_fid += fid.item() * weight
+                batch_loss = batch_loss + (loss * weight)
+                batch_fid = batch_fid + (fid * weight)
 
                 del x_micro, y_micro, pred, loss, fid
 
@@ -699,8 +705,8 @@ class AdvancedTrainer:
 
         self._force_memory_cleanup()
 
-        avg_loss = loss_acc / len(self.test_loader)
-        avg_fid = fid_acc / len(self.test_loader)
+        avg_loss = (loss_acc / len(self.test_loader)).item()
+        avg_fid = (fid_acc / len(self.test_loader)).item()
         return avg_loss, avg_fid
 
     @staticmethod
@@ -913,8 +919,8 @@ class AdvancedTrainer:
                     marker = " *" if is_best else ""
                     print(
                         f"  Ep {epoch:3d}/{epochs}  "
-                        f"Train [Loss {train_loss:.4f}  PPL {train_ppl:.4f}]  "
-                        f"Test [Loss {test_loss:.4f}  PPL {test_ppl:.4f}]{marker}"
+                        f"Train [Loss {train_loss:.4f}  Fid {train_fid:.4f}  PPL {train_ppl:.4f}]  "
+                        f"Test [Loss {test_loss:.4f}  Fid {test_fid:.4f}  PPL {test_ppl:.4f}]{marker}"
                     )
 
                 # --- Early Stopping ---

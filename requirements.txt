@@ -1,3 +1,4 @@
-torch
+# NOTE (Colab): non installare `torch` da PyPI (rischi di finire con una wheel `+cpu`).
+# Usa il PyTorch preinstallato in Colab con runtime GPU, oppure installa esplicitamente una wheel CUDA.
 numpy
 matplotlib
