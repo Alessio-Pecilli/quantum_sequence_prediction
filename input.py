@@ -1,7 +1,22 @@
+import time
+
 import torch
 from torch.utils.data import Dataset, DataLoader
 
 import config
+
+
+def _sync_device_for_timing(device: torch.device):
+    if device.type == "cuda" and config.SYNC_CUDA_TIMINGS:
+        torch.cuda.synchronize(device=device)
+
+
+def _should_log_progress(done: int, total: int, interval: int) -> bool:
+    if total <= 0:
+        return False
+    if interval <= 0:
+        return done == total
+    return done == 1 or done == total or done % interval == 0
 
 
 class QuantumStateDataset(Dataset):
@@ -28,6 +43,73 @@ class QuantumStateDataset(Dataset):
         y_target = self.targets[idx]
 
         return x, y_target
+
+
+class QuantumTrajectoryWindowDataset(Dataset):
+    """
+    Espande traiettorie complete in campioni (contesto di lunghezza T1 -> next-step).
+
+    Per ogni traiettoria:
+      - input  = states[k-T1+1 .. k]
+      - target = state[k+1]
+
+    con k che scorre da T1-1 fino a T1+T2-2, cioe' esattamente sugli step
+    usati poi nel rollout autoregressivo.
+    """
+
+    def __init__(self, inputs_data, targets_data, context_len=config.T1, rollout_horizon=config.T2):
+        self.inputs = inputs_data
+        self.targets = targets_data
+        self.context_len = int(context_len)
+        self.rollout_horizon = int(rollout_horizon)
+
+        assert len(self.inputs) == len(self.targets), "Mismatch tra input e target!"
+        if self.context_len < 1:
+            raise ValueError(f"context_len deve essere >= 1, ricevuto: {self.context_len}")
+        if self.rollout_horizon < 1:
+            raise ValueError(f"rollout_horizon deve essere >= 1, ricevuto: {self.rollout_horizon}")
+
+        seq_len = int(self.inputs.shape[1])
+        if self.targets.shape[1] != seq_len:
+            raise ValueError(
+                f"inputs/targets devono avere la stessa seq_len, ricevuto {seq_len} e {self.targets.shape[1]}"
+            )
+        if self.context_len + self.rollout_horizon > seq_len + 1:
+            raise ValueError(
+                f"Contesto+horizon non validi: {self.context_len}+{self.rollout_horizon} > {seq_len + 1}"
+            )
+
+        self.windows_per_trajectory = self.rollout_horizon
+
+    def __len__(self):
+        return len(self.inputs) * self.windows_per_trajectory
+
+    def __getitem__(self, idx):
+        traj_idx = idx // self.windows_per_trajectory
+        rollout_idx = idx % self.windows_per_trajectory
+        end_t = self.context_len - 1 + rollout_idx
+
+        x_window = self.inputs[traj_idx, end_t - self.context_len + 1 : end_t + 1]
+        y_next = self.targets[traj_idx, end_t : end_t + 1]
+        return x_window, y_next
+
+    def describe_window(self, idx: int) -> dict[str, int]:
+        if idx < 0 or idx >= len(self):
+            raise IndexError(f"idx fuori range: {idx}")
+
+        traj_idx = idx // self.windows_per_trajectory
+        rollout_idx = idx % self.windows_per_trajectory
+        end_t = self.context_len - 1 + rollout_idx
+        start_t = end_t - self.context_len + 1
+        target_t = end_t + 1
+        return {
+            "dataset_index": int(idx),
+            "trajectory_index": int(traj_idx),
+            "rollout_index": int(rollout_idx),
+            "context_start_t": int(start_t),
+            "context_end_t": int(end_t),
+            "target_t": int(target_t),
+        }
 
 
 # --- MATRICI DI PAULI BASE ---
@@ -85,7 +167,7 @@ def _build_hamiltonian(h_type, n_qubits, params):
         J = torch.empty(1).uniform_(*params["J_range"]).item()
         g = torch.empty(1).uniform_(*params["g_range"]).item()
         H = build_tfim_hamiltonian(n_qubits, J=J, g=g)
-        return H
+        return H, {"type": h_type, "J": float(J), "g": float(g)}
     raise ValueError(f"Tipo di Hamiltoniana '{h_type}' non supportato. Opzioni: TFIM")
 
 
@@ -97,6 +179,7 @@ def generate_quantum_dynamics_dataset(
     seq_len=config.SEQ_LEN,
     dt=config.DT,
     h_params=None,
+    dataset_name="dataset",
 ):
     """
     Genera un dataset di B * S traiettorie quantistiche.
@@ -120,6 +203,7 @@ def generate_quantum_dynamics_dataset(
     """
     dim = 2**n_qubits
     total_samples = B * S
+    dataset_name = str(dataset_name).upper()
 
     # Parametri specifici per il tipo di Hamiltoniana (default da config)
     if h_params is None:
@@ -129,6 +213,18 @@ def generate_quantum_dynamics_dataset(
         }
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dataset_t0 = time.perf_counter()
+
+    if config.VERBOSE_STARTUP_LOGS:
+        print(
+            f"  [DATA:{dataset_name}] B={B}, S={S}, total={total_samples}, "
+            f"n_qubits={n_qubits}, dim={dim}, seq_len={seq_len}, dt={dt}, device={device}"
+        )
+        print(
+            f"  [DATA:{dataset_name}] Traiettoria: psi(t) per t=0..{seq_len} "
+            f"(tempo fisico 0.0..{seq_len * dt:.3f})"
+        )
+        print(f"  [DATA:{dataset_name}] Split supervisionato: inputs[t]=psi(t), targets[t]=psi(t+1)")
 
     # Generazione su GPU (se disponibile); si torna su CPU solo al termine.
     inputs_data = torch.empty((total_samples, seq_len, dim), dtype=torch.complex64, device=device)
@@ -137,16 +233,26 @@ def generate_quantum_dynamics_dataset(
     times = torch.arange(seq_len + 1, device=device, dtype=torch.float32).unsqueeze(1)  # (seq_len+1, 1)
 
     sample_idx = 0
-    for _ in range(B):
+    for h_idx in range(B):
+        hamiltonian_t0 = time.perf_counter()
+
         # 1. Costruzione Hamiltoniana b-esima (parametri estratti casualmente)
-        H_b = _build_hamiltonian(h_type, n_qubits, h_params).to(device)
+        build_t0 = time.perf_counter()
+        H_b, h_meta = _build_hamiltonian(h_type, n_qubits, h_params)
+        H_b = H_b.to(device)
+        _sync_device_for_timing(device)
+        build_time = time.perf_counter() - build_t0
 
         # 2. Diagonalizzazione: H = V diag(E) Vâ€   (eigh perchÃ© H Ã¨ Hermitiana)
         #    Costo O(dimÂ³) una tantum, poi evoluzione diventa banale.
+        diag_t0 = time.perf_counter()
         E_b, V_b = torch.linalg.eigh(H_b)
+        _sync_device_for_timing(device)
+        diag_time = time.perf_counter() - diag_t0
 
         # 3. Fasi di evoluzione nella base diagonale per tutti i time-step
         #    phase(t) = exp(-i * E * dt * t),  shape (seq_len+1, dim)
+        evolve_t0 = time.perf_counter()
         all_phases = torch.exp(-1j * E_b.unsqueeze(0) * dt * times)  # (seq_len+1, dim)
 
         # 4. Estrazione stati iniziali casuali (normalizzati) su device
@@ -164,13 +270,44 @@ def generate_quantum_dynamics_dataset(
 
         # 7. Ritorno alla base computazionale: |Ïˆ(t)> = V c(t)
         trajectory_tensor = all_coeffs @ V_b.T  # (S, seq_len+1, dim)
+        _sync_device_for_timing(device)
+        evolve_time = time.perf_counter() - evolve_t0
+        del all_coeffs, coeffs, all_phases, H_b, E_b, V_b, psi, psi_real, psi_imag
 
         # 8. Split tramite shift temporale:
         # Input: da t=0 a t=seq_len-1
         # Target: da t=1 a t=seq_len
+        store_t0 = time.perf_counter()
         inputs_data[sample_idx : sample_idx + S] = trajectory_tensor[:, :-1]
         targets_data[sample_idx : sample_idx + S] = trajectory_tensor[:, 1:]
+        _sync_device_for_timing(device)
+        store_time = time.perf_counter() - store_t0
+        del trajectory_tensor
         sample_idx += S
+
+        done = h_idx + 1
+        if config.VERBOSE_STARTUP_LOGS and _should_log_progress(
+            done, B, int(config.DATASET_LOG_EVERY_N_HAMILTONIANS)
+        ):
+            elapsed = time.perf_counter() - dataset_t0
+            eta = (elapsed / done) * (B - done) if done > 0 else 0.0
+            print(
+                f"  [DATA:{dataset_name}] H {done:3d}/{B} | "
+                f"J={h_meta['J']:.4f} g={h_meta['g']:.4f} | "
+                f"build {build_time:.3f}s diag {diag_time:.3f}s "
+                f"evolve {evolve_time:.3f}s store {store_time:.3f}s "
+                f"total {time.perf_counter() - hamiltonian_t0:.3f}s | "
+                f"elapsed {elapsed:.1f}s eta {eta:.1f}s"
+            )
+
+    _sync_device_for_timing(device)
+    total_time = time.perf_counter() - dataset_t0
+    if config.VERBOSE_STARTUP_LOGS:
+        throughput = total_samples / max(total_time, 1e-9)
+        print(
+            f"  [DATA:{dataset_name}] Completato in {total_time:.2f}s | "
+            f"throughput {throughput:.1f} traiettorie/s | shape={tuple(inputs_data.shape)}"
+        )
 
     return inputs_data.cpu(), targets_data.cpu()
 

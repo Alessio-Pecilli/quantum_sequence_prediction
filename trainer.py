@@ -14,7 +14,6 @@ Include:
 
 import math
 import time
-import copy
 import os
 import gc
 import random
@@ -34,8 +33,10 @@ class EarlyStopping:
     Ferma il training quando la metrica monitorata smette di migliorare.
 
     Supporta sia metriche da minimizzare (loss) sia da massimizzare (fidelity).
-    Salva automaticamente il miglior stato del modello.
+    Il miglior modello viene salvato su disco (non in RAM) per evitare memory bloat.
     """
+
+    _BEST_ES_PATH = "results/_early_stopping_best.pt"
 
     def __init__(
         self,
@@ -55,7 +56,7 @@ class EarlyStopping:
         self.counter = 0
         self.best_epoch = 0
         self.early_stop = False
-        self.best_model_state = None
+        self._has_saved = False
 
     def __call__(self, score: float, epoch: int, model: nn.Module) -> bool:
         """
@@ -76,8 +77,10 @@ class EarlyStopping:
             self.best_score = score
             self.best_epoch = epoch
             self.counter = 0
-            # Deep copy dello stato del modello (solo pesi, non grafi computazionali)
-            self.best_model_state = copy.deepcopy(model.state_dict())
+            # Salva su disco invece di deepcopy in RAM (~120MB risparmiati)
+            os.makedirs(os.path.dirname(self._BEST_ES_PATH) or ".", exist_ok=True)
+            torch.save(model.state_dict(), self._BEST_ES_PATH)
+            self._has_saved = True
         else:
             self.counter += 1
             if self.counter >= self.patience:
@@ -91,9 +94,11 @@ class EarlyStopping:
         return self.early_stop
 
     def restore_best_model(self, model: nn.Module):
-        """Ripristina i pesi del miglior modello trovato."""
-        if self.best_model_state is not None:
-            model.load_state_dict(self.best_model_state)
+        """Ripristina i pesi del miglior modello trovato (da disco)."""
+        if self._has_saved and os.path.exists(self._BEST_ES_PATH):
+            state = torch.load(self._BEST_ES_PATH, weights_only=True, map_location="cpu")
+            model.load_state_dict(state)
+            del state
 
 
 # ============================================================
@@ -467,6 +472,11 @@ class AdvancedTrainer:
         self.cuda_cache_every_n_steps = max(0, int(config.CUDA_EMPTY_CACHE_EVERY_N_STEPS))
         self._checkpoint_warned = False
         self._current_epoch = 0
+        self.train_log_every_n_steps = max(0, int(config.TRAIN_LOG_EVERY_N_STEPS))
+        self.eval_log_every_n_steps = max(0, int(config.EVAL_LOG_EVERY_N_STEPS))
+        self.log_batch_stats = bool(config.LOG_BATCH_STATS)
+        self.log_memory_stats = bool(config.LOG_MEMORY_STATS)
+        self.sync_cuda_timings = bool(self.device == "cuda" and config.SYNC_CUDA_TIMINGS)
 
     def _iter_micro_batches(self, x_batch: torch.Tensor, y_batch: torch.Tensor):
         """
@@ -481,6 +491,115 @@ class AdvancedTrainer:
             y_micro = y_batch[start:end]
             weight = x_micro.shape[0] / batch_size
             yield x_micro, y_micro, weight
+
+    @staticmethod
+    def _match_prediction_target(pred: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Allinea l'output del modello con il target:
+          - full sequence: pred[:, :, :] vs target[:, :, :]
+          - next-step su finestra: usa solo l'ultimo token predetto
+        """
+        if pred.shape[:2] == target.shape[:2]:
+            return pred, target
+        if target.shape[1] == 1 and pred.shape[1] >= 1:
+            return pred[:, -1:, :], target
+        raise ValueError(
+            f"Shape incompatibili tra pred {tuple(pred.shape)} e target {tuple(target.shape)}"
+        )
+
+    def _maybe_sync_for_timing(self, active: bool = False):
+        if active and self.sync_cuda_timings:
+            torch.cuda.synchronize()
+
+    def _should_log_step(self, phase: str, step: int, total_steps: int) -> bool:
+        interval = self.train_log_every_n_steps if phase == "train" else self.eval_log_every_n_steps
+        if interval <= 0:
+            return False
+        return step == 1 or step == total_steps or step % interval == 0
+
+    @staticmethod
+    def _state_norm_stats(batch: torch.Tensor) -> tuple[float, float, float]:
+        flat = batch.reshape(-1, batch.shape[-1])
+        norms = torch.linalg.vector_norm(flat, dim=-1)
+        return (
+            float(norms.min().item()),
+            float(norms.mean().item()),
+            float(norms.max().item()),
+        )
+
+    def _memory_log(self) -> str:
+        if not self.log_memory_stats or self.device != "cuda":
+            return "mem=n/a"
+        allocated = torch.cuda.memory_allocated() / (1024 ** 2)
+        reserved = torch.cuda.memory_reserved() / (1024 ** 2)
+        peak = torch.cuda.max_memory_allocated() / (1024 ** 2)
+        return f"mem={allocated:.0f}/{reserved:.0f}MB peak={peak:.0f}MB"
+
+    def _compute_grad_norm(self) -> float:
+        grad_sq = 0.0
+        for param in self.model.parameters():
+            if param.grad is None:
+                continue
+            grad = param.grad.detach().float()
+            grad_sq += float(torch.sum(grad * grad).item())
+        return math.sqrt(max(grad_sq, 0.0))
+
+    def _log_batch_snapshot(self, phase: str, x_batch: torch.Tensor, y_batch: torch.Tensor):
+        if not self.log_batch_stats:
+            return
+        x_norm_min, x_norm_mean, x_norm_max = self._state_norm_stats(x_batch)
+        y_norm_min, y_norm_mean, y_norm_max = self._state_norm_stats(y_batch)
+        print(
+            f"    [{phase.upper()}] batch snapshot "
+            f"x={tuple(x_batch.shape)} y={tuple(y_batch.shape)} "
+            f"dtype={x_batch.dtype}/{y_batch.dtype}"
+        )
+        print(
+            f"    [{phase.upper()}] ||x|| min/mean/max={x_norm_min:.4f}/{x_norm_mean:.4f}/{x_norm_max:.4f}  "
+            f"||y|| min/mean/max={y_norm_min:.4f}/{y_norm_mean:.4f}/{y_norm_max:.4f}"
+        )
+
+    def _log_step_metrics(
+        self,
+        phase: str,
+        step: int,
+        total_steps: int,
+        x_batch: torch.Tensor,
+        y_batch: torch.Tensor,
+        batch_loss: torch.Tensor,
+        batch_fid: torch.Tensor,
+        fetch_time: float,
+        transfer_time: float,
+        model_time: float,
+        backward_time: float,
+        optimizer_time: float,
+        cleanup_time: float,
+        step_time: float,
+        micro_batches: int,
+        update_performed: bool,
+        grad_norm: float | None,
+    ):
+        batch_size = int(x_batch.shape[0])
+        seq_in = int(x_batch.shape[1])
+        seq_out = int(y_batch.shape[1])
+        samples_per_sec = batch_size / max(step_time, 1e-9)
+        tokens_per_sec = (batch_size * seq_in) / max(step_time, 1e-9)
+        update_label = "yes" if update_performed else "no"
+        grad_label = f"{grad_norm:.4f}" if grad_norm is not None else "n/a"
+        lr_value = self.optimizer.param_groups[0]["lr"]
+        print(
+            f"    [{phase.upper()}][Ep {self._current_epoch:03d}] step {step:4d}/{total_steps} "
+            f"loss={batch_loss.item():.4f} fid={batch_fid.item():.4f} "
+            f"lr={lr_value:.3e} update={update_label} grad_norm={grad_label}"
+        )
+        print(
+            f"    [{phase.upper()}][Ep {self._current_epoch:03d}] batch={batch_size} "
+            f"x_seq={seq_in} y_seq={seq_out} micro={micro_batches} "
+            f"fetch={fetch_time:.3f}s h2d={transfer_time:.3f}s model={model_time:.3f}s "
+            f"back={backward_time:.3f}s opt={optimizer_time:.3f}s cleanup={cleanup_time:.3f}s "
+            f"total={step_time:.3f}s thr={samples_per_sec:.1f} samp/s {tokens_per_sec:.1f} tok/s "
+            f"{self._memory_log()}"
+        )
 
     def _periodic_memory_cleanup(self, step: int):
         """Cleanup periodico per evitare crescita della memoria durante loop lunghi."""
@@ -497,10 +616,9 @@ class AdvancedTrainer:
             torch.cuda.empty_cache()
 
     def _force_memory_cleanup(self):
-        """Cleanup completo a fine epoca/fase."""
-        if self.gc_every_n_steps > 0:
-            gc.collect()
-        if self.device == "cuda" and self.cuda_cache_every_n_steps > 0:
+        """Cleanup completo a fine epoca/fase — sempre attivo."""
+        gc.collect()
+        if self.device == "cuda":
             torch.cuda.empty_cache()
             if hasattr(torch.cuda, "ipc_collect"):
                 torch.cuda.ipc_collect()
@@ -606,38 +724,78 @@ class AdvancedTrainer:
         self.optimizer.zero_grad(set_to_none=True)  # set_to_none=True e' piu' veloce
 
         n_batches = len(self.train_loader)
+        train_iter = iter(self.train_loader)
 
-        for step, (x_batch_cpu, y_batch_cpu) in enumerate(self.train_loader, start=1):
+        for step in range(1, n_batches + 1):
+            should_log = self._should_log_step("train", step, n_batches)
+            self._maybe_sync_for_timing(should_log)
+            step_t0 = time.perf_counter()
+            fetch_t0 = time.perf_counter()
+            x_batch_cpu, y_batch_cpu = next(train_iter)
+            self._maybe_sync_for_timing(should_log)
+            fetch_time = time.perf_counter() - fetch_t0
+
+            if should_log and step == 1:
+                self._log_batch_snapshot("train", x_batch_cpu, y_batch_cpu)
+
             batch_loss = torch.zeros((), device=self.device, dtype=torch.float32)
             batch_fid = torch.zeros((), device=self.device, dtype=torch.float32)
+            transfer_time = 0.0
+            model_time = 0.0
+            backward_time = 0.0
+            optimizer_time = 0.0
+            cleanup_time = 0.0
+            micro_batches = 0
 
             for x_micro_cpu, y_micro_cpu, weight in self._iter_micro_batches(x_batch_cpu, y_batch_cpu):
+                micro_batches += 1
+                transfer_t0 = time.perf_counter()
                 x_micro = x_micro_cpu.to(self.device, non_blocking=self.non_blocking)
                 y_micro = y_micro_cpu.to(self.device, non_blocking=self.non_blocking)
+                self._maybe_sync_for_timing(should_log)
+                transfer_time += time.perf_counter() - transfer_t0
 
+                model_t0 = time.perf_counter()
                 if self.use_amp and self.scaler is not None:
                     with torch.amp.autocast(self.device):
                         pred = self.model(x_micro)
-                        loss, fid = self.criterion(pred, y_micro)
+                        pred_for_loss, target_for_loss = self._match_prediction_target(pred, y_micro)
+                        loss, fid = self.criterion(pred_for_loss, target_for_loss)
                         loss_scaled = (loss * weight) / self.grad_accum_steps
-                    self.scaler.scale(loss_scaled).backward()
                 else:
                     pred = self.model(x_micro)
-                    loss, fid = self.criterion(pred, y_micro)
+                    pred_for_loss, target_for_loss = self._match_prediction_target(pred, y_micro)
+                    loss, fid = self.criterion(pred_for_loss, target_for_loss)
                     loss_scaled = (loss * weight) / self.grad_accum_steps
+                self._maybe_sync_for_timing(should_log)
+                model_time += time.perf_counter() - model_t0
+
+                backward_t0 = time.perf_counter()
+                if self.use_amp and self.scaler is not None:
+                    self.scaler.scale(loss_scaled).backward()
+                else:
                     loss_scaled.backward()
+                self._maybe_sync_for_timing(should_log)
+                backward_time += time.perf_counter() - backward_t0
 
                 # Evita sync CPU-GPU: accumula su device e fai .item() solo a fine epoca.
                 batch_loss = batch_loss + (loss.detach() * weight)
                 batch_fid = batch_fid + (fid * weight)
 
-                del x_micro, y_micro, pred, loss, fid, loss_scaled
+                del x_micro, y_micro, pred, pred_for_loss, target_for_loss, loss, fid, loss_scaled
 
+            update_performed = False
+            grad_norm = None
+            optimizer_t0 = time.perf_counter()
             if step % self.grad_accum_steps == 0 or step == n_batches:
                 if self.grad_clip > 0:
                     if self.use_amp and self.scaler is not None:
                         self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip)
+                    grad_norm = float(
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip)
+                    )
+                else:
+                    grad_norm = self._compute_grad_norm()
 
                 if self.use_amp and self.scaler is not None:
                     self.scaler.step(self.optimizer)
@@ -648,12 +806,41 @@ class AdvancedTrainer:
                 self.optimizer.zero_grad(set_to_none=True)
                 if self.ema is not None:
                     self.ema.update(self.model)
+                update_performed = True
+            self._maybe_sync_for_timing(should_log)
+            optimizer_time += time.perf_counter() - optimizer_t0
 
             loss_acc += batch_loss
             fid_acc += batch_fid
 
-            del x_batch_cpu, y_batch_cpu
+            cleanup_t0 = time.perf_counter()
             self._periodic_memory_cleanup(step)
+            self._maybe_sync_for_timing(should_log)
+            cleanup_time += time.perf_counter() - cleanup_t0
+
+            step_time = time.perf_counter() - step_t0
+            if should_log:
+                self._log_step_metrics(
+                    phase="train",
+                    step=step,
+                    total_steps=n_batches,
+                    x_batch=x_batch_cpu,
+                    y_batch=y_batch_cpu,
+                    batch_loss=batch_loss,
+                    batch_fid=batch_fid,
+                    fetch_time=fetch_time,
+                    transfer_time=transfer_time,
+                    model_time=model_time,
+                    backward_time=backward_time,
+                    optimizer_time=optimizer_time,
+                    cleanup_time=cleanup_time,
+                    step_time=step_time,
+                    micro_batches=micro_batches,
+                    update_performed=update_performed,
+                    grad_norm=grad_norm,
+                )
+
+            del x_batch_cpu, y_batch_cpu
 
         self._force_memory_cleanup()
 
@@ -676,28 +863,79 @@ class AdvancedTrainer:
         self.model.eval()
         loss_acc = torch.zeros((), device=self.device, dtype=torch.float32)
         fid_acc = torch.zeros((), device=self.device, dtype=torch.float32)
+        n_batches = len(self.test_loader)
+        eval_iter = iter(self.test_loader)
 
-        for step, (x_batch_cpu, y_batch_cpu) in enumerate(self.test_loader, start=1):
+        for step in range(1, n_batches + 1):
+            should_log = self._should_log_step("eval", step, n_batches)
+            self._maybe_sync_for_timing(should_log)
+            step_t0 = time.perf_counter()
+            fetch_t0 = time.perf_counter()
+            x_batch_cpu, y_batch_cpu = next(eval_iter)
+            self._maybe_sync_for_timing(should_log)
+            fetch_time = time.perf_counter() - fetch_t0
+
+            if should_log and step == 1:
+                self._log_batch_snapshot("eval", x_batch_cpu, y_batch_cpu)
+
             batch_loss = torch.zeros((), device=self.device, dtype=torch.float32)
             batch_fid = torch.zeros((), device=self.device, dtype=torch.float32)
+            transfer_time = 0.0
+            model_time = 0.0
+            cleanup_time = 0.0
+            micro_batches = 0
 
             for x_micro_cpu, y_micro_cpu, weight in self._iter_micro_batches(x_batch_cpu, y_batch_cpu):
+                micro_batches += 1
+                transfer_t0 = time.perf_counter()
                 x_micro = x_micro_cpu.to(self.device, non_blocking=self.non_blocking)
                 y_micro = y_micro_cpu.to(self.device, non_blocking=self.non_blocking)
+                self._maybe_sync_for_timing(should_log)
+                transfer_time += time.perf_counter() - transfer_t0
 
+                model_t0 = time.perf_counter()
                 pred = self.model(x_micro)
-                loss, fid = self.criterion(pred, y_micro)
+                pred_for_loss, target_for_loss = self._match_prediction_target(pred, y_micro)
+                loss, fid = self.criterion(pred_for_loss, target_for_loss)
+                self._maybe_sync_for_timing(should_log)
+                model_time += time.perf_counter() - model_t0
 
                 batch_loss = batch_loss + (loss * weight)
                 batch_fid = batch_fid + (fid * weight)
 
-                del x_micro, y_micro, pred, loss, fid
+                del x_micro, y_micro, pred, pred_for_loss, target_for_loss, loss, fid
 
             loss_acc += batch_loss
             fid_acc += batch_fid
 
-            del x_batch_cpu, y_batch_cpu
+            cleanup_t0 = time.perf_counter()
             self._periodic_memory_cleanup(step)
+            self._maybe_sync_for_timing(should_log)
+            cleanup_time += time.perf_counter() - cleanup_t0
+
+            step_time = time.perf_counter() - step_t0
+            if should_log:
+                self._log_step_metrics(
+                    phase="eval",
+                    step=step,
+                    total_steps=n_batches,
+                    x_batch=x_batch_cpu,
+                    y_batch=y_batch_cpu,
+                    batch_loss=batch_loss,
+                    batch_fid=batch_fid,
+                    fetch_time=fetch_time,
+                    transfer_time=transfer_time,
+                    model_time=model_time,
+                    backward_time=0.0,
+                    optimizer_time=0.0,
+                    cleanup_time=cleanup_time,
+                    step_time=step_time,
+                    micro_batches=micro_batches,
+                    update_performed=False,
+                    grad_norm=None,
+                )
+
+            del x_batch_cpu, y_batch_cpu
 
         # Ripristina pesi originali
         if use_ema and self.ema is not None:
@@ -705,8 +943,8 @@ class AdvancedTrainer:
 
         self._force_memory_cleanup()
 
-        avg_loss = (loss_acc / len(self.test_loader)).item()
-        avg_fid = (fid_acc / len(self.test_loader)).item()
+        avg_loss = (loss_acc / n_batches).item()
+        avg_fid = (fid_acc / n_batches).item()
         return avg_loss, avg_fid
 
     @staticmethod
@@ -724,6 +962,9 @@ class AdvancedTrainer:
             "N_QUBITS": config.N_QUBITS,
             "DIM_2N": config.DIM_2N,
             "SEQ_LEN": config.SEQ_LEN,
+            "T1": config.T1,
+            "T2": config.T2,
+            "TRAINING_MODE": config.TRAINING_MODE,
             "DROPOUT": config.DROPOUT,
         }
 
@@ -877,20 +1118,40 @@ class AdvancedTrainer:
             for epoch in range(start_epoch, epochs + 1):
                 self._current_epoch = epoch
                 t_epoch = time.time()
+                if self.device == "cuda" and self.log_memory_stats:
+                    torch.cuda.reset_peak_memory_stats()
 
                 # --- Train ---
+                t_train = time.time()
                 train_loss, train_fid = self._train_one_epoch()
+                train_phase_time = time.time() - t_train
                 train_ppl = math.exp(min(train_loss, 20))  # clamp per evitare overflow
 
                 # --- Evaluate ---
+                t_eval = time.time()
                 test_loss, test_fid = self._evaluate(use_ema=config.EMA_ENABLED)
+                eval_phase_time = time.time() - t_eval
                 test_ppl = math.exp(min(test_loss, 20))
+
+                # --- LR Scheduling ---
+                t_sched = time.time()
+                current_lr = self.scheduler.step(epoch, val_loss=test_loss)
+                scheduler_time = time.time() - t_sched
+
+                # --- Best model tracking ---
+                is_best = test_fid > self.best_test_fid
+                if is_best:
+                    self.best_test_fid = test_fid
+                    self.best_test_epoch = epoch
+
+                # --- Checkpointing ---
+                t_ckpt = time.time()
+                self._save_checkpoint(epoch, is_best=is_best)
+                checkpoint_time = time.time() - t_ckpt
 
                 epoch_time = time.time() - t_epoch
                 self.total_train_time += epoch_time
-
-                # --- LR Scheduling ---
-                current_lr = self.scheduler.step(epoch, val_loss=test_loss)
+                train_samples_per_sec = len(self.train_loader.dataset) / max(train_phase_time, 1e-9)
 
                 # --- History ---
                 self.history["train_loss"].append(train_loss)
@@ -901,15 +1162,11 @@ class AdvancedTrainer:
                 self.history["test_ppl"].append(test_ppl)
                 self.history["lr"].append(current_lr)
                 self.history["epoch_time"].append(epoch_time)
-
-                # --- Best model tracking ---
-                is_best = test_fid > self.best_test_fid
-                if is_best:
-                    self.best_test_fid = test_fid
-                    self.best_test_epoch = epoch
-
-                # --- Checkpointing ---
-                self._save_checkpoint(epoch, is_best=is_best)
+                self.history["train_phase_time"].append(train_phase_time)
+                self.history["eval_phase_time"].append(eval_phase_time)
+                self.history["scheduler_time"].append(scheduler_time)
+                self.history["checkpoint_time"].append(checkpoint_time)
+                self.history["train_samples_per_sec"].append(train_samples_per_sec)
 
                 # --- LR Diagnostics ---
                 self.lr_diagnostics.update(epoch, current_lr, train_loss, test_loss, test_fid)
@@ -920,7 +1177,14 @@ class AdvancedTrainer:
                     print(
                         f"  Ep {epoch:3d}/{epochs}  "
                         f"Train [Loss {train_loss:.4f}  Fid {train_fid:.4f}  PPL {train_ppl:.4f}]  "
-                        f"Test [Loss {test_loss:.4f}  Fid {test_fid:.4f}  PPL {test_ppl:.4f}]{marker}"
+                        f"Test [Loss {test_loss:.4f}  Fid {test_fid:.4f}  PPL {test_ppl:.4f}]  "
+                        f"LR {current_lr:.3e}{marker}"
+                    )
+                    print(
+                        f"    Time train/eval/sched/ckpt = "
+                        f"{train_phase_time:.2f}/{eval_phase_time:.2f}/{scheduler_time:.2f}/{checkpoint_time:.2f}s  "
+                        f"epoch={epoch_time:.2f}s  throughput={train_samples_per_sec:.1f} samp/s  "
+                        f"{self._memory_log()}"
                     )
 
                 # --- Early Stopping ---
@@ -951,11 +1215,12 @@ class AdvancedTrainer:
 
         # --- Post-training ---
         # Ripristina il miglior modello
-        if self.early_stopper is not None and self.early_stopper.best_model_state is not None:
+        if self.early_stopper is not None and self.early_stopper._has_saved:
             self.early_stopper.restore_best_model(self.model)
         elif config.SAVE_BEST_MODEL and os.path.exists(config.BEST_MODEL_PATH):
-            checkpoint = torch.load(config.BEST_MODEL_PATH, weights_only=False)
+            checkpoint = torch.load(config.BEST_MODEL_PATH, weights_only=False, map_location="cpu")
             self.model.load_state_dict(checkpoint["model_state_dict"])
+            del checkpoint
 
         return dict(self.history)
 
@@ -969,3 +1234,11 @@ class AdvancedTrainer:
 
         print(f"\n  Training completato: {n}/{config.EPOCHS} ep. in {self.total_train_time:.1f}s")
         print(f"  Best test: Loss={h['test_loss'][self.best_test_epoch-1]:.4f}  PPL={h['test_ppl'][self.best_test_epoch-1]:.4f}  (ep.{self.best_test_epoch})")
+        if h["train_phase_time"]:
+            mean_train = sum(h["train_phase_time"]) / len(h["train_phase_time"])
+            mean_eval = sum(h["eval_phase_time"]) / len(h["eval_phase_time"])
+            mean_thr = sum(h["train_samples_per_sec"]) / len(h["train_samples_per_sec"])
+            print(
+                f"  Medie runtime: train={mean_train:.2f}s/ep  "
+                f"eval={mean_eval:.2f}s/ep  throughput={mean_thr:.1f} samp/s"
+            )

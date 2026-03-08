@@ -17,7 +17,7 @@ import torch
 from torch.utils.data import DataLoader
 
 import config
-from input import QuantumStateDataset, generate_quantum_dynamics_dataset
+from input import QuantumStateDataset, QuantumTrajectoryWindowDataset, generate_quantum_dynamics_dataset
 from predictor import QuantumStatePredictor, QuantumFidelityLoss
 
 
@@ -39,6 +39,7 @@ print(
     f"  Rollout window: T1={config.T1} (context), T2={config.T2} (horizon)  "
     f"(richiede SEQ_LEN+1>={config.T1 + config.T2})"
 )
+print(f"  Training mode: {config.TRAINING_MODE}")
 print(f"  Sequenza dataset (SEQ_LEN): {config.SEQ_LEN}  (dt={config.DT})")
 print(f"  Modello: d={config.D_MODEL}, heads={config.NUM_HEADS}, layers={config.NUM_LAYERS}")
 print(f"  Device: {config.DEVICE}")
@@ -73,8 +74,23 @@ if num_workers > 0:
 else:
     loader_kwargs["num_workers"] = 0
 
-train_loader = DataLoader(QuantumStateDataset(train_in, train_tgt), shuffle=True, **loader_kwargs)
-test_loader = DataLoader(QuantumStateDataset(test_in, test_tgt), shuffle=False, **loader_kwargs)
+train_full_dataset = QuantumStateDataset(train_in, train_tgt)
+test_full_dataset = QuantumStateDataset(test_in, test_tgt)
+
+if config.TRAINING_MODE == "rollout_window":
+    train_dataset = QuantumTrajectoryWindowDataset(
+        train_in, train_tgt, context_len=config.T1, rollout_horizon=config.T2
+    )
+    test_dataset = QuantumTrajectoryWindowDataset(
+        test_in, test_tgt, context_len=config.T1, rollout_horizon=config.T2
+    )
+else:
+    train_dataset = train_full_dataset
+    test_dataset = test_full_dataset
+
+train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
+test_loader = DataLoader(test_dataset, shuffle=False, **loader_kwargs)
+test_eval_loader = DataLoader(test_full_dataset, shuffle=False, **loader_kwargs)
 
 micro_batch_size = config.MICRO_BATCH_SIZE if config.MICRO_BATCH_SIZE > 0 else BATCH_SIZE
 non_blocking = pin_memory
@@ -109,13 +125,14 @@ for epoch in range(EPOCHS_EVAL):
             y_micro = y_micro_cpu.to(config.DEVICE, non_blocking=non_blocking)
 
             pred = model(x_micro)
-            loss, fid = criterion(pred, y_micro)
+            pred_for_loss = pred[:, -1:, :] if y_micro.shape[1] == 1 else pred
+            loss, fid = criterion(pred_for_loss, y_micro)
             (loss * weight).backward()
 
             batch_loss += loss.item() * weight
             batch_fid += fid.item() * weight
 
-            del x_micro, y_micro, pred, loss, fid
+            del x_micro, y_micro, pred, pred_for_loss, loss, fid
 
         optimizer.step()
 
@@ -148,7 +165,7 @@ per_step_fid = torch.zeros(config.SEQ_LEN, dtype=torch.float64)
 per_step_count = 0
 
 with torch.no_grad():
-    for step, (x_batch_cpu, y_batch_cpu) in enumerate(test_loader, start=1):
+    for step, (x_batch_cpu, y_batch_cpu) in enumerate(test_eval_loader, start=1):
         batch_loss, batch_fid = 0.0, 0.0
         batch_step_fid = torch.zeros(config.SEQ_LEN, dtype=torch.float64)
 
@@ -200,7 +217,7 @@ rollout_fid_sum = torch.zeros(config.T2, dtype=torch.float64)
 rollout_count = 0
 
 with torch.no_grad():
-    for step, (x_batch_cpu, y_batch_cpu) in enumerate(test_loader, start=1):
+    for step, (x_batch_cpu, y_batch_cpu) in enumerate(test_eval_loader, start=1):
         # Ricostruiamo la traiettoria completa: states[t] per t=0..SEQ_LEN
         # inputs:  t=0..SEQ_LEN-1, targets: t=1..SEQ_LEN
         state0 = x_batch_cpu[:, 0:1, :]  # (batch, 1, dim)

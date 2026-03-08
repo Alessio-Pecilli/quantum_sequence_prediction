@@ -26,34 +26,71 @@ def _env_int(name: str, default: int) -> int:
         raise ValueError(f"Env var {name} deve essere un intero, ricevuto: {raw!r}") from e
 
 
+def _env_str(name: str, default: str) -> str:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower()
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "y", "on"}:
+        return True
+    if value in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(f"Env var {name} deve essere booleana, ricevuto: {raw!r}")
+
+
+def _default_model_hyperparams(n_qubits: int) -> tuple[int, int, int]:
+    if n_qubits <= 4:
+        return 128, 4, 4
+    if n_qubits <= 6:
+        return 256, 8, 5
+    return 512, 8, 6
+
+
 # Dimensione dello spazio di embedding (2^n per n qubit)
 # Per 10 qubit (2048 feature reali) â†’ 512 riduce la compressione a ~4:1
-D_MODEL = 512
+# ===== Configurazione Sistema Quantistico =====
+
+# Numero di qubit del sistema.
+# Default impostato a 4: spazio di Hilbert di dimensione 16.
+N_QUBITS = _env_int("QSP_N_QUBITS", 4)
+DIM_2N = 2**N_QUBITS
+# ===== Configurazione Modello =====
+
+_default_d_model, _default_num_heads, _default_num_layers = _default_model_hyperparams(N_QUBITS)
+# Per 4 qubit (16 ampiezze complesse -> 32 feature reali) 128 e' gia' capiente.
+D_MODEL = _env_int("QSP_D_MODEL", _default_d_model)
 
 # Numero di teste di attenzione nel Transformer
 # 512 / 8 = 64 dim per testa (cattura pattern temporali diversi)
-NUM_HEADS = 8
+NUM_HEADS = _env_int("QSP_NUM_HEADS", _default_num_heads)
 
 # Numero di layer del Transformer Encoder
 # 6 layer per dinamiche quantistiche complesse con residual connections
-NUM_LAYERS = 6
+NUM_LAYERS = _env_int("QSP_NUM_LAYERS", _default_num_layers)
 
 # Dimensione hidden del Feed-Forward Network nel Transformer
 # Rapporto standard 4Ã— d_model (Vaswani et al.)
-DIM_FEEDFORWARD = 2048
+DIM_FEEDFORWARD = _env_int("QSP_DIM_FEEDFORWARD", D_MODEL * 4)
+
+if D_MODEL <= 0:
+    raise ValueError(f"D_MODEL deve essere > 0, ricevuto: {D_MODEL}")
+if NUM_HEADS <= 0:
+    raise ValueError(f"NUM_HEADS deve essere > 0, ricevuto: {NUM_HEADS}")
+if D_MODEL % NUM_HEADS != 0:
+    raise ValueError(
+        f"D_MODEL={D_MODEL} deve essere divisibile per NUM_HEADS={NUM_HEADS}"
+    )
 
 # Dropout nel Transformer (regolarizzazione)
 # Ridotto: il modello era in underfitting (gap train-test piccolo, fidelity bassa)
 DROPOUT = 0.05
-
-# ===== Configurazione Sistema Quantistico =====
-
-# Numero di qubit del sistema
-# Default ridotto a 6 per test veloci; usa env QSP_N_QUBITS per cambiare.
-N_QUBITS = _env_int("QSP_N_QUBITS", 6)
-
-# Dimensione dello spazio di Hilbert (2^n)
-DIM_2N = 2**N_QUBITS
 
 # Parametri dell'Hamiltoniana TFIM
 J_RANGE = (0.5, 1.5)
@@ -107,6 +144,16 @@ if T1 + T2 > SEQ_LEN + 1:
     raise ValueError(
         f"Configurazione non valida: T1+T2={T1 + T2} > SEQ_LEN+1={SEQ_LEN + 1}. "
         f"Aumenta SEQ_LEN (env QSP_SEQ_LEN) o riduci T1/T2 (env QSP_T1/QSP_T2)."
+    )
+
+# Modalita' di training:
+#   - "rollout_window": finestre di lunghezza T1 -> next-step, allineato al rollout autoregressivo
+#   - "full_sequence": teacher forcing sull'intera sequenza shiftata
+TRAINING_MODE = _env_str("QSP_TRAINING_MODE", "rollout_window")
+if TRAINING_MODE not in {"rollout_window", "full_sequence"}:
+    raise ValueError(
+        f"QSP_TRAINING_MODE non supportato: {TRAINING_MODE!r}. "
+        "Valori ammessi: 'rollout_window', 'full_sequence'."
     )
 
 # Dimensione del batch. T4 (16GB) regge batch=64 con d_model=512, seq_len=100.
@@ -234,7 +281,8 @@ GRAD_ACCUMULATION_STEPS = 1
 
 # Usa torch.compile() per ottimizzare il modello (PyTorch 2.0+)
 # Riduce overhead Python e fonde operazioni. Prima epoca piu' lenta (compilazione).
-TORCH_COMPILE = True
+# NOTA: su CPU viene disabilitato automaticamente (vedi auto-tuning in fondo).
+TORCH_COMPILE = _env_bool("QSP_TORCH_COMPILE", N_QUBITS > 4)
 
 # Backend per torch.compile: "inductor" (richiede compilatore C++), "aot_eager" (no dipendenze esterne)
 TORCH_COMPILE_BACKEND = "inductor"
@@ -243,7 +291,7 @@ TORCH_COMPILE_BACKEND = "inductor"
 
 # Numero di worker per il caricamento dati (0 = main process)
 # Su CPU con dati gia' in memoria, 0 e' ottimale (evita overhead IPC)
-NUM_WORKERS = 2
+NUM_WORKERS = _env_int("QSP_NUM_WORKERS", 0 if os.name == "nt" else 2)
 
 # Pin memory accelera il trasferimento CPU->GPU quando il device e' CUDA.
 PIN_MEMORY = True
@@ -261,6 +309,31 @@ OBSERVABLE_PLOTS_ENABLED = True
 # Se <= 0 usa tutto il training set (puo' essere lento).
 OBSERVABLE_PLOT_SAMPLES = _env_int("QSP_OBS_PLOT_SAMPLES", 256)
 
+# ===== Logging / Diagnostica =====
+
+# Log dettagliati su semantica temporale, dataset e tempi interni del trainer.
+VERBOSE_STARTUP_LOGS = _env_bool("QSP_VERBOSE_STARTUP_LOGS", True)
+
+# Progress della generazione dataset: 1 = una riga per Hamiltoniana.
+DATASET_LOG_EVERY_N_HAMILTONIANS = _env_int("QSP_DATASET_LOG_EVERY_N_HAMILTONIANS", 1)
+
+# Numero di esempi temporali da stampare per spiegare la mappa input -> target.
+TEMPORAL_LOG_EXAMPLES = _env_int("QSP_TEMPORAL_LOG_EXAMPLES", 4)
+
+# Log step-level nel training/eval.
+TRAIN_LOG_EVERY_N_STEPS = _env_int("QSP_TRAIN_LOG_EVERY_N_STEPS", 10)
+EVAL_LOG_EVERY_N_STEPS = _env_int("QSP_EVAL_LOG_EVERY_N_STEPS", 10)
+
+# Logga shape, dtype e statistiche di norma del primo batch di ogni fase.
+LOG_BATCH_STATS = _env_bool("QSP_LOG_BATCH_STATS", True)
+
+# Logga memoria CUDA nei punti chiave del training.
+LOG_MEMORY_STATS = _env_bool("QSP_LOG_MEMORY_STATS", True)
+
+# Sincronizza CUDA quando si misurano i tempi loggati.
+# Piu' accurato, ma aggiunge un po' di overhead nei batch stampati.
+SYNC_CUDA_TIMINGS = _env_bool("QSP_SYNC_CUDA_TIMINGS", True)
+
 
 # Device (gpu o cpu) - determinato al momento dell'uso
 def get_device():
@@ -273,3 +346,19 @@ def get_device():
 
 
 DEVICE = get_device()
+
+# ===== Auto-tuning in base al device =====
+# Su CPU molte feature GPU-only causano solo overhead e memory bloat.
+if DEVICE == "cpu":
+    TORCH_COMPILE = False       # Inductor usa ~1GB RAM extra senza beneficio su CPU
+    EMA_ENABLED = False         # Risparmia una copia completa dei pesi (~120MB)
+    AMP_ENABLED = False         # AMP non ha senso su CPU
+    NUM_WORKERS = 0             # Workers su Windows (spawn) duplicano il dataset in RAM
+    PIN_MEMORY = False          # Solo utile per trasferimenti CPU->GPU
+    MEMORY_SAFE_MODE = True     # Abilita cleanup aggressivo
+    GC_COLLECT_EVERY_N_STEPS = 20
+    CUDA_EMPTY_CACHE_EVERY_N_STEPS = 0
+    if BATCH_SIZE > 16:
+        BATCH_SIZE = 16         # Riduce picco attivazioni forward/backward
+    if GRAD_ACCUMULATION_STEPS < 4:
+        GRAD_ACCUMULATION_STEPS = 4  # Compensa batch piccolo: effettivo = 16*4 = 64

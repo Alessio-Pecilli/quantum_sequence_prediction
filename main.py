@@ -13,7 +13,7 @@ matplotlib.use("Agg")  # Backend non-interattivo per salvare PNG
 import matplotlib.pyplot as plt
 
 import config
-from input import QuantumStateDataset, generate_quantum_dynamics_dataset
+from input import QuantumStateDataset, QuantumTrajectoryWindowDataset, generate_quantum_dynamics_dataset
 from predictor import QuantumStatePredictor, QuantumFidelityLoss
 from trainer import AdvancedTrainer
 from observables import precompute_observables, batch_observables
@@ -23,6 +23,43 @@ from observables import precompute_observables, batch_observables
 RESULTS_DIR = "results"
 os.makedirs(RESULTS_DIR, exist_ok=True)
 generated_plots = []
+
+
+def _format_time_index(t_idx: int) -> str:
+    return f"t={t_idx} ({t_idx * config.DT:.3f})"
+
+
+def _print_temporal_learning_map(dataset):
+    print("  Semantica temporale del training:")
+    print(
+        f"    - traiettoria grezza: psi(0), psi(1), ..., psi({config.SEQ_LEN}) "
+        f"con dt={config.DT}"
+    )
+    print("    - split dataset: inputs[t]=psi(t), targets[t]=psi(t+1)")
+
+    if config.TRAINING_MODE == "rollout_window" and isinstance(dataset, QuantumTrajectoryWindowDataset):
+        n_examples = min(config.TEMPORAL_LOG_EXAMPLES, dataset.windows_per_trajectory)
+        print(
+            "    - il DataLoader mescola finestre provenienti da Hamiltoniane, stati iniziali "
+            "e rollout index diversi"
+        )
+        print(f"    - esempi dalle prime finestre della traiettoria 0 (tot finestre per traiettoria={dataset.windows_per_trajectory}):")
+        for idx in range(n_examples):
+            info = dataset.describe_window(idx)
+            print(
+                f"      window {idx}: psi[{info['context_start_t']}..{info['context_end_t']}] "
+                f"({_format_time_index(info['context_start_t'])} -> {_format_time_index(info['context_end_t'])}) "
+                f"-> target psi[{info['target_t']}] ({_format_time_index(info['target_t'])})"
+            )
+    else:
+        example_steps = sorted({0, min(1, config.SEQ_LEN - 1), min(2, config.SEQ_LEN - 1), config.SEQ_LEN - 1})
+        print("    - full_sequence: grazie alla maschera causale, il token t vede solo 0..t e impara psi(t+1)")
+        for t_idx in example_steps:
+            print(
+                f"      token {t_idx}: contesto psi[0..{t_idx}] "
+                f"(fino a {_format_time_index(t_idx)}) -> target psi[{t_idx + 1}] "
+                f"({_format_time_index(t_idx + 1)})"
+            )
 
 
 # ============================================================
@@ -40,6 +77,7 @@ print(f"  Training data:   {config.B_TRAIN} H × {config.S_TRAIN} stati = {confi
 print(f"  Test data:       {config.B_TEST} H × {config.S_TEST} stati = {config.B_TEST * config.S_TEST}")
 print(f"  Epoche:          {config.EPOCHS},  batch={config.BATCH_SIZE},  lr={config.LEARNING_RATE}")
 print(f"  Scheduler:       {config.LR_SCHEDULER_TYPE} (warmup={config.LR_WARMUP_EPOCHS})")
+print(f"  Training mode:   {config.TRAINING_MODE}")
 print(f"  Early stopping:  {'ON' if config.EARLY_STOPPING_ENABLED else 'OFF'} (patience={config.EARLY_STOPPING_PATIENCE})")
 print(f"  EMA:             {'ON' if config.EMA_ENABLED else 'OFF'} (decay={config.EMA_DECAY})")
 print(f"  Grad clip:       {config.GRAD_CLIP_MAX_NORM},  weight decay: {config.WEIGHT_DECAY}")
@@ -48,15 +86,19 @@ print(f"  Resume:          {'ON' if config.RESUME_TRAINING else 'OFF'}")
 print(f"  Device:          {config.DEVICE}")
 micro_bs_print = config.MICRO_BATCH_SIZE if config.MICRO_BATCH_SIZE > 0 else config.BATCH_SIZE
 print(f"  Memory safe:     {'ON' if config.MEMORY_SAFE_MODE else 'OFF'} (micro-batch={micro_bs_print})")
+print(
+    f"  Logging:         dataset/H={config.DATASET_LOG_EVERY_N_HAMILTONIANS}, "
+    f"train-step={config.TRAIN_LOG_EVERY_N_STEPS}, eval-step={config.EVAL_LOG_EVERY_N_STEPS}"
+)
 print("=" * 70)
 
 print("\n[1/6] Generando dataset...")
 t0 = time.time()
 train_inputs, train_targets = generate_quantum_dynamics_dataset(
-    B=config.B_TRAIN, S=config.S_TRAIN
+    B=config.B_TRAIN, S=config.S_TRAIN, dataset_name="train"
 )
 test_inputs, test_targets = generate_quantum_dynamics_dataset(
-    B=config.B_TEST, S=config.S_TEST
+    B=config.B_TEST, S=config.S_TEST, dataset_name="test"
 )
 gen_time = time.time() - t0
 print(f"  Train: {train_inputs.shape}  |  Test: {test_inputs.shape}  ({gen_time:.1f}s)")
@@ -71,16 +113,65 @@ loader_kwargs = dict(
 if num_workers > 0:
     loader_kwargs["persistent_workers"] = True
 
+train_full_dataset = QuantumStateDataset(train_inputs, train_targets)
+test_full_dataset = QuantumStateDataset(test_inputs, test_targets)
+
+if config.TRAINING_MODE == "rollout_window":
+    train_dataset = QuantumTrajectoryWindowDataset(
+        train_inputs, train_targets, context_len=config.T1, rollout_horizon=config.T2
+    )
+    test_dataset = QuantumTrajectoryWindowDataset(
+        test_inputs, test_targets, context_len=config.T1, rollout_horizon=config.T2
+    )
+    print(
+        f"  Training objective: finestre T1={config.T1} -> next-step "
+        f"(campioni train={len(train_dataset):,}, test={len(test_dataset):,})"
+    )
+else:
+    train_dataset = train_full_dataset
+    test_dataset = test_full_dataset
+    print(
+        f"  Training objective: teacher forcing full-sequence "
+        f"(campioni train={len(train_dataset):,}, test={len(test_dataset):,})"
+    )
+
+if config.VERBOSE_STARTUP_LOGS:
+    _print_temporal_learning_map(train_dataset)
+
 train_loader = DataLoader(
-    QuantumStateDataset(train_inputs, train_targets),
+    train_dataset,
     shuffle=True,
     **loader_kwargs,
 )
 test_loader = DataLoader(
-    QuantumStateDataset(test_inputs, test_targets),
+    test_dataset,
     shuffle=False,
     **loader_kwargs,
 )
+train_eval_loader = DataLoader(
+    train_full_dataset,
+    shuffle=False,
+    **loader_kwargs,
+)
+test_eval_loader = DataLoader(
+    test_full_dataset,
+    shuffle=False,
+    **loader_kwargs,
+)
+
+if config.VERBOSE_STARTUP_LOGS:
+    print(
+        f"  DataLoader train: batches={len(train_loader)}, shuffle=True, "
+        f"workers={num_workers}, pin_memory={pin_memory}"
+    )
+    print(
+        f"  DataLoader test:  batches={len(test_loader)}, shuffle=False, "
+        f"workers={num_workers}, pin_memory={pin_memory}"
+    )
+
+# Liberiamo i tensori raw — i DataLoader hanno copie interne nei Dataset
+del train_inputs, train_targets, test_inputs, test_targets
+gc.collect()
 
 
 # ============================================================
@@ -133,7 +224,7 @@ trainer.print_training_summary()
 # ============================================================
 #  4. VALUTAZIONE FINALE SUL TEST SET
 # ============================================================
-print(f"\n[4/6] Valutazione finale sul Test Set...")
+print(f"\n[4/6] Valutazione finale sul Test Set (teacher forcing full-sequence)...")
 
 model = trainer.model
 model.eval()
@@ -148,7 +239,7 @@ max_plot_samples = max(1, int(config.MAX_FIDELITY_PLOT_SAMPLES))
 per_step_plot_values = [[] for _ in range(config.SEQ_LEN)]
 
 with torch.no_grad():
-    for step, (x_batch_cpu, y_batch_cpu) in enumerate(test_loader, start=1):
+    for step, (x_batch_cpu, y_batch_cpu) in enumerate(test_eval_loader, start=1):
         x_batch = x_batch_cpu.to(config.DEVICE, non_blocking=non_blocking)
         y_batch = y_batch_cpu.to(config.DEVICE, non_blocking=non_blocking)
 
@@ -337,8 +428,8 @@ if config.OBSERVABLE_PLOTS_ENABLED:
 
         return curves
 
-    obs_curves = _rollout_curves(train_loader, "Train")
-    test_rollout_curves = _rollout_curves(test_loader, "Test")
+    obs_curves = _rollout_curves(train_eval_loader, "Train")
+    test_rollout_curves = _rollout_curves(test_eval_loader, "Test")
 
 
 # ============================================================
@@ -670,6 +761,7 @@ summary = {
         "SEQ_LEN": int(config.SEQ_LEN),
         "T1": int(config.T1),
         "T2": int(config.T2),
+        "TRAINING_MODE": config.TRAINING_MODE,
         "B_TRAIN": int(config.B_TRAIN),
         "S_TRAIN": int(config.S_TRAIN),
         "B_TEST": int(config.B_TEST),
@@ -679,6 +771,9 @@ summary = {
         "D_MODEL": int(config.D_MODEL),
         "NUM_HEADS": int(config.NUM_HEADS),
         "NUM_LAYERS": int(config.NUM_LAYERS),
+        "DATASET_LOG_EVERY_N_HAMILTONIANS": int(config.DATASET_LOG_EVERY_N_HAMILTONIANS),
+        "TRAIN_LOG_EVERY_N_STEPS": int(config.TRAIN_LOG_EVERY_N_STEPS),
+        "EVAL_LOG_EVERY_N_STEPS": int(config.EVAL_LOG_EVERY_N_STEPS),
     },
     "training": {
         "actual_epochs": int(actual_epochs),
@@ -688,6 +783,15 @@ summary = {
         "final_test_loss": float(final_te_loss),
         "final_train_fidelity": float(final_tr_fid),
         "final_test_fidelity": float(final_te_fid),
+        "mean_train_phase_time_s": float(sum(history["train_phase_time"]) / len(history["train_phase_time"]))
+        if history.get("train_phase_time")
+        else None,
+        "mean_eval_phase_time_s": float(sum(history["eval_phase_time"]) / len(history["eval_phase_time"]))
+        if history.get("eval_phase_time")
+        else None,
+        "mean_train_samples_per_sec": float(sum(history["train_samples_per_sec"]) / len(history["train_samples_per_sec"]))
+        if history.get("train_samples_per_sec")
+        else None,
     },
     "test_eval": {
         "mean_fidelity": float(mean_fid),
