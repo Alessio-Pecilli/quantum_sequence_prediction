@@ -97,9 +97,9 @@ EPOCHS = _env_int("QSP_EPOCHS", 200)
 
 # ===== Pesi Loss (Fidelity + Physics-Informed terms) =====
 LAMBDA_FID = _env_float("QSP_LAMBDA_FID", 1.0)
-LAMBDA_MZ = _env_float("QSP_LAMBDA_MZ", 0.0)
-LAMBDA_MX = _env_float("QSP_LAMBDA_MX", 0.0)
-LAMBDA_CZ = _env_float("QSP_LAMBDA_CZ", 0.0)
+LAMBDA_MZ = _env_float("QSP_LAMBDA_MZ", 0.35)
+LAMBDA_MX = _env_float("QSP_LAMBDA_MX", 0.35)
+LAMBDA_CZ = _env_float("QSP_LAMBDA_CZ", 0.35)
 
 # ===== Configurazione Ottimizzatore =====
 # LR leggermente più alto per convergere in fretta
