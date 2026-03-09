@@ -83,8 +83,11 @@ T2 = _env_int("QSP_T2", 35)
 if T1 + T2 > SEQ_LEN + 1:
     raise ValueError(f"Configurazione non valida: T1+T2={T1 + T2} > SEQ_LEN+1={SEQ_LEN + 1}.")
 
+# ===== TRAINING CORE: UNROLL E LOSS FISICA =====
 TRAINING_MODE = _env_str("QSP_TRAINING_MODE", "rollout_window")
-UNROLL_STEPS = _env_int("QSP_UNROLL_STEPS", 3)
+
+# Aumentato drasticamente per forzare la conservazione delle fasi a lungo termine
+UNROLL_STEPS = _env_int("QSP_UNROLL_STEPS", 10)
 
 if UNROLL_STEPS < 1:
     raise ValueError(f"UNROLL_STEPS deve essere >= 1, ricevuto: {UNROLL_STEPS}")
@@ -95,11 +98,12 @@ if UNROLL_STEPS > T2:
 BATCH_SIZE = _env_int("QSP_BATCH_SIZE", 20)
 EPOCHS = _env_int("QSP_EPOCHS", 200)
 
-# ===== Pesi Loss (Fidelity + Physics-Informed terms) =====
+# Pesi Loss (Fidelity + Physics-Informed terms)
+# Diamo una penalità enorme all'appiattimento di Mx e Mz
 LAMBDA_FID = _env_float("QSP_LAMBDA_FID", 1.0)
-LAMBDA_MZ = _env_float("QSP_LAMBDA_MZ", 0.35)
-LAMBDA_MX = _env_float("QSP_LAMBDA_MX", 0.35)
-LAMBDA_CZ = _env_float("QSP_LAMBDA_CZ", 0.35)
+LAMBDA_MZ = _env_float("QSP_LAMBDA_MZ", 2.0)
+LAMBDA_MX = _env_float("QSP_LAMBDA_MX", 2.0)
+LAMBDA_CZ = _env_float("QSP_LAMBDA_CZ", 1.0)
 
 # ===== Configurazione Ottimizzatore =====
 # LR leggermente più alto per convergere in fretta
@@ -178,5 +182,6 @@ print(f"=====================================================")
 print(f" Qubits: {N_QUBITS} | Dim Hilbert: {DIM_2N//2}")
 print(f" Dataset: {B_TRAIN} Hamiltoniane x {S_TRAIN} Stati")
 print(f" Transformer: {NUM_LAYERS} Layer, {NUM_HEADS} Heads, d={D_MODEL}")
+print(f" Modello: BPTT {UNROLL_STEPS} step | Physics Loss: Z={LAMBDA_MZ}, X={LAMBDA_MX}")
 print(f" Device: {DEVICE.upper()}")
 print(f"=====================================================")
