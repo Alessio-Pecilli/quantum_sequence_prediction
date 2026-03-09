@@ -33,7 +33,7 @@ def _env_bool(name: str, default: bool) -> bool:
 # ===== Configurazione Sistema Quantistico =====
 
 # Numero di qubit del sistema.
-N_QUBITS = _env_int("QSP_N_QUBITS", 6)
+N_QUBITS = _env_int("QSP_N_QUBITS", 4)
 DIM_2N = 2**N_QUBITS
 
 # ===== Configurazione Modello (Custom per CPU Test) =====
