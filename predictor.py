@@ -3,6 +3,7 @@ import torch.nn as nn
 
 import config
 from embedding import ComplexEmbedding
+from observables import batch_observables_diff
 
 
 def _dynamo_disable(fn):
@@ -108,6 +109,76 @@ class QuantumFidelityLoss(nn.Module):
         loss = 1.0 - mean_fidelity
 
         return loss, mean_fidelity
+
+
+class PhysicsInformedLoss(nn.Module):
+    """
+    Loss composita:
+      - infidelity globale (1 - fidelity), pesata da LAMBDA_FID
+      - MSE sulle osservabili (m^z, m^x, c^z) opzionali
+    """
+
+    def __init__(
+        self,
+        z_eigs: torch.Tensor,
+        zz_nn_eigs: torch.Tensor,
+        zz_all_eigs: torch.Tensor,
+        x_flip_idx: list[torch.Tensor],
+        lambda_fid: float = config.LAMBDA_FID,
+        lambda_mz: float = config.LAMBDA_MZ,
+        lambda_mx: float = config.LAMBDA_MX,
+        lambda_cz: float = config.LAMBDA_CZ,
+    ):
+        super().__init__()
+        self.lambda_fid = float(lambda_fid)
+        self.lambda_mz = float(lambda_mz)
+        self.lambda_mx = float(lambda_mx)
+        self.lambda_cz = float(lambda_cz)
+
+        self._use_obs = any(w > 0.0 for w in (self.lambda_mz, self.lambda_mx, self.lambda_cz))
+        self.z_eigs = z_eigs
+        self.zz_nn_eigs = zz_nn_eigs
+        self.zz_all_eigs = zz_all_eigs
+        self.x_flip_idx = list(x_flip_idx)
+
+    @staticmethod
+    def _flatten_states(states: torch.Tensor) -> torch.Tensor:
+        if states.ndim < 2:
+            raise ValueError(f"states deve avere almeno 2 dimensioni, ricevuto {tuple(states.shape)}")
+        return states.reshape(-1, states.shape[-1])
+
+    def forward(self, state_pred: torch.Tensor, state_target: torch.Tensor):
+        if state_pred.shape != state_target.shape:
+            raise ValueError(
+                f"state_pred e state_target devono avere la stessa shape: "
+                f"{tuple(state_pred.shape)} vs {tuple(state_target.shape)}"
+            )
+
+        pred_flat = self._flatten_states(state_pred)
+        target_flat = self._flatten_states(state_target)
+
+        overlap = torch.sum(target_flat.conj() * pred_flat, dim=-1)  # (batch*seq,)
+        fidelity = torch.abs(overlap) ** 2
+        mean_fidelity = fidelity.mean()
+
+        total_loss = self.lambda_fid * (1.0 - mean_fidelity)
+
+        if self._use_obs:
+            mz_pred, mx_pred, cz_pred, _, _ = batch_observables_diff(
+                pred_flat, self.z_eigs, self.zz_nn_eigs, self.zz_all_eigs, self.x_flip_idx
+            )
+            mz_tgt, mx_tgt, cz_tgt, _, _ = batch_observables_diff(
+                target_flat, self.z_eigs, self.zz_nn_eigs, self.zz_all_eigs, self.x_flip_idx
+            )
+
+            if self.lambda_mz > 0.0:
+                total_loss = total_loss + self.lambda_mz * torch.mean((mz_pred - mz_tgt) ** 2)
+            if self.lambda_mx > 0.0:
+                total_loss = total_loss + self.lambda_mx * torch.mean((mx_pred - mx_tgt) ** 2)
+            if self.lambda_cz > 0.0:
+                total_loss = total_loss + self.lambda_cz * torch.mean((cz_pred - cz_tgt) ** 2)
+
+        return total_loss, mean_fidelity
 
 
 class QuantumStatePredictor(nn.Module):

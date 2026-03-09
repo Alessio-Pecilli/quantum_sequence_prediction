@@ -79,10 +79,18 @@ test_full_dataset = QuantumStateDataset(test_in, test_tgt)
 
 if config.TRAINING_MODE == "rollout_window":
     train_dataset = QuantumTrajectoryWindowDataset(
-        train_in, train_tgt, context_len=config.T1, rollout_horizon=config.T2
+        train_in,
+        train_tgt,
+        context_len=config.T1,
+        rollout_horizon=config.T2,
+        unroll_steps=config.UNROLL_STEPS,
     )
     test_dataset = QuantumTrajectoryWindowDataset(
-        test_in, test_tgt, context_len=config.T1, rollout_horizon=config.T2
+        test_in,
+        test_tgt,
+        context_len=config.T1,
+        rollout_horizon=config.T2,
+        unroll_steps=config.UNROLL_STEPS,
     )
 else:
     train_dataset = train_full_dataset
@@ -125,14 +133,19 @@ for epoch in range(EPOCHS_EVAL):
             y_micro = y_micro_cpu.to(config.DEVICE, non_blocking=non_blocking)
 
             pred = model(x_micro)
-            pred_for_loss = pred[:, -1:, :] if y_micro.shape[1] == 1 else pred
-            loss, fid = criterion(pred_for_loss, y_micro)
+            if y_micro.ndim == 3 and y_micro.shape[1] >= 1 and pred.shape[1] != y_micro.shape[1]:
+                pred_for_loss = pred[:, -1, :]
+                target_for_loss = y_micro[:, 0, :]
+            else:
+                pred_for_loss = pred
+                target_for_loss = y_micro
+            loss, fid = criterion(pred_for_loss, target_for_loss)
             (loss * weight).backward()
 
             batch_loss += loss.item() * weight
             batch_fid += fid.item() * weight
 
-            del x_micro, y_micro, pred, pred_for_loss, loss, fid
+            del x_micro, y_micro, pred, pred_for_loss, target_for_loss, loss, fid
 
         optimizer.step()
 

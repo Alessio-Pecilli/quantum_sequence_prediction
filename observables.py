@@ -112,3 +112,64 @@ def batch_observables(
 
     return mz, mx, cz, zz_corr_all, z_sites
 
+
+def batch_observables_diff(
+    states: torch.Tensor,
+    z_eigs: torch.Tensor,
+    zz_nn_eigs: torch.Tensor,
+    zz_all_eigs: torch.Tensor,
+    x_flip_idx: list[torch.Tensor],
+):
+    """
+    Calcola (per batch) le medie su siti/pairs:
+      m^z  = (1/N) * sum_i <Z_i>
+      m^x  = (1/N) * sum_i <X_i>
+      c^z  = (1/(N-1)) * sum_i <Z_i Z_{i+1}>  (solo vicini, bordo aperto)
+      zz_corr_all = <Z_i Z_j> per tutte le coppie (i,j)
+      z_sites = <Z_i> per ogni sito singolo
+
+    Args:
+      states: (batch, dim) complesso, normalizzato
+    Returns:
+      mz, mx, cz: tensori float32 shape (batch,)
+      zz_corr_all: tensore float32 shape (batch, n_qubits, n_qubits) con <Z_i Z_j>
+      z_sites: tensore float32 shape (batch, n_qubits) con <Z_i>
+    """
+    if states.ndim != 2:
+        raise ValueError(f"states deve avere shape (batch, dim), ricevuto: {tuple(states.shape)}")
+
+    batch, dim = states.shape
+    n_qubits = int(z_eigs.shape[0])
+    if dim != int(z_eigs.shape[1]):
+        raise ValueError(f"dim mismatch: states dim={dim}, z_eigs dim={int(z_eigs.shape[1])}")
+
+    # --- Z e ZZ: operatori diagonali -> uso delle probabilita' |psi|^2
+    probs = torch.abs(states) ** 2  # (batch, dim), float32/float64
+    probs = probs.to(torch.float32)
+
+    exp_z_sites = probs @ z_eigs.T  # (batch, n_qubits)
+    mz = exp_z_sites.mean(dim=1)  # (batch,)
+    z_sites = exp_z_sites  # (batch, n_qubits) - magnetizzazioni per sito
+
+    if n_qubits >= 2:
+        exp_zz_pairs = probs @ zz_nn_eigs.T  # (batch, n_qubits-1)
+        cz = exp_zz_pairs.mean(dim=1)  # (batch,)
+    else:
+        cz = torch.zeros((batch,), device=states.device, dtype=torch.float32)
+
+    # Correlazioni ZZ per tutte le coppie (i,j)
+    zz_corr_all = torch.zeros((batch, n_qubits, n_qubits), device=states.device, dtype=torch.float32)
+    for i in range(n_qubits):
+        for j in range(n_qubits):
+            zz_corr_all[:, i, j] = torch.sum(probs * zz_all_eigs[i, j], dim=1)  # (batch,)
+
+    # --- X: flip del bit i-esimo (non diagonale)
+    psi_conj = states.conj()
+    mx_sum = torch.zeros((batch,), device=states.device, dtype=torch.float32)
+    for i in range(n_qubits):
+        flipped = states[:, x_flip_idx[i]]  # (batch, dim)
+        exp_x_i = torch.sum(psi_conj * flipped, dim=1)  # (batch,) complex
+        mx_sum += exp_x_i.real.to(torch.float32)
+    mx = mx_sum / max(1, n_qubits)
+
+    return mz, mx, cz, zz_corr_all, z_sites

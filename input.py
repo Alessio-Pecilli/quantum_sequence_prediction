@@ -47,27 +47,41 @@ class QuantumStateDataset(Dataset):
 
 class QuantumTrajectoryWindowDataset(Dataset):
     """
-    Espande traiettorie complete in campioni (contesto di lunghezza T1 -> next-step).
+    Espande traiettorie complete in campioni (contesto T1 -> target futuri multi-step).
 
     Per ogni traiettoria:
       - input  = states[k-T1+1 .. k]
-      - target = state[k+1]
+      - target = states[k+1 .. k+UNROLL_STEPS]
 
-    con k che scorre da T1-1 fino a T1+T2-2, cioe' esattamente sugli step
-    usati poi nel rollout autoregressivo.
+    con k che scorre da T1-1 fino a T1+T2-UNROLL_STEPS-1, in modo che i target
+    futuri siano sempre disponibili senza uscire dalla traiettoria.
     """
 
-    def __init__(self, inputs_data, targets_data, context_len=config.T1, rollout_horizon=config.T2):
+    def __init__(
+        self,
+        inputs_data,
+        targets_data,
+        context_len=config.T1,
+        rollout_horizon=config.T2,
+        unroll_steps=config.UNROLL_STEPS,
+    ):
         self.inputs = inputs_data
         self.targets = targets_data
         self.context_len = int(context_len)
         self.rollout_horizon = int(rollout_horizon)
+        self.unroll_steps = int(unroll_steps)
 
         assert len(self.inputs) == len(self.targets), "Mismatch tra input e target!"
         if self.context_len < 1:
             raise ValueError(f"context_len deve essere >= 1, ricevuto: {self.context_len}")
         if self.rollout_horizon < 1:
             raise ValueError(f"rollout_horizon deve essere >= 1, ricevuto: {self.rollout_horizon}")
+        if self.unroll_steps < 1:
+            raise ValueError(f"unroll_steps deve essere >= 1, ricevuto: {self.unroll_steps}")
+        if self.unroll_steps > self.rollout_horizon:
+            raise ValueError(
+                f"unroll_steps={self.unroll_steps} non puo' superare rollout_horizon={self.rollout_horizon}"
+            )
 
         seq_len = int(self.inputs.shape[1])
         if self.targets.shape[1] != seq_len:
@@ -79,7 +93,7 @@ class QuantumTrajectoryWindowDataset(Dataset):
                 f"Contesto+horizon non validi: {self.context_len}+{self.rollout_horizon} > {seq_len + 1}"
             )
 
-        self.windows_per_trajectory = self.rollout_horizon
+        self.windows_per_trajectory = self.rollout_horizon - self.unroll_steps + 1
 
     def __len__(self):
         return len(self.inputs) * self.windows_per_trajectory
@@ -90,8 +104,8 @@ class QuantumTrajectoryWindowDataset(Dataset):
         end_t = self.context_len - 1 + rollout_idx
 
         x_window = self.inputs[traj_idx, end_t - self.context_len + 1 : end_t + 1]
-        y_next = self.targets[traj_idx, end_t : end_t + 1]
-        return x_window, y_next
+        y_future = self.targets[traj_idx, end_t : end_t + self.unroll_steps]
+        return x_window, y_future
 
     def describe_window(self, idx: int) -> dict[str, int]:
         if idx < 0 or idx >= len(self):
@@ -101,14 +115,17 @@ class QuantumTrajectoryWindowDataset(Dataset):
         rollout_idx = idx % self.windows_per_trajectory
         end_t = self.context_len - 1 + rollout_idx
         start_t = end_t - self.context_len + 1
-        target_t = end_t + 1
+        target_start_t = end_t + 1
+        target_end_t = end_t + self.unroll_steps
         return {
             "dataset_index": int(idx),
             "trajectory_index": int(traj_idx),
             "rollout_index": int(rollout_idx),
             "context_start_t": int(start_t),
             "context_end_t": int(end_t),
-            "target_t": int(target_t),
+            "target_t": int(target_start_t),
+            "target_start_t": int(target_start_t),
+            "target_end_t": int(target_end_t),
         }
 
 

@@ -18,6 +18,15 @@ def _env_str(name: str, default: str) -> str:
         return default
     return raw.strip().lower()
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError as e:
+        raise ValueError(f"Env var {name} deve essere un float, ricevuto: {raw!r}") from e
+
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None or raw == "":
@@ -75,10 +84,22 @@ if T1 + T2 > SEQ_LEN + 1:
     raise ValueError(f"Configurazione non valida: T1+T2={T1 + T2} > SEQ_LEN+1={SEQ_LEN + 1}.")
 
 TRAINING_MODE = _env_str("QSP_TRAINING_MODE", "rollout_window")
+UNROLL_STEPS = _env_int("QSP_UNROLL_STEPS", 3)
+
+if UNROLL_STEPS < 1:
+    raise ValueError(f"UNROLL_STEPS deve essere >= 1, ricevuto: {UNROLL_STEPS}")
+if UNROLL_STEPS > T2:
+    raise ValueError(f"UNROLL_STEPS={UNROLL_STEPS} non puo' superare T2={T2}")
 
 # Batch ridotto, ideale per CPU
 BATCH_SIZE = _env_int("QSP_BATCH_SIZE", 20)
 EPOCHS = _env_int("QSP_EPOCHS", 200)
+
+# ===== Pesi Loss (Fidelity + Physics-Informed terms) =====
+LAMBDA_FID = _env_float("QSP_LAMBDA_FID", 1.0)
+LAMBDA_MZ = _env_float("QSP_LAMBDA_MZ", 0.0)
+LAMBDA_MX = _env_float("QSP_LAMBDA_MX", 0.0)
+LAMBDA_CZ = _env_float("QSP_LAMBDA_CZ", 0.0)
 
 # ===== Configurazione Ottimizzatore =====
 # LR leggermente più alto per convergere in fretta

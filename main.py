@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 
 import config
 from input import QuantumStateDataset, QuantumTrajectoryWindowDataset, generate_quantum_dynamics_dataset
-from predictor import QuantumStatePredictor, QuantumFidelityLoss
+from predictor import QuantumStatePredictor, PhysicsInformedLoss
 from trainer import AdvancedTrainer
 from observables import precompute_observables, batch_observables
 
@@ -49,7 +49,8 @@ def _print_temporal_learning_map(dataset):
             print(
                 f"      window {idx}: psi[{info['context_start_t']}..{info['context_end_t']}] "
                 f"({_format_time_index(info['context_start_t'])} -> {_format_time_index(info['context_end_t'])}) "
-                f"-> target psi[{info['target_t']}] ({_format_time_index(info['target_t'])})"
+                f"-> target psi[{info['target_start_t']}..{info['target_end_t']}] "
+                f"({_format_time_index(info['target_start_t'])} -> {_format_time_index(info['target_end_t'])})"
             )
     else:
         example_steps = sorted({0, min(1, config.SEQ_LEN - 1), min(2, config.SEQ_LEN - 1), config.SEQ_LEN - 1})
@@ -72,6 +73,7 @@ print(f"  Hamiltoniana:    {config.HAMILTONIAN_TYPE} (fissata)")
 print(f"  Qubit:           {config.N_QUBITS}  (dim. Hilbert: {config.DIM_2N})")
 print(f"  Sequenza:        SEQ_LEN={config.SEQ_LEN} (stati totali={config.SEQ_LEN + 1})  (dt={config.DT})")
 print(f"  Rollout:         T1={config.T1} (context)  T2={config.T2} (horizon)  (max={config.SEQ_LEN + 1})")
+print(f"  Unroll TBPTT:    UNROLL_STEPS={config.UNROLL_STEPS}")
 print(f"  Modello:         d={config.D_MODEL}, heads={config.NUM_HEADS}, layers={config.NUM_LAYERS}")
 print(f"  Training data:   {config.B_TRAIN} H × {config.S_TRAIN} stati = {config.B_TRAIN * config.S_TRAIN}")
 print(f"  Test data:       {config.B_TEST} H × {config.S_TEST} stati = {config.B_TEST * config.S_TEST}")
@@ -118,13 +120,21 @@ test_full_dataset = QuantumStateDataset(test_inputs, test_targets)
 
 if config.TRAINING_MODE == "rollout_window":
     train_dataset = QuantumTrajectoryWindowDataset(
-        train_inputs, train_targets, context_len=config.T1, rollout_horizon=config.T2
+        train_inputs,
+        train_targets,
+        context_len=config.T1,
+        rollout_horizon=config.T2,
+        unroll_steps=config.UNROLL_STEPS,
     )
     test_dataset = QuantumTrajectoryWindowDataset(
-        test_inputs, test_targets, context_len=config.T1, rollout_horizon=config.T2
+        test_inputs,
+        test_targets,
+        context_len=config.T1,
+        rollout_horizon=config.T2,
+        unroll_steps=config.UNROLL_STEPS,
     )
     print(
-        f"  Training objective: finestre T1={config.T1} -> next-step "
+        f"  Training objective: finestre T1={config.T1} -> autoregressive unroll {config.UNROLL_STEPS} step "
         f"(campioni train={len(train_dataset):,}, test={len(test_dataset):,})"
     )
 else:
@@ -179,7 +189,19 @@ gc.collect()
 # ============================================================
 print("\n[2/6] Inizializzando modello e trainer avanzato...")
 model = QuantumStatePredictor().to(config.DEVICE)
-criterion = QuantumFidelityLoss()
+z_eigs, zz_nn_eigs, zz_all_eigs, x_flip_idx = precompute_observables(
+    config.N_QUBITS, device=torch.device(config.DEVICE)
+)
+criterion = PhysicsInformedLoss(
+    z_eigs=z_eigs,
+    zz_nn_eigs=zz_nn_eigs,
+    zz_all_eigs=zz_all_eigs,
+    x_flip_idx=x_flip_idx,
+    lambda_fid=config.LAMBDA_FID,
+    lambda_mz=config.LAMBDA_MZ,
+    lambda_mx=config.LAMBDA_MX,
+    lambda_cz=config.LAMBDA_CZ,
+)
 n_params = sum(p.numel() for p in model.parameters())
 print(f"  Parametri: {n_params:,}  |  Device: {config.DEVICE}")
 
@@ -244,8 +266,6 @@ if config.OBSERVABLE_PLOTS_ENABLED:
     t1 = int(config.T1)
     t2 = int(config.T2)
     device = torch.device(config.DEVICE)
-
-    z_eigs, zz_nn_eigs, zz_all_eigs, x_flip_idx = precompute_observables(config.N_QUBITS, device=device)
 
     max_samples = int(config.OBSERVABLE_PLOT_SAMPLES)
     if max_samples > 0:
@@ -612,6 +632,11 @@ summary = {
         "T1": int(config.T1),
         "T2": int(config.T2),
         "TRAINING_MODE": config.TRAINING_MODE,
+        "UNROLL_STEPS": int(config.UNROLL_STEPS),
+        "LAMBDA_FID": float(config.LAMBDA_FID),
+        "LAMBDA_MZ": float(config.LAMBDA_MZ),
+        "LAMBDA_MX": float(config.LAMBDA_MX),
+        "LAMBDA_CZ": float(config.LAMBDA_CZ),
         "B_TRAIN": int(config.B_TRAIN),
         "S_TRAIN": int(config.S_TRAIN),
         "B_TEST": int(config.B_TEST),

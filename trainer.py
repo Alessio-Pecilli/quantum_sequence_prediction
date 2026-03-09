@@ -503,9 +503,57 @@ class AdvancedTrainer:
             return pred, target
         if target.shape[1] == 1 and pred.shape[1] >= 1:
             return pred[:, -1:, :], target
+        if target.shape[1] > 1 and pred.shape[1] >= 1:
+            return pred[:, -1, :], target[:, 0, :]
         raise ValueError(
             f"Shape incompatibili tra pred {tuple(pred.shape)} e target {tuple(target.shape)}"
         )
+
+    def _autoregressive_unrolled_loss(
+        self,
+        x_window: torch.Tensor,
+        y_future: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Truncated BPTT su finestre autoregressive:
+          - input iniziale: finestra reale di lunghezza T1
+          - a ogni step: predizione next-step, loss vs target reale, shift finestra con il predetto
+
+        L'orizzonte del grafo e' limitato a UNROLL_STEPS (controllo VRAM).
+        """
+        if x_window.ndim != 3 or y_future.ndim != 3:
+            raise ValueError(
+                f"Attese shape (batch, time, dim). Ricevuto x={tuple(x_window.shape)} y={tuple(y_future.shape)}"
+            )
+        if x_window.shape[0] != y_future.shape[0] or x_window.shape[2] != y_future.shape[2]:
+            raise ValueError(
+                f"Batch/dim mismatch tra x={tuple(x_window.shape)} e y={tuple(y_future.shape)}"
+            )
+        if y_future.shape[1] < 1:
+            raise ValueError("y_future deve contenere almeno 1 step temporale.")
+
+        unroll_steps = int(y_future.shape[1])
+        window = x_window
+        loss_acc = torch.zeros((), device=self.device, dtype=torch.float32)
+        fid_acc = torch.zeros((), device=self.device, dtype=torch.float32)
+
+        for k in range(unroll_steps):
+            pred_seq = self.model(window)
+            next_pred = pred_seq[:, -1, :]
+            next_target = y_future[:, k, :]
+
+            step_loss, step_fid = self.criterion(next_pred, next_target)
+            loss_acc = loss_acc + step_loss
+            fid_acc = fid_acc + step_fid
+
+            # Shift della finestra: drop del piu' vecchio e append del predetto.
+            if k + 1 < unroll_steps:
+                window = torch.cat((window[:, 1:, :], next_pred.unsqueeze(1)), dim=1)
+
+            del pred_seq, next_pred, next_target, step_loss, step_fid
+
+        scale = 1.0 / float(unroll_steps)
+        return loss_acc * scale, fid_acc * scale
 
     def _maybe_sync_for_timing(self, active: bool = False):
         if active and self.sync_cuda_timings:
@@ -759,14 +807,20 @@ class AdvancedTrainer:
                 model_t0 = time.perf_counter()
                 if self.use_amp and self.scaler is not None:
                     with torch.amp.autocast(self.device):
+                        if config.TRAINING_MODE == "rollout_window":
+                            loss, fid = self._autoregressive_unrolled_loss(x_micro, y_micro)
+                        else:
+                            pred = self.model(x_micro)
+                            pred_for_loss, target_for_loss = self._match_prediction_target(pred, y_micro)
+                            loss, fid = self.criterion(pred_for_loss, target_for_loss)
+                        loss_scaled = (loss * weight) / self.grad_accum_steps
+                else:
+                    if config.TRAINING_MODE == "rollout_window":
+                        loss, fid = self._autoregressive_unrolled_loss(x_micro, y_micro)
+                    else:
                         pred = self.model(x_micro)
                         pred_for_loss, target_for_loss = self._match_prediction_target(pred, y_micro)
                         loss, fid = self.criterion(pred_for_loss, target_for_loss)
-                        loss_scaled = (loss * weight) / self.grad_accum_steps
-                else:
-                    pred = self.model(x_micro)
-                    pred_for_loss, target_for_loss = self._match_prediction_target(pred, y_micro)
-                    loss, fid = self.criterion(pred_for_loss, target_for_loss)
                     loss_scaled = (loss * weight) / self.grad_accum_steps
                 self._maybe_sync_for_timing(should_log)
                 model_time += time.perf_counter() - model_t0
@@ -783,7 +837,9 @@ class AdvancedTrainer:
                 batch_loss = batch_loss + (loss.detach() * weight)
                 batch_fid = batch_fid + (fid * weight)
 
-                del x_micro, y_micro, pred, pred_for_loss, target_for_loss, loss, fid, loss_scaled
+                del x_micro, y_micro, loss, fid, loss_scaled
+                if config.TRAINING_MODE != "rollout_window":
+                    del pred, pred_for_loss, target_for_loss
 
             update_performed = False
             grad_norm = None
