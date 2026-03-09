@@ -221,68 +221,8 @@ total_train_time = trainer.total_train_time
 trainer.print_training_summary()
 
 
-# ============================================================
-#  4. VALUTAZIONE FINALE SUL TEST SET
-# ============================================================
-print(f"\n[4/6] Valutazione finale sul Test Set (teacher forcing full-sequence)...")
-
-model = trainer.model
-model.eval()
-
-non_blocking = pin_memory
-fid_sum_per_step = torch.zeros(config.SEQ_LEN, dtype=torch.float64)
-fid_sq_sum_per_step = torch.zeros(config.SEQ_LEN, dtype=torch.float64)
-fid_total_sum = 0.0
-total_samples = 0
-sample_fid_means = []
-max_plot_samples = max(1, int(config.MAX_FIDELITY_PLOT_SAMPLES))
-per_step_plot_values = [[] for _ in range(config.SEQ_LEN)]
-
-with torch.no_grad():
-    for step, (x_batch_cpu, y_batch_cpu) in enumerate(test_eval_loader, start=1):
-        x_batch = x_batch_cpu.to(config.DEVICE, non_blocking=non_blocking)
-        y_batch = y_batch_cpu.to(config.DEVICE, non_blocking=non_blocking)
-
-        pred = model(x_batch)
-        overlap = torch.sum(y_batch.conj() * pred, dim=-1)
-        fid_per_step = torch.abs(overlap) ** 2
-        fid_cpu = fid_per_step.cpu()
-
-        fid_sum_per_step += fid_cpu.sum(dim=0, dtype=torch.float64)
-        fid_sq_sum_per_step += (fid_cpu.double().pow(2)).sum(dim=0)
-        fid_total_sum += fid_cpu.sum().item()
-        total_samples += fid_cpu.shape[0]
-
-        if len(sample_fid_means) < max_plot_samples:
-            remaining = max_plot_samples - len(sample_fid_means)
-            sample_fid_means.extend(fid_cpu.mean(dim=-1).tolist()[:remaining])
-
-        for t in range(config.SEQ_LEN):
-            if len(per_step_plot_values[t]) < max_plot_samples:
-                remaining = max_plot_samples - len(per_step_plot_values[t])
-                per_step_plot_values[t].extend(fid_cpu[:, t].tolist()[:remaining])
-
-        del x_batch_cpu, y_batch_cpu, x_batch, y_batch, pred, overlap, fid_per_step, fid_cpu
-
-        if config.GC_COLLECT_EVERY_N_STEPS > 0 and step % config.GC_COLLECT_EVERY_N_STEPS == 0:
-            gc.collect()
-
-gc.collect()
-
-total_points = max(1, total_samples * config.SEQ_LEN)
-mean_fid = fid_total_sum / total_points
-mean_loss = 1.0 - mean_fid
-test_ppl = math.exp(mean_loss)
-
-print(f"  Loss: {mean_loss:.6f}  |  PPL: {test_ppl:.6f}")
-
-# Dati per grafici
+# Dati per grafici dal training
 actual_epochs = len(history["train_loss"])
-den = max(1, total_samples)
-fid_per_step_mean = (fid_sum_per_step / den).float()
-fid_var_per_step = (fid_sq_sum_per_step / den) - fid_per_step_mean.double().pow(2)
-fid_per_step_std = torch.sqrt(torch.clamp(fid_var_per_step, min=0.0)).float()
-
 final_tr_loss = history["train_loss"][-1]
 final_te_loss = history["test_loss"][-1]
 final_tr_fid = history["train_fidelity"][-1]
@@ -290,14 +230,16 @@ final_te_fid = history["test_fidelity"][-1]
 best_test_fid = max(history["test_fidelity"])
 best_test_epoch = history["test_fidelity"].index(best_test_fid) + 1
 
+model = trainer.model
+model.eval()
+non_blocking = pin_memory
 
 # ============================================================
-#  4b. ROLLOUT AUTOREGRESSIVO (FIDELITY + OSSERVABILI) SU TRAIN/TEST
+#  4. ROLLOUT AUTOREGRESSIVO (FIDELITY + OSSERVABILI) SU TEST
 # ============================================================
-obs_curves = None
-test_rollout_curves = None
+rollout_curves = None
 if config.OBSERVABLE_PLOTS_ENABLED:
-    print(f"\n[4b/6] Rollout autoregressivo: fidelity + osservabili (Train/Test)...")
+    print(f"\n[4/5] Rollout autoregressivo: fidelity + osservabili (Test Set)...")
 
     t1 = int(config.T1)
     t2 = int(config.T2)
@@ -428,14 +370,13 @@ if config.OBSERVABLE_PLOTS_ENABLED:
 
         return curves
 
-    obs_curves = _rollout_curves(train_eval_loader, "Train")
-    test_rollout_curves = _rollout_curves(test_eval_loader, "Test")
+    rollout_curves = _rollout_curves(test_eval_loader, "Test")
 
 
 # ============================================================
 #  5. GRAFICI
 # ============================================================
-print(f"\n[5/6] Generando grafici...")
+print(f"\n[5/5] Generando grafici...")
 
 epochs_range = range(1, actual_epochs + 1)
 
@@ -486,17 +427,22 @@ ax.set_title("Perplexity (exp(Loss))")
 ax.legend()
 ax.grid(True, alpha=0.3)
 
-# --- Fig 5: Fidelity per step temporale ---
+# --- Fig 5: Rollout performance ---
 ax = axes[1, 1]
-steps = list(range(config.SEQ_LEN))
-means = fid_per_step_mean.numpy()
-stds = fid_per_step_std.numpy()
-ax.bar(steps, means, yerr=stds, capsize=3, alpha=0.7, color="steelblue", edgecolor="navy")
-ax.set_xlabel("Step temporale")
-ax.set_ylabel("Fidelity")
-ax.set_title("Fidelity per step temporale (Test)")
-ax.set_xticks(steps)
-ax.grid(True, alpha=0.3, axis="y")
+if rollout_curves is not None:
+    fid_rol_mean, fid_rol_std = rollout_curves["fid"]
+    t_axis_short = np.arange(len(fid_rol_mean)) + config.T1
+    ax.plot(t_axis_short, fid_rol_mean, 'o-', color="purple", linewidth=2, markersize=4)
+    ax.fill_between(t_axis_short, fid_rol_mean - fid_rol_std, fid_rol_mean + fid_rol_std, 
+                   color="purple", alpha=0.2)
+    ax.set_xlabel("Step temporale rollout")
+    ax.set_ylabel("Fidelity")
+    ax.set_title(f"Rollout Fidelity (T1={config.T1}→T2={config.T2})")
+    ax.set_ylim(0, 1)
+else:
+    ax.text(0.5, 0.5, "Rollout disabilitato", ha="center", va="center", transform=ax.transAxes)
+    ax.set_title("Rollout Fidelity")
+ax.grid(True, alpha=0.3)
 
 # --- Fig 6: Generalization gap nel tempo ---
 ax = axes[1, 2]
@@ -516,86 +462,12 @@ plt.close()
 generated_plots.append(training_report_path)
 print(f"  [PLOT] {training_report_path}")
 
-# --- Fig OBS: Osservabili su rollout (train) ---
-if obs_curves is not None:
-    fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
-    fig.suptitle(
-        f"Osservabili su rollout (Train Set)  -  n={obs_curves['n_samples']}",
-        fontsize=13,
-        fontweight="bold",
-    )
-
-    t_axis = (np.arange(config.T2, dtype=np.float32) + config.T1) * float(config.DT)
-
-    # m^z
-    ax = axes[0]
-    mz_pred_mean, mz_pred_std = obs_curves["mz_pred"]
-    mz_true_mean, mz_true_std = obs_curves["mz_true"]
-    ax.plot(t_axis, mz_true_mean, label="Esatto", color="black", linewidth=2)
-    ax.fill_between(t_axis, mz_true_mean - mz_true_std, mz_true_mean + mz_true_std, color="black", alpha=0.15)
-    ax.plot(t_axis, mz_pred_mean, label="Rollout Modello", color="tab:blue", linewidth=2)
-    ax.fill_between(
-        t_axis,
-        mz_pred_mean - mz_pred_std,
-        mz_pred_mean + mz_pred_std,
-        color="tab:blue",
-        alpha=0.20,
-    )
-    ax.set_ylabel("m^z")
-    ax.set_title(r"$m^z(t)=\frac{1}{N}\sum_i \langle Z_i\rangle$")
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-
-    # m^x
-    ax = axes[1]
-    mx_pred_mean, mx_pred_std = obs_curves["mx_pred"]
-    mx_true_mean, mx_true_std = obs_curves["mx_true"]
-    ax.plot(t_axis, mx_true_mean, label="Esatto", color="black", linewidth=2)
-    ax.fill_between(t_axis, mx_true_mean - mx_true_std, mx_true_mean + mx_true_std, color="black", alpha=0.15)
-    ax.plot(t_axis, mx_pred_mean, label="Rollout Modello", color="tab:orange", linewidth=2)
-    ax.fill_between(
-        t_axis,
-        mx_pred_mean - mx_pred_std,
-        mx_pred_mean + mx_pred_std,
-        color="tab:orange",
-        alpha=0.20,
-    )
-    ax.set_ylabel("m^x")
-    ax.set_title(r"$m^x(t)=\frac{1}{N}\sum_i \langle X_i\rangle$")
-    ax.grid(True, alpha=0.3)
-
-    # c^z (nearest neighbor)
-    ax = axes[2]
-    cz_pred_mean, cz_pred_std = obs_curves["cz_pred"]
-    cz_true_mean, cz_true_std = obs_curves["cz_true"]
-    ax.plot(t_axis, cz_true_mean, label="Esatto", color="black", linewidth=2)
-    ax.fill_between(t_axis, cz_true_mean - cz_true_std, cz_true_mean + cz_true_std, color="black", alpha=0.15)
-    ax.plot(t_axis, cz_pred_mean, label="Rollout Modello", color="tab:green", linewidth=2)
-    ax.fill_between(
-        t_axis,
-        cz_pred_mean - cz_pred_std,
-        cz_pred_mean + cz_pred_std,
-        color="tab:green",
-        alpha=0.20,
-    )
-    ax.set_ylabel("c^z")
-    ax.set_xlabel("Tempo (t)")
-    ax.set_title(r"$c^z(t)=\frac{1}{N-1}\sum_i \langle Z_i Z_{i+1}\rangle$")
-    ax.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    observables_path = os.path.join(RESULTS_DIR, "observables_rollout_train.png")
-    plt.savefig(observables_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    generated_plots.append(observables_path)
-    print(f"  [PLOT] {observables_path}")
-
-# --- Fig ROLL: Fidelity + osservabili su rollout (test) ---
-if test_rollout_curves is not None:
+# --- Fig ROLLOUT: Fidelity + osservabili su rollout (test) ---
+if rollout_curves is not None:
     fig, axes = plt.subplots(4, 1, figsize=(12, 13), sharex=True)
     fig.suptitle(
-        f"Rollout (Test Set)  -  n={test_rollout_curves['n_samples']}  (T1={config.T1}, T2={config.T2})",
-        fontsize=13,
+        f"ROLLOUT AUTOREGRESSIVO (Test Set)  -  n={rollout_curves['n_samples']}  (T1={config.T1}, T2={config.T2})",
+        fontsize=14,
         fontweight="bold",
     )
 
@@ -603,22 +475,30 @@ if test_rollout_curves is not None:
 
     # Fidelity
     ax = axes[0]
-    fid_mean, fid_std = test_rollout_curves["fid"]
-    ax.plot(t_axis, fid_mean, label="Fidelity rollout", color="tab:purple", linewidth=2)
-    ax.fill_between(t_axis, fid_mean - fid_std, fid_mean + fid_std, color="tab:purple", alpha=0.20)
+    fid_mean, fid_std = rollout_curves["fid"]
+    ax.plot(t_axis, fid_mean, label="Fidelity rollout", color="tab:purple", linewidth=3)
+    ax.fill_between(t_axis, fid_mean - fid_std, fid_mean + fid_std, color="tab:purple", alpha=0.25)
     ax.set_ylabel("Fidelity")
     ax.set_ylim(0.0, 1.0)
-    ax.set_title(r"$F(t)=|\langle \psi_{\mathrm{true}}(t) | \psi_{\mathrm{pred}}(t)\rangle|^2$")
+    ax.set_title(r"ROLLOUT FIDELITY: $F(t)=|\langle \psi_{\mathrm{true}}(t) | \psi_{\mathrm{pred}}(t)\rangle|^2$")
     ax.grid(True, alpha=0.3)
     ax.legend()
+    
+    # Aggiungi statistics box
+    f_mean_overall = float(fid_mean.mean())
+    f_final = float(fid_mean[-1])
+    textstr = f'Media: {f_mean_overall:.3f}\nFinale: {f_final:.3f}'
+    props = dict(boxstyle='round', facecolor='wheat', alpha=0.8)
+    ax.text(0.02, 0.98, textstr, transform=ax.transAxes, fontsize=9,
+            verticalalignment='top', bbox=props)
 
     # m^z
     ax = axes[1]
-    mz_pred_mean, mz_pred_std = test_rollout_curves["mz_pred"]
-    mz_true_mean, mz_true_std = test_rollout_curves["mz_true"]
-    ax.plot(t_axis, mz_true_mean, label="Esatto", color="black", linewidth=2)
+    mz_pred_mean, mz_pred_std = rollout_curves["mz_pred"]
+    mz_true_mean, mz_true_std = rollout_curves["mz_true"]
+    ax.plot(t_axis, mz_true_mean, label="Ground Truth", color="black", linewidth=2)
     ax.fill_between(t_axis, mz_true_mean - mz_true_std, mz_true_mean + mz_true_std, color="black", alpha=0.15)
-    ax.plot(t_axis, mz_pred_mean, label="Rollout Modello", color="tab:blue", linewidth=2)
+    ax.plot(t_axis, mz_pred_mean, label="Rollout Prediction", color="tab:blue", linewidth=2)
     ax.fill_between(
         t_axis,
         mz_pred_mean - mz_pred_std,
@@ -627,17 +507,17 @@ if test_rollout_curves is not None:
         alpha=0.20,
     )
     ax.set_ylabel("m^z")
-    ax.set_title(r"$m^z(t)=\frac{1}{N}\sum_i \langle Z_i\rangle$")
+    ax.set_title(r"MAGNETIZZAZIONE Z: $m^z(t)=\frac{1}{N}\sum_i \langle Z_i\rangle$")
     ax.grid(True, alpha=0.3)
     ax.legend()
 
     # m^x
     ax = axes[2]
-    mx_pred_mean, mx_pred_std = test_rollout_curves["mx_pred"]
-    mx_true_mean, mx_true_std = test_rollout_curves["mx_true"]
-    ax.plot(t_axis, mx_true_mean, label="Esatto", color="black", linewidth=2)
+    mx_pred_mean, mx_pred_std = rollout_curves["mx_pred"]
+    mx_true_mean, mx_true_std = rollout_curves["mx_true"]
+    ax.plot(t_axis, mx_true_mean, label="Ground Truth", color="black", linewidth=2)
     ax.fill_between(t_axis, mx_true_mean - mx_true_std, mx_true_mean + mx_true_std, color="black", alpha=0.15)
-    ax.plot(t_axis, mx_pred_mean, label="Rollout Modello", color="tab:orange", linewidth=2)
+    ax.plot(t_axis, mx_pred_mean, label="Rollout Prediction", color="tab:orange", linewidth=2)
     ax.fill_between(
         t_axis,
         mx_pred_mean - mx_pred_std,
@@ -646,16 +526,16 @@ if test_rollout_curves is not None:
         alpha=0.20,
     )
     ax.set_ylabel("m^x")
-    ax.set_title(r"$m^x(t)=\frac{1}{N}\sum_i \langle X_i\rangle$")
+    ax.set_title(r"MAGNETIZZAZIONE X: $m^x(t)=\frac{1}{N}\sum_i \langle X_i\rangle$")
     ax.grid(True, alpha=0.3)
 
     # c^z (nearest neighbor)
     ax = axes[3]
-    cz_pred_mean, cz_pred_std = test_rollout_curves["cz_pred"]
-    cz_true_mean, cz_true_std = test_rollout_curves["cz_true"]
-    ax.plot(t_axis, cz_true_mean, label="Esatto", color="black", linewidth=2)
+    cz_pred_mean, cz_pred_std = rollout_curves["cz_pred"]
+    cz_true_mean, cz_true_std = rollout_curves["cz_true"]
+    ax.plot(t_axis, cz_true_mean, label="Ground Truth", color="black", linewidth=2)
     ax.fill_between(t_axis, cz_true_mean - cz_true_std, cz_true_mean + cz_true_std, color="black", alpha=0.15)
-    ax.plot(t_axis, cz_pred_mean, label="Rollout Modello", color="tab:green", linewidth=2)
+    ax.plot(t_axis, cz_pred_mean, label="Rollout Prediction", color="tab:green", linewidth=2)
     ax.fill_between(
         t_axis,
         cz_pred_mean - cz_pred_std,
@@ -665,47 +545,17 @@ if test_rollout_curves is not None:
     )
     ax.set_ylabel("c^z")
     ax.set_xlabel("Tempo (t)")
-    ax.set_title(r"$c^z(t)=\frac{1}{N-1}\sum_i \langle Z_i Z_{i+1}\rangle$")
+    ax.set_title(r"CORRELAZIONI NN: $c^z(t)=\frac{1}{N-1}\sum_i \langle Z_i Z_{i+1}\rangle$")
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    rollout_test_path = os.path.join(RESULTS_DIR, "rollout_test_report.png")
-    plt.savefig(rollout_test_path, dpi=150, bbox_inches="tight")
+    rollout_report_path = os.path.join(RESULTS_DIR, "rollout_report.png")
+    plt.savefig(rollout_report_path, dpi=150, bbox_inches="tight")
     plt.close()
-    generated_plots.append(rollout_test_path)
-    print(f"  [PLOT] {rollout_test_path}")
-
-# --- Fig 5: Distribuzione fidelity sul test set ---
-fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-fig.suptitle("Distribuzione Fidelity sul Test Set", fontsize=13, fontweight="bold")
-
-ax = axes[0]
-fid_means = np.asarray(sample_fid_means, dtype=np.float32)
-if fid_means.size == 0:
-    fid_means = np.array([0.0], dtype=np.float32)
-ax.hist(fid_means, bins=40, alpha=0.7, color="steelblue", edgecolor="navy")
-ax.axvline(mean_fid, color="red", linestyle="--", linewidth=2, label=f"Media: {mean_fid:.4f}")
-ax.set_xlabel("Fidelity media per campione")
-ax.set_ylabel("Conteggio")
-ax.set_title("Istogramma Fidelity")
-ax.legend()
-ax.grid(True, alpha=0.3)
-
-ax = axes[1]
-boxplot_data = [vals if vals else [0.0] for vals in per_step_plot_values]
-ax.boxplot(boxplot_data,
-           tick_labels=[str(t) for t in range(config.SEQ_LEN)])
-ax.set_xlabel("Step temporale")
-ax.set_ylabel("Fidelity")
-ax.set_title("Boxplot Fidelity per step")
-ax.grid(True, alpha=0.3, axis="y")
-
-plt.tight_layout()
-fid_dist_path = os.path.join(RESULTS_DIR, "fidelity_distribution.png")
-plt.savefig(fid_dist_path, dpi=150, bbox_inches="tight")
-plt.close()
-generated_plots.append(fid_dist_path)
-print(f"  [PLOT] {fid_dist_path}")
+    generated_plots.append(rollout_report_path)
+    print(f"  [PLOT] ROLLOUT PRINCIPALE: {rollout_report_path}")
+else:
+    print(f"  [SKIP] Rollout disabilitato (OBSERVABLE_PLOTS_ENABLED=False)")
 
 # --- Fig 7: LR vs Loss (fase space) ---
 fig, axes = plt.subplots(1, 2, figsize=(12, 5))
@@ -793,25 +643,21 @@ summary = {
         if history.get("train_samples_per_sec")
         else None,
     },
-    "test_eval": {
-        "mean_fidelity": float(mean_fid),
-        "mean_loss": float(mean_loss),
-        "test_ppl": float(test_ppl),
-    },
-    "observables_rollout_train": {
+    "rollout_evaluation": {
         "enabled": bool(config.OBSERVABLE_PLOTS_ENABLED),
-        "n_samples": int(obs_curves["n_samples"]) if obs_curves is not None else 0,
-        "obs_plot_samples_cfg": int(config.OBSERVABLE_PLOT_SAMPLES),
-    },
-    "rollout_test": {
-        "enabled": bool(config.OBSERVABLE_PLOTS_ENABLED),
-        "n_samples": int(test_rollout_curves["n_samples"]) if test_rollout_curves is not None else 0,
-        "fidelity_mean_over_horizon": float(test_rollout_curves["fid"][0].mean())
-        if test_rollout_curves is not None
+        "n_samples": int(rollout_curves["n_samples"]) if rollout_curves is not None else 0,
+        "context_len_T1": int(config.T1),
+        "horizon_len_T2": int(config.T2),
+        "fidelity_mean_over_horizon": float(rollout_curves["fid"][0].mean())
+        if rollout_curves is not None
         else None,
-        "fidelity_last_step": float(test_rollout_curves["fid"][0][-1])
-        if test_rollout_curves is not None
+        "fidelity_first_step": float(rollout_curves["fid"][0][0])
+        if rollout_curves is not None
         else None,
+        "fidelity_last_step": float(rollout_curves["fid"][0][-1])
+        if rollout_curves is not None
+        else None,
+        "observables_samples_cfg": int(config.OBSERVABLE_PLOT_SAMPLES),
     },
 }
 
@@ -832,14 +678,8 @@ with open(summary_txt_path, "w", encoding="utf-8") as f:
     f.write("\nTraining:\n")
     for k, v in summary["training"].items():
         f.write(f"  {k}: {v}\n")
-    f.write("\nTest eval:\n")
-    for k, v in summary["test_eval"].items():
-        f.write(f"  {k}: {v}\n")
-    f.write("\nObservables rollout (train):\n")
-    for k, v in summary["observables_rollout_train"].items():
-        f.write(f"  {k}: {v}\n")
-    f.write("\nRollout (test):\n")
-    for k, v in summary["rollout_test"].items():
+    f.write("\nRollout evaluation:\n")
+    for k, v in summary["rollout_evaluation"].items():
         f.write(f"  {k}: {v}\n")
     f.write("\nPlots:\n")
     for p in summary["plots"]:
@@ -851,10 +691,16 @@ print(f"  [SUMMARY] {summary_txt_path}")
 #  6. RIEPILOGO FINALE
 # ============================================================
 gap_fid = final_tr_fid - final_te_fid
-print(f"\n[6/6] RIEPILOGO FINALE")
+print(f"\n[6/6] RIEPILOGO FINALE - ROLLOUT AUTOREGRESSIVO")
 print("=" * 50)
-print(f"  Test Loss:   {mean_loss:.4f}   PPL: {math.exp(mean_loss):.4f}")
-print(f"  Train Loss:  {final_tr_loss:.4f}   PPL: {math.exp(final_tr_loss):.4f}")
-print(f"  Gap fidelity: {gap_fid:+.4f}")
-print(f"  Tempo:        {total_train_time:.1f}s  ({actual_epochs} ep.)")
+print(f"  Training completato: {total_train_time:.1f}s  ({actual_epochs} ep.)")
+print(f"  Best test fidelity:  {best_test_fid:.4f} (epoca {best_test_epoch})")
+print(f"  Final train/test:    {final_tr_fid:.4f} / {final_te_fid:.4f}")
+print(f"  Gap fidelity:        {gap_fid:+.4f}")
+if rollout_curves is not None:
+    fid_rol_mean, _ = rollout_curves["fid"]
+    print(f"  Rollout samples:     {rollout_curves['n_samples']}")
+    print(f"  Rollout fidelity:    {float(fid_rol_mean.mean()):.4f} (media), {float(fid_rol_mean[-1]):.4f} (finale)")
+else:
+    print(f"  Rollout:             DISABILITATO")
 print("=" * 50)
