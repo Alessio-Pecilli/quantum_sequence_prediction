@@ -592,14 +592,15 @@ class AdvancedTrainer:
             f"loss={batch_loss.item():.4f} fid={batch_fid.item():.4f} "
             f"lr={lr_value:.3e} update={update_label} grad_norm={grad_label}"
         )
-        print(
-            f"    [{phase.upper()}][Ep {self._current_epoch:03d}] batch={batch_size} "
-            f"x_seq={seq_in} y_seq={seq_out} micro={micro_batches} "
-            f"fetch={fetch_time:.3f}s h2d={transfer_time:.3f}s model={model_time:.3f}s "
-            f"back={backward_time:.3f}s opt={optimizer_time:.3f}s cleanup={cleanup_time:.3f}s "
-            f"total={step_time:.3f}s thr={samples_per_sec:.1f} samp/s {tokens_per_sec:.1f} tok/s "
-            f"{self._memory_log()}"
-        )
+        if config.VERBOSE_STARTUP_LOGS:
+            print(
+                f"    [{phase.upper()}][Ep {self._current_epoch:03d}] batch={batch_size} "
+                f"x_seq={seq_in} y_seq={seq_out} micro={micro_batches} "
+                f"fetch={fetch_time:.3f}s h2d={transfer_time:.3f}s model={model_time:.3f}s "
+                f"back={backward_time:.3f}s opt={optimizer_time:.3f}s cleanup={cleanup_time:.3f}s "
+                f"total={step_time:.3f}s thr={samples_per_sec:.1f} samp/s {tokens_per_sec:.1f} tok/s "
+                f"{self._memory_log()}"
+            )
 
     def _periodic_memory_cleanup(self, step: int):
         """Cleanup periodico per evitare crescita della memoria durante loop lunghi."""

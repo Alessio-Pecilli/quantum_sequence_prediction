@@ -12,6 +12,7 @@ def precompute_observables(n_qubits: int, device: torch.device | str):
     Ritorna:
       z_eigs:       (n_qubits, 2^n) float32 con autovalori di Z_i
       zz_nn_eigs:   (n_qubits-1, 2^n) float32 con autovalori di Z_i Z_{i+1} (vicini, bordo aperto)
+      zz_all_eigs:  (n_qubits, n_qubits, 2^n) float32 con autovalori di Z_i Z_j per tutte le coppie
       x_flip_idx:   lista length n_qubits, ciascuno (2^n,) int64 con indici flippati per X_i
     """
     if n_qubits < 1:
@@ -34,13 +35,19 @@ def precompute_observables(n_qubits: int, device: torch.device | str):
     else:
         zz_nn_eigs = torch.empty((0, dim), device=device, dtype=torch.float32)
 
+    # All-pairs ZZ correlations: Z_i Z_j for all (i,j)
+    zz_all_eigs = torch.zeros((n_qubits, n_qubits, dim), device=device, dtype=torch.float32)
+    for i in range(n_qubits):
+        for j in range(n_qubits):
+            zz_all_eigs[i, j] = z_eigs[i] * z_eigs[j]  # (dim,)
+
     x_flip_idx = []
     for i in range(n_qubits):
         shift = int((n_qubits - 1) - i)
         flip_mask = 1 << shift
         x_flip_idx.append(indices ^ flip_mask)  # (dim,)
 
-    return z_eigs, zz_nn_eigs, x_flip_idx
+    return z_eigs, zz_nn_eigs, zz_all_eigs, x_flip_idx
 
 
 @torch.no_grad()
@@ -48,6 +55,7 @@ def batch_observables(
     states: torch.Tensor,
     z_eigs: torch.Tensor,
     zz_nn_eigs: torch.Tensor,
+    zz_all_eigs: torch.Tensor,
     x_flip_idx: list[torch.Tensor],
 ):
     """
@@ -55,11 +63,15 @@ def batch_observables(
       m^z  = (1/N) * sum_i <Z_i>
       m^x  = (1/N) * sum_i <X_i>
       c^z  = (1/(N-1)) * sum_i <Z_i Z_{i+1}>  (solo vicini, bordo aperto)
+      zz_corr_all = <Z_i Z_j> per tutte le coppie (i,j)
+      z_sites = <Z_i> per ogni sito singolo
 
     Args:
       states: (batch, dim) complesso, normalizzato
     Returns:
       mz, mx, cz: tensori float32 shape (batch,)
+      zz_corr_all: tensore float32 shape (batch, n_qubits, n_qubits) con <Z_i Z_j>
+      z_sites: tensore float32 shape (batch, n_qubits) con <Z_i>
     """
     if states.ndim != 2:
         raise ValueError(f"states deve avere shape (batch, dim), ricevuto: {tuple(states.shape)}")
@@ -75,12 +87,19 @@ def batch_observables(
 
     exp_z_sites = probs @ z_eigs.T  # (batch, n_qubits)
     mz = exp_z_sites.mean(dim=1)  # (batch,)
+    z_sites = exp_z_sites  # (batch, n_qubits) - magnetizzazioni per sito
 
     if n_qubits >= 2:
         exp_zz_pairs = probs @ zz_nn_eigs.T  # (batch, n_qubits-1)
         cz = exp_zz_pairs.mean(dim=1)  # (batch,)
     else:
         cz = torch.zeros((batch,), device=states.device, dtype=torch.float32)
+
+    # Correlazioni ZZ per tutte le coppie (i,j)
+    zz_corr_all = torch.zeros((batch, n_qubits, n_qubits), device=states.device, dtype=torch.float32)
+    for i in range(n_qubits):
+        for j in range(n_qubits):
+            zz_corr_all[:, i, j] = torch.sum(probs * zz_all_eigs[i, j], dim=1)  # (batch,)
 
     # --- X: flip del bit i-esimo (non diagonale)
     psi_conj = states.conj()
@@ -91,5 +110,5 @@ def batch_observables(
         mx_sum += exp_x_i.real.to(torch.float32)
     mx = mx_sum / max(1, n_qubits)
 
-    return mz, mx, cz
+    return mz, mx, cz, zz_corr_all, z_sites
 

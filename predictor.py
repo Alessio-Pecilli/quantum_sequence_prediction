@@ -169,6 +169,10 @@ class QuantumStatePredictor(nn.Module):
         # D. Split: parte reale e immaginaria
         real_raw, imag_raw = torch.chunk(out_raw, chunks=2, dim=-1)
 
+        # Residual Prediction: predici il delta anziché lo stato da zero
+        real_raw = real_raw + x_complex.real
+        imag_raw = imag_raw + x_complex.imag
+
         # --- STATO COMPLESSO + VINCOLO FISICO ---
         # Pack + normalizzazione fuori dal grafo compilato (evita lowering complessi).
         return _normalize_and_pack_complex(real_raw, imag_raw)

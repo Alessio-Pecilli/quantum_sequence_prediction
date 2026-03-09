@@ -303,7 +303,7 @@ if config.OBSERVABLE_PLOTS_ENABLED:
     t2 = int(config.T2)
     device = torch.device(config.DEVICE)
 
-    z_eigs, zz_nn_eigs, x_flip_idx = precompute_observables(config.N_QUBITS, device=device)
+    z_eigs, zz_nn_eigs, zz_all_eigs, x_flip_idx = precompute_observables(config.N_QUBITS, device=device)
 
     max_samples = int(config.OBSERVABLE_PLOT_SAMPLES)
     if max_samples > 0:
@@ -368,8 +368,8 @@ if config.OBSERVABLE_PLOTS_ENABLED:
                     fid_sum[k] += fid.sum()
                     fid_sumsq[k] += fid.pow(2).sum()
 
-                    mz_p, mx_p, cz_p = batch_observables(next_pred, z_eigs, zz_nn_eigs, x_flip_idx)
-                    mz_t, mx_t, cz_t = batch_observables(next_true, z_eigs, zz_nn_eigs, x_flip_idx)
+                    mz_p, mx_p, cz_p, zz_corr_all_p, z_sites_p = batch_observables(next_pred, z_eigs, zz_nn_eigs, zz_all_eigs, x_flip_idx)
+                    mz_t, mx_t, cz_t, zz_corr_all_t, z_sites_t = batch_observables(next_true, z_eigs, zz_nn_eigs, zz_all_eigs, x_flip_idx)
 
                     mz_pred_sum[k] += mz_p.double().sum()
                     mz_pred_sumsq[k] += mz_p.double().pow(2).sum()
