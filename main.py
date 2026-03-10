@@ -49,6 +49,65 @@ def _fmt_metric(value) -> str:
     return f"{value:.4f}" if isinstance(value, (float, int)) else str(value)
 
 
+def _parse_int_csv(raw: str) -> list[int]:
+    values: list[int] = []
+    for token in raw.replace(";", ",").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        values.append(int(token))
+    return values
+
+
+def _build_rollout_eval_pairs(default_t1: int, default_t2: int, seq_len: int) -> list[tuple[int, int]]:
+    pairs: list[tuple[int, int]] = [(int(default_t1), int(default_t2))]
+
+    raw_t1_sweep = os.getenv("QSP_ROLLOUT_T1_SWEEP", "").strip()
+    if not raw_t1_sweep:
+        return pairs
+
+    try:
+        t1_candidates = _parse_int_csv(raw_t1_sweep)
+    except ValueError:
+        print(f"  [WARN] QSP_ROLLOUT_T1_SWEEP non valido ({raw_t1_sweep!r}). Ignoro lo sweep.")
+        return pairs
+
+    if not t1_candidates:
+        return pairs
+
+    raw_fixed_t2 = os.getenv("QSP_ROLLOUT_SWEEP_T2", "").strip()
+    fixed_t2 = None
+    if raw_fixed_t2:
+        try:
+            fixed_t2 = int(raw_fixed_t2)
+        except ValueError:
+            print(f"  [WARN] QSP_ROLLOUT_SWEEP_T2 non valido ({raw_fixed_t2!r}). Uso T2 dinamico.")
+            fixed_t2 = None
+
+    fixed_end = int(default_t1) + int(default_t2)
+    max_total_states = int(seq_len) + 1
+
+    for t1_candidate in t1_candidates:
+        t2_candidate = fixed_t2 if fixed_t2 is not None else (fixed_end - int(t1_candidate))
+        if t1_candidate < 1 or t2_candidate < 1:
+            print(f"  [WARN] Scenario T1={t1_candidate}, T2={t2_candidate} non valido (richiesto >= 1).")
+            continue
+        if t1_candidate + t2_candidate > max_total_states:
+            print(
+                f"  [WARN] Scenario T1={t1_candidate}, T2={t2_candidate} fuori limite: "
+                f"T1+T2={t1_candidate + t2_candidate} > {max_total_states}. Ignoro."
+            )
+            continue
+        pair = (int(t1_candidate), int(t2_candidate))
+        if pair not in pairs:
+            pairs.append(pair)
+
+    if len(pairs) > 1:
+        pairs_str = ", ".join(f"(T1={t1},T2={t2})" for t1, t2 in pairs)
+        print(f"  Rollout sweep abilitato: {pairs_str}")
+    return pairs
+
+
 def _print_temporal_learning_map(dataset):
     print("  Semantica temporale del training:")
     print(
@@ -304,40 +363,45 @@ model.eval()
 non_blocking = pin_memory
 
 # ============================================================
-#  4. ROLLOUT AUTOREGRESSIVO (FIDELITY + OSSERVABILI) SU TEST
+#  4. ROLLOUT AUTOREGRESSIVO + TEACHER FORCING (FIDELITY + OSSERVABILI) SU TEST
 # ============================================================
 rollout_curves = None
+rollout_sweep_curves = []
 if config.OBSERVABLE_PLOTS_ENABLED:
-    print(f"\n[4/5] Rollout autoregressivo: fidelity + osservabili (Test Set)...")
+    print(
+        "\n[4/5] Rollout Test Set: confronto fidelity autoregressiva vs teacher-forced "
+        "(gold context) + osservabili..."
+    )
 
-    t1 = int(config.T1)
-    t2 = int(config.T2)
     device = torch.device(config.DEVICE)
-
     max_samples = int(config.OBSERVABLE_PLOT_SAMPLES)
     if max_samples > 0:
         print(f"  Max traiettorie per split: {max_samples}")
     else:
-        print(f"  Max traiettorie per split: ALL (puo' essere lento)")
+        print("  Max traiettorie per split: ALL (puo' essere lento)")
 
-    def _rollout_curves(data_loader, split_name: str):
-        fid_sum = torch.zeros(t2, device=device, dtype=torch.float64)
-        fid_sumsq = torch.zeros(t2, device=device, dtype=torch.float64)
+    rollout_pairs = _build_rollout_eval_pairs(config.T1, config.T2, config.SEQ_LEN)
 
-        mz_pred_sum = torch.zeros(t2, device=device, dtype=torch.float64)
-        mz_pred_sumsq = torch.zeros(t2, device=device, dtype=torch.float64)
-        mz_true_sum = torch.zeros(t2, device=device, dtype=torch.float64)
-        mz_true_sumsq = torch.zeros(t2, device=device, dtype=torch.float64)
+    def _rollout_curves(data_loader, split_name: str, t1_eval: int, t2_eval: int):
+        fid_roll_sum = torch.zeros(t2_eval, device=device, dtype=torch.float64)
+        fid_roll_sumsq = torch.zeros(t2_eval, device=device, dtype=torch.float64)
+        fid_teacher_sum = torch.zeros(t2_eval, device=device, dtype=torch.float64)
+        fid_teacher_sumsq = torch.zeros(t2_eval, device=device, dtype=torch.float64)
 
-        mx_pred_sum = torch.zeros(t2, device=device, dtype=torch.float64)
-        mx_pred_sumsq = torch.zeros(t2, device=device, dtype=torch.float64)
-        mx_true_sum = torch.zeros(t2, device=device, dtype=torch.float64)
-        mx_true_sumsq = torch.zeros(t2, device=device, dtype=torch.float64)
+        mz_pred_sum = torch.zeros(t2_eval, device=device, dtype=torch.float64)
+        mz_pred_sumsq = torch.zeros(t2_eval, device=device, dtype=torch.float64)
+        mz_true_sum = torch.zeros(t2_eval, device=device, dtype=torch.float64)
+        mz_true_sumsq = torch.zeros(t2_eval, device=device, dtype=torch.float64)
 
-        cz_pred_sum = torch.zeros(t2, device=device, dtype=torch.float64)
-        cz_pred_sumsq = torch.zeros(t2, device=device, dtype=torch.float64)
-        cz_true_sum = torch.zeros(t2, device=device, dtype=torch.float64)
-        cz_true_sumsq = torch.zeros(t2, device=device, dtype=torch.float64)
+        mx_pred_sum = torch.zeros(t2_eval, device=device, dtype=torch.float64)
+        mx_pred_sumsq = torch.zeros(t2_eval, device=device, dtype=torch.float64)
+        mx_true_sum = torch.zeros(t2_eval, device=device, dtype=torch.float64)
+        mx_true_sumsq = torch.zeros(t2_eval, device=device, dtype=torch.float64)
+
+        cz_pred_sum = torch.zeros(t2_eval, device=device, dtype=torch.float64)
+        cz_pred_sumsq = torch.zeros(t2_eval, device=device, dtype=torch.float64)
+        cz_true_sum = torch.zeros(t2_eval, device=device, dtype=torch.float64)
+        cz_true_sumsq = torch.zeros(t2_eval, device=device, dtype=torch.float64)
 
         count = 0
 
@@ -359,26 +423,40 @@ if config.OBSERVABLE_PLOTS_ENABLED:
 
                 x_batch = x_batch_cpu.to(config.DEVICE, non_blocking=non_blocking)
                 # target[t] corrisponde allo stato a tempo (t+1); vogliamo tempi T1..T1+T2-1
-                y_future = y_batch_cpu[:, t1 - 1 : t1 - 1 + t2, :].to(
+                y_future = y_batch_cpu[:, t1_eval - 1 : t1_eval - 1 + t2_eval, :].to(
                     config.DEVICE, non_blocking=non_blocking
                 )
 
-                # Finestra iniziale (ground-truth): stati a tempi 0..T1-1
-                window = x_batch[:, :t1, :].clone()
-                window_buf = torch.empty_like(window)
+                # Rollout autoregressivo: finestra iniziale reale 0..T1-1.
+                window_roll = x_batch[:, :t1_eval, :].clone()
+                window_buf = torch.empty_like(window_roll)
 
-                for k in range(t2):
-                    pred_seq = model(window)  # (batch, T1, dim), pred_seq[:, t] ~ state(t+1)
-                    next_pred = pred_seq[:, -1, :]  # (batch, dim)
-                    next_true = y_future[:, k, :]  # (batch, dim)
+                for k in range(t2_eval):
+                    # 1) Rollout autoregressivo (usa predizioni precedenti come contesto)
+                    pred_seq_roll = model(window_roll)
+                    next_pred_roll = pred_seq_roll[:, -1, :]
+                    next_true = y_future[:, k, :]
 
-                    overlap = torch.sum(next_true.conj() * next_pred, dim=-1)  # (batch,)
-                    fid = (torch.abs(overlap) ** 2).double()  # (batch,)
-                    fid_sum[k] += fid.sum()
-                    fid_sumsq[k] += fid.pow(2).sum()
+                    overlap_roll = torch.sum(next_true.conj() * next_pred_roll, dim=-1)
+                    fid_roll = (torch.abs(overlap_roll) ** 2).double()
+                    fid_roll_sum[k] += fid_roll.sum()
+                    fid_roll_sumsq[k] += fid_roll.pow(2).sum()
 
-                    mz_p, mx_p, cz_p, zz_corr_all_p, z_sites_p = batch_observables(next_pred, z_eigs, zz_nn_eigs, zz_all_eigs, x_flip_idx)
-                    mz_t, mx_t, cz_t, zz_corr_all_t, z_sites_t = batch_observables(next_true, z_eigs, zz_nn_eigs, zz_all_eigs, x_flip_idx)
+                    # 2) Teacher forcing locale (usa contesto reale per lo stesso step k)
+                    window_teacher = x_batch[:, k : k + t1_eval, :]
+                    pred_seq_teacher = model(window_teacher)
+                    next_pred_teacher = pred_seq_teacher[:, -1, :]
+                    overlap_teacher = torch.sum(next_true.conj() * next_pred_teacher, dim=-1)
+                    fid_teacher = (torch.abs(overlap_teacher) ** 2).double()
+                    fid_teacher_sum[k] += fid_teacher.sum()
+                    fid_teacher_sumsq[k] += fid_teacher.pow(2).sum()
+
+                    mz_p, mx_p, cz_p, _, _ = batch_observables(
+                        next_pred_roll, z_eigs, zz_nn_eigs, zz_all_eigs, x_flip_idx
+                    )
+                    mz_t, mx_t, cz_t, _, _ = batch_observables(
+                        next_true, z_eigs, zz_nn_eigs, zz_all_eigs, x_flip_idx
+                    )
 
                     mz_pred_sum[k] += mz_p.double().sum()
                     mz_pred_sumsq[k] += mz_p.double().pow(2).sum()
@@ -395,15 +473,32 @@ if config.OBSERVABLE_PLOTS_ENABLED:
                     cz_true_sum[k] += cz_t.double().sum()
                     cz_true_sumsq[k] += cz_t.double().pow(2).sum()
 
-                    # Shift a finestra fissa (T1): drop del primo, append del predetto
-                    if t1 > 1:
-                        window_buf[:, :-1, :] = window[:, 1:, :]
-                    window_buf[:, -1, :] = next_pred
-                    window, window_buf = window_buf, window
+                    # Shift della finestra rollout (T1 fisso): drop primo, append predetto.
+                    if t1_eval > 1:
+                        window_buf[:, :-1, :] = window_roll[:, 1:, :]
+                    window_buf[:, -1, :] = next_pred_roll
+                    window_roll, window_buf = window_buf, window_roll
 
-                    del pred_seq, next_pred, next_true, overlap, fid, mz_p, mx_p, cz_p, mz_t, mx_t, cz_t
+                    del (
+                        pred_seq_roll,
+                        next_pred_roll,
+                        overlap_roll,
+                        fid_roll,
+                        window_teacher,
+                        pred_seq_teacher,
+                        next_pred_teacher,
+                        overlap_teacher,
+                        fid_teacher,
+                        next_true,
+                        mz_p,
+                        mx_p,
+                        cz_p,
+                        mz_t,
+                        mx_t,
+                        cz_t,
+                    )
 
-                del x_batch_cpu, y_batch_cpu, x_batch, y_future, window, window_buf
+                del x_batch_cpu, y_batch_cpu, x_batch, y_future, window_roll, window_buf
                 if config.GC_COLLECT_EVERY_N_STEPS > 0 and step % config.GC_COLLECT_EVERY_N_STEPS == 0:
                     gc.collect()
 
@@ -415,8 +510,13 @@ if config.OBSERVABLE_PLOTS_ENABLED:
             std_ = torch.sqrt(torch.clamp(var_, min=0.0))
             return mean_.cpu().float().numpy(), std_.cpu().float().numpy()
 
+        fid_roll_curve = _mean_std(fid_roll_sum, fid_roll_sumsq)
+        fid_teacher_curve = _mean_std(fid_teacher_sum, fid_teacher_sumsq)
+
         curves = {
-            "fid": _mean_std(fid_sum, fid_sumsq),
+            "fid": fid_roll_curve,  # backward compatibility
+            "fid_roll": fid_roll_curve,
+            "fid_teacher": fid_teacher_curve,
             "mz_pred": _mean_std(mz_pred_sum, mz_pred_sumsq),
             "mz_true": _mean_std(mz_true_sum, mz_true_sumsq),
             "mx_pred": _mean_std(mx_pred_sum, mx_pred_sumsq),
@@ -424,20 +524,36 @@ if config.OBSERVABLE_PLOTS_ENABLED:
             "cz_pred": _mean_std(cz_pred_sum, cz_pred_sumsq),
             "cz_true": _mean_std(cz_true_sum, cz_true_sumsq),
             "n_samples": count,
+            "t1": int(t1_eval),
+            "t2": int(t2_eval),
         }
 
-        fid_mean = curves["fid"][0]
-        if fid_mean.size > 0:
+        fid_roll_mean = curves["fid_roll"][0]
+        fid_teacher_mean = curves["fid_teacher"][0]
+        if fid_roll_mean.size > 0 and fid_teacher_mean.size > 0:
             print(
-                f"  [ROLL] {split_name:5s} n={count:4d}  "
-                f"F_mean={float(fid_mean.mean()):.4f}  F_last={float(fid_mean[-1]):.4f}"
+                f"  [ROLL] {split_name:5s} T1={t1_eval:2d} T2={t2_eval:2d} n={count:4d}  "
+                f"F_roll(mean/last)={float(fid_roll_mean.mean()):.4f}/{float(fid_roll_mean[-1]):.4f}  "
+                f"F_teacher(mean/last)={float(fid_teacher_mean.mean()):.4f}/{float(fid_teacher_mean[-1]):.4f}"
             )
         else:
-            print(f"  [ROLL] {split_name:5s} n={count:4d}  (no data)")
+            print(f"  [ROLL] {split_name:5s} T1={t1_eval:2d} T2={t2_eval:2d} n={count:4d}  (no data)")
 
         return curves
 
-    rollout_curves = _rollout_curves(test_eval_loader, "Test")
+    all_rollout_curves = []
+    for idx_pair, (t1_eval, t2_eval) in enumerate(rollout_pairs, start=1):
+        if len(rollout_pairs) > 1:
+            print(f"  [SWEEP] Scenario {idx_pair}/{len(rollout_pairs)}: T1={t1_eval}, T2={t2_eval}")
+        scenario_curves = _rollout_curves(test_eval_loader, "Test", t1_eval, t2_eval)
+        all_rollout_curves.append(scenario_curves)
+
+        if t1_eval == int(config.T1) and t2_eval == int(config.T2):
+            rollout_curves = scenario_curves
+
+    if rollout_curves is None and all_rollout_curves:
+        rollout_curves = all_rollout_curves[0]
+    rollout_sweep_curves = all_rollout_curves
 
 
 # ============================================================
@@ -498,15 +614,49 @@ ax.grid(True, alpha=0.3)
 # --- Fig 5: Rollout performance ---
 ax = axes[1, 1]
 if rollout_curves is not None:
-    fid_rol_mean, fid_rol_std = rollout_curves["fid"]
-    t_axis_short = np.arange(len(fid_rol_mean)) + config.T1
-    ax.plot(t_axis_short, fid_rol_mean, 'o-', color="purple", linewidth=2, markersize=4)
-    ax.fill_between(t_axis_short, fid_rol_mean - fid_rol_std, fid_rol_mean + fid_rol_std, 
-                   color="purple", alpha=0.2)
+    fid_rol_mean, fid_rol_std = rollout_curves["fid_roll"]
+    fid_tf_mean, fid_tf_std = rollout_curves["fid_teacher"]
+    t_axis_short = np.arange(len(fid_rol_mean)) + int(rollout_curves["t1"])
+    ax.plot(
+        t_axis_short,
+        fid_rol_mean,
+        "o-",
+        color="purple",
+        linewidth=2,
+        markersize=4,
+        label="Rollout autoregressivo",
+    )
+    ax.fill_between(
+        t_axis_short,
+        fid_rol_mean - fid_rol_std,
+        fid_rol_mean + fid_rol_std,
+        color="purple",
+        alpha=0.2,
+    )
+    ax.plot(
+        t_axis_short,
+        fid_tf_mean,
+        "o--",
+        color="tab:red",
+        linewidth=2,
+        markersize=4,
+        label="Teacher forcing (gold context)",
+    )
+    ax.fill_between(
+        t_axis_short,
+        fid_tf_mean - fid_tf_std,
+        fid_tf_mean + fid_tf_std,
+        color="tab:red",
+        alpha=0.15,
+    )
     ax.set_xlabel("Step temporale rollout")
     ax.set_ylabel("Fidelity")
-    ax.set_title(f"Rollout Fidelity (T1={config.T1}→T2={config.T2})")
     ax.set_ylim(0, 1)
+    ax.set_title(
+        f"Rollout vs Teacher Fidelity "
+        f"(T1={int(rollout_curves['t1'])}->T2={int(rollout_curves['t2'])})"
+    )
+    ax.legend()
 else:
     ax.text(0.5, 0.5, "Rollout disabilitato", ha="center", va="center", transform=ax.transAxes)
     ax.set_title("Rollout Fidelity")
@@ -534,31 +684,64 @@ print(f"  [PLOT] {training_report_path}")
 if rollout_curves is not None:
     fig, axes = plt.subplots(4, 1, figsize=(12, 13), sharex=True)
     fig.suptitle(
-        f"ROLLOUT AUTOREGRESSIVO (Test Set)  -  n={rollout_curves['n_samples']}  (T1={config.T1}, T2={config.T2})",
+        "ROLLOUT AUTOREGRESSIVO vs TEACHER FORCING (Test Set)  "
+        f"-  n={rollout_curves['n_samples']}  "
+        f"(T1={int(rollout_curves['t1'])}, T2={int(rollout_curves['t2'])})",
         fontsize=14,
         fontweight="bold",
     )
 
-    t_axis = (np.arange(config.T2, dtype=np.float32) + config.T1) * float(config.DT)
+    t_axis = (
+        np.arange(int(rollout_curves["t2"]), dtype=np.float32) + int(rollout_curves["t1"])
+    ) * float(config.DT)
 
     # Fidelity
     ax = axes[0]
-    fid_mean, fid_std = rollout_curves["fid"]
-    ax.plot(t_axis, fid_mean, label="Fidelity rollout", color="tab:purple", linewidth=3)
-    ax.fill_between(t_axis, fid_mean - fid_std, fid_mean + fid_std, color="tab:purple", alpha=0.25)
+    fid_roll_mean, fid_roll_std = rollout_curves["fid_roll"]
+    fid_teacher_mean, fid_teacher_std = rollout_curves["fid_teacher"]
+    ax.plot(t_axis, fid_roll_mean, label="Rollout autoregressivo", color="tab:purple", linewidth=3)
+    ax.fill_between(
+        t_axis,
+        fid_roll_mean - fid_roll_std,
+        fid_roll_mean + fid_roll_std,
+        color="tab:purple",
+        alpha=0.25,
+    )
+    ax.plot(
+        t_axis,
+        fid_teacher_mean,
+        label="Teacher forcing (gold context)",
+        color="tab:red",
+        linewidth=2.5,
+        linestyle="--",
+    )
+    ax.fill_between(
+        t_axis,
+        fid_teacher_mean - fid_teacher_std,
+        fid_teacher_mean + fid_teacher_std,
+        color="tab:red",
+        alpha=0.15,
+    )
     ax.set_ylabel("Fidelity")
     ax.set_ylim(0.0, 1.0)
-    ax.set_title(r"ROLLOUT FIDELITY: $F(t)=|\langle \psi_{\mathrm{true}}(t) | \psi_{\mathrm{pred}}(t)\rangle|^2$")
+    ax.set_title(
+        r"FIDELITY: rollout autoregressivo vs teacher forcing "
+        r"$F(t)=|\langle \psi_{\mathrm{true}}(t) | \psi_{\mathrm{pred}}(t)\rangle|^2$"
+    )
     ax.grid(True, alpha=0.3)
     ax.legend()
-    
-    # Aggiungi statistics box
-    f_mean_overall = float(fid_mean.mean())
-    f_final = float(fid_mean[-1])
-    textstr = f'Media: {f_mean_overall:.3f}\nFinale: {f_final:.3f}'
-    props = dict(boxstyle='round', facecolor='wheat', alpha=0.8)
-    ax.text(0.02, 0.98, textstr, transform=ax.transAxes, fontsize=9,
-            verticalalignment='top', bbox=props)
+
+    f_roll_mean_overall = float(fid_roll_mean.mean())
+    f_roll_final = float(fid_roll_mean[-1])
+    f_teacher_mean_overall = float(fid_teacher_mean.mean())
+    f_teacher_final = float(fid_teacher_mean[-1])
+    textstr = (
+        f"Rollout media/finale: {f_roll_mean_overall:.3f} / {f_roll_final:.3f}\n"
+        f"Teacher media/finale: {f_teacher_mean_overall:.3f} / {f_teacher_final:.3f}\n"
+        f"Delta finale (teacher-rollout): {(f_teacher_final - f_roll_final):+.3f}"
+    )
+    props = dict(boxstyle="round", facecolor="wheat", alpha=0.8)
+    ax.text(0.02, 0.98, textstr, transform=ax.transAxes, fontsize=9, verticalalignment="top", bbox=props)
 
     # m^z
     ax = axes[1]
@@ -623,7 +806,53 @@ if rollout_curves is not None:
     generated_plots.append(rollout_report_path)
     print(f"  [PLOT] ROLLOUT PRINCIPALE: {rollout_report_path}")
 else:
-    print(f"  [SKIP] Rollout disabilitato (OBSERVABLE_PLOTS_ENABLED=False)")
+    print("  [SKIP] Rollout disabilitato (OBSERVABLE_PLOTS_ENABLED=False)")
+
+# --- Fig ROLLOUT SWEEP: confronto T1/T2 ---
+if rollout_sweep_curves and len(rollout_sweep_curves) > 1:
+    fig, ax = plt.subplots(1, 1, figsize=(12, 6))
+    fig.suptitle(
+        "Confronto Fidelity rollout vs teacher-forced su diversi T1/T2 (Test Set)",
+        fontsize=13,
+        fontweight="bold",
+    )
+
+    cmap = plt.get_cmap("tab10")
+    for idx_curve, curve in enumerate(rollout_sweep_curves):
+        color = cmap(idx_curve % 10)
+        t1_curve = int(curve["t1"])
+        t2_curve = int(curve["t2"])
+        t_axis_curve = (np.arange(t2_curve, dtype=np.float32) + t1_curve) * float(config.DT)
+        fid_roll_mean, _ = curve["fid_roll"]
+        fid_teacher_mean, _ = curve["fid_teacher"]
+        label_base = f"T1={t1_curve}, T2={t2_curve}"
+        ax.plot(
+            t_axis_curve,
+            fid_roll_mean,
+            color=color,
+            linewidth=2.0,
+            label=f"{label_base} rollout",
+        )
+        ax.plot(
+            t_axis_curve,
+            fid_teacher_mean,
+            color=color,
+            linewidth=2.0,
+            linestyle="--",
+            label=f"{label_base} teacher",
+        )
+
+    ax.set_xlabel("Tempo (t)")
+    ax.set_ylabel("Fidelity")
+    ax.set_ylim(0.0, 1.0)
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8, ncol=2)
+    plt.tight_layout()
+    rollout_sweep_path = os.path.join(RESULTS_DIR, f"rollout_t1_sweep_{run_file_stamp}.png")
+    plt.savefig(rollout_sweep_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    generated_plots.append(rollout_sweep_path)
+    print(f"  [PLOT] ROLLOUT SWEEP: {rollout_sweep_path}")
 
 # --- Fig 7: LR vs Loss (fase space) ---
 fig, axes = plt.subplots(1, 2, figsize=(12, 5))
@@ -672,6 +901,33 @@ run_ended_dt = _now_local()
 run_ended_str = _fmt_dt(run_ended_dt)
 run_started_iso = run_started_dt.isoformat(timespec="seconds")
 run_ended_iso = run_ended_dt.isoformat(timespec="seconds")
+
+
+rollout_scenarios = (
+    rollout_sweep_curves
+    if rollout_sweep_curves
+    else ([] if rollout_curves is None else [rollout_curves])
+)
+
+
+def _rollout_scenario_summary(curve: dict) -> dict:
+    fid_roll = curve["fid_roll"][0]
+    fid_teacher = curve["fid_teacher"][0]
+    return {
+        "t1": int(curve["t1"]),
+        "t2": int(curve["t2"]),
+        "n_samples": int(curve["n_samples"]),
+        "fidelity_rollout_mean_over_horizon": float(fid_roll.mean()),
+        "fidelity_teacher_mean_over_horizon": float(fid_teacher.mean()),
+        "fidelity_rollout_first_step": float(fid_roll[0]),
+        "fidelity_teacher_first_step": float(fid_teacher[0]),
+        "fidelity_rollout_last_step": float(fid_roll[-1]),
+        "fidelity_teacher_last_step": float(fid_teacher[-1]),
+        "teacher_minus_rollout_last_step": float(fid_teacher[-1] - fid_roll[-1]),
+    }
+
+
+rollout_scenarios_summary = [_rollout_scenario_summary(curve) for curve in rollout_scenarios]
 
 summary = {
     "results_dir": RESULTS_DIR,
@@ -734,17 +990,33 @@ summary = {
         "metrics_timestamp": run_ended_iso,
         "enabled": bool(config.OBSERVABLE_PLOTS_ENABLED),
         "n_samples": int(rollout_curves["n_samples"]) if rollout_curves is not None else 0,
-        "context_len_T1": int(config.T1),
-        "horizon_len_T2": int(config.T2),
-        "fidelity_mean_over_horizon": float(rollout_curves["fid"][0].mean())
+        "context_len_T1": int(rollout_curves["t1"]) if rollout_curves is not None else int(config.T1),
+        "horizon_len_T2": int(rollout_curves["t2"]) if rollout_curves is not None else int(config.T2),
+        "fidelity_rollout_mean_over_horizon": float(rollout_curves["fid_roll"][0].mean())
         if rollout_curves is not None
         else None,
-        "fidelity_first_step": float(rollout_curves["fid"][0][0])
+        "fidelity_teacher_mean_over_horizon": float(rollout_curves["fid_teacher"][0].mean())
         if rollout_curves is not None
         else None,
-        "fidelity_last_step": float(rollout_curves["fid"][0][-1])
+        "fidelity_rollout_first_step": float(rollout_curves["fid_roll"][0][0])
         if rollout_curves is not None
         else None,
+        "fidelity_teacher_first_step": float(rollout_curves["fid_teacher"][0][0])
+        if rollout_curves is not None
+        else None,
+        "fidelity_rollout_last_step": float(rollout_curves["fid_roll"][0][-1])
+        if rollout_curves is not None
+        else None,
+        "fidelity_teacher_last_step": float(rollout_curves["fid_teacher"][0][-1])
+        if rollout_curves is not None
+        else None,
+        "teacher_minus_rollout_last_step": float(
+            rollout_curves["fid_teacher"][0][-1] - rollout_curves["fid_roll"][0][-1]
+        )
+        if rollout_curves is not None
+        else None,
+        "sweep_enabled": len(rollout_scenarios_summary) > 1,
+        "scenarios": rollout_scenarios_summary,
         "observables_samples_cfg": int(config.OBSERVABLE_PLOT_SAMPLES),
     },
 }
@@ -809,12 +1081,30 @@ print(
 )
 print(f"  Gap fidelity:         [{run_ended_str}] {gap_str}")
 if rollout_curves is not None:
-    fid_rol_mean, _ = rollout_curves["fid"]
+    fid_rol_mean, _ = rollout_curves["fid_roll"]
+    fid_teacher_mean, _ = rollout_curves["fid_teacher"]
     print(f"  Rollout samples:      [{run_ended_str}] {rollout_curves['n_samples']}")
     print(
         f"  Rollout fidelity:     [{run_ended_str}] "
         f"{float(fid_rol_mean.mean()):.4f} (media), {float(fid_rol_mean[-1]):.4f} (finale)"
     )
+    print(
+        f"  Teacher fidelity:     [{run_ended_str}] "
+        f"{float(fid_teacher_mean.mean()):.4f} (media), {float(fid_teacher_mean[-1]):.4f} (finale)"
+    )
+    print(
+        f"  Delta finale (T-R):   [{run_ended_str}] "
+        f"{float(fid_teacher_mean[-1] - fid_rol_mean[-1]):+.4f}"
+    )
+    if rollout_scenarios_summary and len(rollout_scenarios_summary) > 1:
+        print(f"  Sweep T1/T2:          [{run_ended_str}] {len(rollout_scenarios_summary)} scenari")
+        for scenario in rollout_scenarios_summary:
+            print(
+                f"    - T1={scenario['t1']:2d}, T2={scenario['t2']:2d}: "
+                f"roll_last={scenario['fidelity_rollout_last_step']:.4f}, "
+                f"teacher_last={scenario['fidelity_teacher_last_step']:.4f}"
+            )
 else:
     print(f"  Rollout:              [{run_ended_str}] DISABILITATO")
 print("=" * 50)
+
