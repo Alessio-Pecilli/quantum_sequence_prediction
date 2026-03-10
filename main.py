@@ -4,6 +4,7 @@ import os
 import gc
 import json
 import sys
+from datetime import datetime
 
 import torch
 import numpy as np
@@ -27,6 +28,25 @@ generated_plots = []
 
 def _format_time_index(t_idx: int) -> str:
     return f"t={t_idx} ({t_idx * config.DT:.3f})"
+
+
+def _now_local() -> datetime:
+    return datetime.now().astimezone()
+
+
+def _fmt_dt(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def _fmt_metric(value) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        if isinstance(value, float) and math.isnan(value):
+            return "n/a"
+    except Exception:
+        pass
+    return f"{value:.4f}" if isinstance(value, (float, int)) else str(value)
 
 
 def _print_temporal_learning_map(dataset):
@@ -88,6 +108,9 @@ print(f"  Resume:          {'ON' if config.RESUME_TRAINING else 'OFF'}")
 print(f"  Device:          {config.DEVICE}")
 micro_bs_print = config.MICRO_BATCH_SIZE if config.MICRO_BATCH_SIZE > 0 else config.BATCH_SIZE
 print(f"  Memory safe:     {'ON' if config.MEMORY_SAFE_MODE else 'OFF'} (micro-batch={micro_bs_print})")
+run_started_dt = _now_local()
+run_file_stamp = run_started_dt.strftime("%Y%m%d_%H%M%S")
+print(f"  Run start:       {_fmt_dt(run_started_dt)}")
 print(
     f"  Logging:         dataset/H={config.DATASET_LOG_EVERY_N_HAMILTONIANS}, "
     f"train-step={config.TRAIN_LOG_EVERY_N_STEPS}, eval-step={config.EVAL_LOG_EVERY_N_STEPS}"
@@ -239,18 +262,42 @@ print(f"\n[3/6] Training avanzato (max {config.EPOCHS} epoche)...\n")
 
 history = trainer.train(epochs=config.EPOCHS, verbose=True)
 total_train_time = trainer.total_train_time
+training_stop_reason = history.get("stop_reason", getattr(trainer, "stop_reason", "completed"))
+training_stop_exception = history.get("stop_exception", getattr(trainer, "stop_exception", None))
 
-trainer.print_training_summary()
+try:
+    trainer.print_training_summary()
+except Exception as summary_err:
+    print(f"  [WARN] Summary training non disponibile: {summary_err}. Proseguo con grafici e risultati.")
 
 
 # Dati per grafici dal training
-actual_epochs = len(history["train_loss"])
-final_tr_loss = history["train_loss"][-1]
-final_te_loss = history["test_loss"][-1]
-final_tr_fid = history["train_fidelity"][-1]
-final_te_fid = history["test_fidelity"][-1]
-best_test_fid = max(history["test_fidelity"])
-best_test_epoch = history["test_fidelity"].index(best_test_fid) + 1
+actual_epochs = len(history.get("train_loss", []))
+if actual_epochs > 0:
+    final_tr_loss = history["train_loss"][-1]
+    final_te_loss = history["test_loss"][-1]
+    final_tr_fid = history["train_fidelity"][-1]
+    final_te_fid = history["test_fidelity"][-1]
+    best_test_fid = max(history["test_fidelity"])
+    best_test_epoch = history["test_fidelity"].index(best_test_fid) + 1
+else:
+    final_tr_loss = None
+    final_tr_fid = None
+    best_test_epoch = 0
+    try:
+        final_te_loss, final_te_fid = trainer._evaluate(use_ema=config.EMA_ENABLED)
+        best_test_fid = final_te_fid
+        print(
+            f"  [RECOVERY] Nessuna epoca completa: metriche test calcolate comunque "
+            f"(loss={final_te_loss:.4f}, fidelity={final_te_fid:.4f})."
+        )
+    except Exception as eval_err:
+        final_te_loss = None
+        final_te_fid = None
+        best_test_fid = None
+        if training_stop_exception is None:
+            training_stop_exception = f"post_eval_error: {type(eval_err).__name__}: {eval_err}"
+        print(f"  [WARN] Impossibile calcolare metriche test post-interruzione: {eval_err}")
 
 model = trainer.model
 model.eval()
@@ -399,15 +446,16 @@ if config.OBSERVABLE_PLOTS_ENABLED:
 print(f"\n[5/5] Generando grafici...")
 
 epochs_range = range(1, actual_epochs + 1)
+training_history_available = actual_epochs > 0
 
 # --- Fig 1: Loss (train + test) ---
 fig, axes = plt.subplots(2, 3, figsize=(20, 10))
 fig.suptitle("Quantum Sequence Prediction — Training Report (Advanced)", fontsize=14, fontweight="bold")
 
 ax = axes[0, 0]
-ax.plot(epochs_range, history["train_loss"], label="Train Loss", linewidth=2)
-ax.plot(epochs_range, history["test_loss"], label="Test Loss", linewidth=2, linestyle="--")
-if best_test_epoch <= actual_epochs:
+ax.plot(epochs_range, history.get("train_loss", []), label="Train Loss", linewidth=2)
+ax.plot(epochs_range, history.get("test_loss", []), label="Test Loss", linewidth=2, linestyle="--")
+if training_history_available and 1 <= best_test_epoch <= actual_epochs:
     ax.axvline(best_test_epoch, color="green", linestyle=":", alpha=0.5, label=f"Best @ {best_test_epoch}")
 ax.set_xlabel("Epoca")
 ax.set_ylabel("Loss (1 - Fidelity)")
@@ -417,9 +465,9 @@ ax.grid(True, alpha=0.3)
 
 # --- Fig 2: Fidelity (train + test) ---
 ax = axes[0, 1]
-ax.plot(epochs_range, history["train_fidelity"], label="Train Fidelity", linewidth=2)
-ax.plot(epochs_range, history["test_fidelity"], label="Test Fidelity", linewidth=2, linestyle="--")
-if best_test_epoch <= actual_epochs:
+ax.plot(epochs_range, history.get("train_fidelity", []), label="Train Fidelity", linewidth=2)
+ax.plot(epochs_range, history.get("test_fidelity", []), label="Test Fidelity", linewidth=2, linestyle="--")
+if training_history_available and 1 <= best_test_epoch <= actual_epochs:
     ax.axvline(best_test_epoch, color="green", linestyle=":", alpha=0.5, label=f"Best @ {best_test_epoch}")
 ax.set_xlabel("Epoca")
 ax.set_ylabel("Fidelity")
@@ -429,8 +477,8 @@ ax.grid(True, alpha=0.3)
 
 # --- Fig 3: Learning Rate Schedule ---
 ax = axes[0, 2]
-if "lr" in history:
-    ax.plot(epochs_range, history["lr"], linewidth=2, color="darkorange")
+if history.get("lr"):
+    ax.plot(epochs_range, history.get("lr", []), linewidth=2, color="darkorange")
     ax.set_yscale("log")
 ax.set_xlabel("Epoca")
 ax.set_ylabel("Learning Rate")
@@ -439,8 +487,8 @@ ax.grid(True, alpha=0.3)
 
 # --- Fig 4: Perplexity (train + test) ---
 ax = axes[1, 0]
-ax.plot(epochs_range, history["train_ppl"], label="Train PPL", linewidth=2)
-ax.plot(epochs_range, history["test_ppl"], label="Test PPL", linewidth=2, linestyle="--")
+ax.plot(epochs_range, history.get("train_ppl", []), label="Train PPL", linewidth=2)
+ax.plot(epochs_range, history.get("test_ppl", []), label="Test PPL", linewidth=2, linestyle="--")
 ax.set_xlabel("Epoca")
 ax.set_ylabel("Perplexity")
 ax.set_title("Perplexity (exp(Loss))")
@@ -466,7 +514,7 @@ ax.grid(True, alpha=0.3)
 
 # --- Fig 6: Generalization gap nel tempo ---
 ax = axes[1, 2]
-gap_history = [tr - te for tr, te in zip(history["train_fidelity"], history["test_fidelity"])]
+gap_history = [tr - te for tr, te in zip(history.get("train_fidelity", []), history.get("test_fidelity", []))]
 ax.plot(epochs_range, gap_history, linewidth=2, color="red")
 ax.axhline(0, color="gray", linestyle="--", alpha=0.5)
 ax.fill_between(epochs_range, 0, gap_history, alpha=0.2, color="red")
@@ -476,7 +524,7 @@ ax.set_title("Generalization Gap")
 ax.grid(True, alpha=0.3)
 
 plt.tight_layout()
-training_report_path = os.path.join(RESULTS_DIR, "training_report.png")
+training_report_path = os.path.join(RESULTS_DIR, f"training_report_{run_file_stamp}.png")
 plt.savefig(training_report_path, dpi=150, bbox_inches="tight")
 plt.close()
 generated_plots.append(training_report_path)
@@ -569,7 +617,7 @@ if rollout_curves is not None:
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    rollout_report_path = os.path.join(RESULTS_DIR, "rollout_report.png")
+    rollout_report_path = os.path.join(RESULTS_DIR, f"rollout_report_{run_file_stamp}.png")
     plt.savefig(rollout_report_path, dpi=150, bbox_inches="tight")
     plt.close()
     generated_plots.append(rollout_report_path)
@@ -582,8 +630,12 @@ fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 fig.suptitle("Learning Rate Analysis", fontsize=13, fontweight="bold")
 
 ax = axes[0]
-if "lr" in history:
-    ax.scatter(history["lr"], history["test_loss"], c=list(epochs_range), cmap="viridis", s=20, alpha=0.7)
+lr_hist = history.get("lr", [])
+test_loss_hist = history.get("test_loss", [])
+test_fid_hist = history.get("test_fidelity", [])
+
+if lr_hist and len(lr_hist) == len(test_loss_hist):
+    ax.scatter(lr_hist, test_loss_hist, c=list(epochs_range), cmap="viridis", s=20, alpha=0.7)
     ax.set_xscale("log")
     ax.set_xlabel("Learning Rate")
     ax.set_ylabel("Test Loss")
@@ -591,13 +643,13 @@ if "lr" in history:
     ax.grid(True, alpha=0.3)
 
 ax = axes[1]
-if "lr" in history:
+if lr_hist and len(lr_hist) == len(test_fid_hist):
     # Tasso di miglioramento della fidelity (derivata discreta)
     fid_improvement = [0] + [
-        history["test_fidelity"][i] - history["test_fidelity"][i - 1]
-        for i in range(1, actual_epochs)
+        test_fid_hist[i] - test_fid_hist[i - 1]
+        for i in range(1, len(test_fid_hist))
     ]
-    ax.scatter(history["lr"], fid_improvement, c=list(epochs_range), cmap="viridis", s=20, alpha=0.7)
+    ax.scatter(lr_hist, fid_improvement, c=list(epochs_range), cmap="viridis", s=20, alpha=0.7)
     ax.set_xscale("log")
     ax.axhline(0, color="gray", linestyle="--", alpha=0.5)
     ax.set_xlabel("Learning Rate")
@@ -606,7 +658,7 @@ if "lr" in history:
     ax.grid(True, alpha=0.3)
 
 plt.tight_layout()
-lr_analysis_path = os.path.join(RESULTS_DIR, "lr_analysis.png")
+lr_analysis_path = os.path.join(RESULTS_DIR, f"lr_analysis_{run_file_stamp}.png")
 plt.savefig(lr_analysis_path, dpi=150, bbox_inches="tight")
 plt.close()
 generated_plots.append(lr_analysis_path)
@@ -616,9 +668,18 @@ print(f"  Plot salvati in {RESULTS_DIR}/ ({len(generated_plots)} file)")
 for p in generated_plots:
     print(f"    - {p}")
 
+run_ended_dt = _now_local()
+run_ended_str = _fmt_dt(run_ended_dt)
+run_started_iso = run_started_dt.isoformat(timespec="seconds")
+run_ended_iso = run_ended_dt.isoformat(timespec="seconds")
+
 summary = {
     "results_dir": RESULTS_DIR,
     "plots": [os.path.basename(p) for p in generated_plots],
+    "run_started_at": run_started_iso,
+    "run_ended_at": run_ended_iso,
+    "stop_reason": training_stop_reason,
+    "stop_exception": training_stop_exception,
     "device": config.DEVICE,
     "python": sys.version.split()[0],
     "torch": getattr(torch, "__version__", "unknown"),
@@ -651,24 +712,26 @@ summary = {
         "EVAL_LOG_EVERY_N_STEPS": int(config.EVAL_LOG_EVERY_N_STEPS),
     },
     "training": {
+        "metrics_timestamp": run_ended_iso,
         "actual_epochs": int(actual_epochs),
         "total_train_time_s": float(total_train_time),
         "best_test_epoch": int(best_test_epoch),
-        "final_train_loss": float(final_tr_loss),
-        "final_test_loss": float(final_te_loss),
-        "final_train_fidelity": float(final_tr_fid),
-        "final_test_fidelity": float(final_te_fid),
-        "mean_train_phase_time_s": float(sum(history["train_phase_time"]) / len(history["train_phase_time"]))
+        "final_train_loss": float(final_tr_loss) if final_tr_loss is not None else None,
+        "final_test_loss": float(final_te_loss) if final_te_loss is not None else None,
+        "final_train_fidelity": float(final_tr_fid) if final_tr_fid is not None else None,
+        "final_test_fidelity": float(final_te_fid) if final_te_fid is not None else None,
+        "mean_train_phase_time_s": float(sum(history.get("train_phase_time", [])) / len(history.get("train_phase_time", [])))
         if history.get("train_phase_time")
         else None,
-        "mean_eval_phase_time_s": float(sum(history["eval_phase_time"]) / len(history["eval_phase_time"]))
+        "mean_eval_phase_time_s": float(sum(history.get("eval_phase_time", [])) / len(history.get("eval_phase_time", [])))
         if history.get("eval_phase_time")
         else None,
-        "mean_train_samples_per_sec": float(sum(history["train_samples_per_sec"]) / len(history["train_samples_per_sec"]))
+        "mean_train_samples_per_sec": float(sum(history.get("train_samples_per_sec", [])) / len(history.get("train_samples_per_sec", [])))
         if history.get("train_samples_per_sec")
         else None,
     },
     "rollout_evaluation": {
+        "metrics_timestamp": run_ended_iso,
         "enabled": bool(config.OBSERVABLE_PLOTS_ENABLED),
         "n_samples": int(rollout_curves["n_samples"]) if rollout_curves is not None else 0,
         "context_len_T1": int(config.T1),
@@ -686,26 +749,37 @@ summary = {
     },
 }
 
-summary_json_path = os.path.join(RESULTS_DIR, "run_summary.json")
+summary_json_path = os.path.join(RESULTS_DIR, f"run_summary_{run_file_stamp}.json")
 with open(summary_json_path, "w", encoding="utf-8") as f:
     json.dump(summary, f, indent=2, ensure_ascii=False)
 print(f"  [SUMMARY] {summary_json_path}")
 
-summary_txt_path = os.path.join(RESULTS_DIR, "run_summary.txt")
+summary_txt_path = os.path.join(RESULTS_DIR, f"run_summary_{run_file_stamp}.txt")
 with open(summary_txt_path, "w", encoding="utf-8") as f:
     f.write("QUANTUM SEQUENCE PREDICTION - RUN SUMMARY\n")
     f.write("=" * 60 + "\n")
+    f.write(f"Run started: {summary['run_started_at']}\n")
+    f.write(f"Run ended:   {summary['run_ended_at']}\n")
+    f.write(f"Stop reason: {summary['stop_reason']}\n")
+    if summary["stop_exception"]:
+        f.write(f"Stop exception: {summary['stop_exception']}\n")
     f.write(f"Device: {summary['device']}\n")
     f.write(f"Python: {summary['python']}  Torch: {summary['torch']}  Numpy: {summary['numpy']}\n")
     f.write("\nConfig:\n")
     for k, v in summary["config"].items():
         f.write(f"  {k}: {v}\n")
     f.write("\nTraining:\n")
+    training_ts = summary["training"].get("metrics_timestamp", summary["run_ended_at"])
     for k, v in summary["training"].items():
-        f.write(f"  {k}: {v}\n")
+        if k == "metrics_timestamp":
+            continue
+        f.write(f"  [{training_ts}] {k}: {v}\n")
     f.write("\nRollout evaluation:\n")
+    rollout_ts = summary["rollout_evaluation"].get("metrics_timestamp", summary["run_ended_at"])
     for k, v in summary["rollout_evaluation"].items():
-        f.write(f"  {k}: {v}\n")
+        if k == "metrics_timestamp":
+            continue
+        f.write(f"  [{rollout_ts}] {k}: {v}\n")
     f.write("\nPlots:\n")
     for p in summary["plots"]:
         f.write(f"  - {p}\n")
@@ -715,17 +789,32 @@ print(f"  [SUMMARY] {summary_txt_path}")
 # ============================================================
 #  6. RIEPILOGO FINALE
 # ============================================================
-gap_fid = final_tr_fid - final_te_fid
+gap_fid = None
+if final_tr_fid is not None and final_te_fid is not None:
+    gap_fid = final_tr_fid - final_te_fid
+
+best_epoch_label = str(best_test_epoch) if best_test_epoch > 0 else "n/a"
+gap_str = f"{gap_fid:+.4f}" if gap_fid is not None else "n/a"
+
 print(f"\n[6/6] RIEPILOGO FINALE - ROLLOUT AUTOREGRESSIVO")
 print("=" * 50)
-print(f"  Training completato: {total_train_time:.1f}s  ({actual_epochs} ep.)")
-print(f"  Best test fidelity:  {best_test_fid:.4f} (epoca {best_test_epoch})")
-print(f"  Final train/test:    {final_tr_fid:.4f} / {final_te_fid:.4f}")
-print(f"  Gap fidelity:        {gap_fid:+.4f}")
+print(f"  Training status:      [{run_ended_str}] {training_stop_reason}")
+if training_stop_exception:
+    print(f"  Stop detail:          [{run_ended_str}] {training_stop_exception}")
+print(f"  Training time:        [{run_ended_str}] {total_train_time:.1f}s  ({actual_epochs} ep.)")
+print(f"  Best test fidelity:   [{run_ended_str}] {_fmt_metric(best_test_fid)} (epoca {best_epoch_label})")
+print(
+    f"  Final train/test fid: [{run_ended_str}] "
+    f"{_fmt_metric(final_tr_fid)} / {_fmt_metric(final_te_fid)}"
+)
+print(f"  Gap fidelity:         [{run_ended_str}] {gap_str}")
 if rollout_curves is not None:
     fid_rol_mean, _ = rollout_curves["fid"]
-    print(f"  Rollout samples:     {rollout_curves['n_samples']}")
-    print(f"  Rollout fidelity:    {float(fid_rol_mean.mean()):.4f} (media), {float(fid_rol_mean[-1]):.4f} (finale)")
+    print(f"  Rollout samples:      [{run_ended_str}] {rollout_curves['n_samples']}")
+    print(
+        f"  Rollout fidelity:     [{run_ended_str}] "
+        f"{float(fid_rol_mean.mean()):.4f} (media), {float(fid_rol_mean[-1]):.4f} (finale)"
+    )
 else:
-    print(f"  Rollout:             DISABILITATO")
+    print(f"  Rollout:              [{run_ended_str}] DISABILITATO")
 print("=" * 50)

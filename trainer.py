@@ -17,6 +17,7 @@ import time
 import os
 import gc
 import random
+from datetime import datetime
 from collections import defaultdict
 
 import torch
@@ -459,6 +460,8 @@ class AdvancedTrainer:
         self.actual_epochs = 0
         self.best_test_fid = 0.0
         self.best_test_epoch = 0
+        self.stop_reason = "completed"
+        self.stop_exception = None
 
         # --- Memory management ---
         if config.MICRO_BATCH_SIZE <= 0:
@@ -554,6 +557,17 @@ class AdvancedTrainer:
 
         scale = 1.0 / float(unroll_steps)
         return loss_acc * scale, fid_acc * scale
+
+    def _compute_objective(self, x_in: torch.Tensor, y_target: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Calcola loss/fidelity con la stessa logica usata dal training mode attivo.
+        """
+        if config.TRAINING_MODE == "rollout_window":
+            return self._autoregressive_unrolled_loss(x_in, y_target)
+
+        pred = self.model(x_in)
+        pred_for_loss, target_for_loss = self._match_prediction_target(pred, y_target)
+        return self.criterion(pred_for_loss, target_for_loss)
 
     def _maybe_sync_for_timing(self, active: bool = False):
         if active and self.sync_cuda_timings:
@@ -759,6 +773,10 @@ class AdvancedTrainer:
         except Exception as e:
             print(f"  [WARN] Impossibile salvare checkpoint emergenza ({reason}): {e}")
 
+    @staticmethod
+    def _timestamp_now() -> str:
+        return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
     def _train_one_epoch(self) -> tuple[float, float]:
         """
         Esegue una singola epoca di training.
@@ -807,20 +825,10 @@ class AdvancedTrainer:
                 model_t0 = time.perf_counter()
                 if self.use_amp and self.scaler is not None:
                     with torch.amp.autocast(self.device):
-                        if config.TRAINING_MODE == "rollout_window":
-                            loss, fid = self._autoregressive_unrolled_loss(x_micro, y_micro)
-                        else:
-                            pred = self.model(x_micro)
-                            pred_for_loss, target_for_loss = self._match_prediction_target(pred, y_micro)
-                            loss, fid = self.criterion(pred_for_loss, target_for_loss)
+                        loss, fid = self._compute_objective(x_micro, y_micro)
                         loss_scaled = (loss * weight) / self.grad_accum_steps
                 else:
-                    if config.TRAINING_MODE == "rollout_window":
-                        loss, fid = self._autoregressive_unrolled_loss(x_micro, y_micro)
-                    else:
-                        pred = self.model(x_micro)
-                        pred_for_loss, target_for_loss = self._match_prediction_target(pred, y_micro)
-                        loss, fid = self.criterion(pred_for_loss, target_for_loss)
+                    loss, fid = self._compute_objective(x_micro, y_micro)
                     loss_scaled = (loss * weight) / self.grad_accum_steps
                 self._maybe_sync_for_timing(should_log)
                 model_time += time.perf_counter() - model_t0
@@ -838,8 +846,6 @@ class AdvancedTrainer:
                 batch_fid = batch_fid + (fid * weight)
 
                 del x_micro, y_micro, loss, fid, loss_scaled
-                if config.TRAINING_MODE != "rollout_window":
-                    del pred, pred_for_loss, target_for_loss
 
             update_performed = False
             grad_norm = None
@@ -908,7 +914,7 @@ class AdvancedTrainer:
     @torch.no_grad()
     def _evaluate(self, use_ema: bool = True) -> tuple[float, float]:
         """
-        Valutazione sul test set.
+        Valutazione sul test set con la stessa objective del training mode attivo.
         Se use_ema=True e EMA è abilitato, usa i pesi EMA per la valutazione.
 
         Ritorna: (avg_loss, avg_fidelity)
@@ -951,16 +957,14 @@ class AdvancedTrainer:
                 transfer_time += time.perf_counter() - transfer_t0
 
                 model_t0 = time.perf_counter()
-                pred = self.model(x_micro)
-                pred_for_loss, target_for_loss = self._match_prediction_target(pred, y_micro)
-                loss, fid = self.criterion(pred_for_loss, target_for_loss)
+                loss, fid = self._compute_objective(x_micro, y_micro)
                 self._maybe_sync_for_timing(should_log)
                 model_time += time.perf_counter() - model_t0
 
                 batch_loss = batch_loss + (loss * weight)
                 batch_fid = batch_fid + (fid * weight)
 
-                del x_micro, y_micro, pred, pred_for_loss, target_for_loss, loss, fid
+                del x_micro, y_micro, loss, fid
 
             loss_acc += batch_loss
             fid_acc += batch_fid
@@ -1169,7 +1173,13 @@ class AdvancedTrainer:
 
         if start_epoch > epochs:
             print(f"  >> Il checkpoint (epoca {start_epoch - 1}) ha già completato {epochs} epoche. Nulla da fare.")
-            return dict(self.history)
+            out = dict(self.history)
+            out["stop_reason"] = "completed"
+            out["stop_exception"] = None
+            return out
+
+        self.stop_reason = "completed"
+        self.stop_exception = None
 
         try:
             for epoch in range(start_epoch, epochs + 1):
@@ -1256,46 +1266,75 @@ class AdvancedTrainer:
 
                 self.actual_epochs = epoch
         except KeyboardInterrupt:
-            print("\n  [INTERRUPT] Training interrotto dall'utente.")
+            self.stop_reason = "keyboard_interrupt"
+            print("\n  [INTERRUPT] Training interrotto dall'utente. Procedo con i risultati disponibili.")
             self._save_emergency_checkpoint(
                 epoch=max(start_epoch, self._current_epoch),
                 reason="keyboard_interrupt",
             )
-            raise
+            self.actual_epochs = len(self.history["train_loss"])
         except Exception as e:
+            self.stop_reason = "runtime_error"
+            self.stop_exception = f"{type(e).__name__}: {e}"
             print(f"\n  [ERROR] Eccezione durante il training: {e}")
+            print("  [ERROR] Procedo con i risultati disponibili.")
             self._save_emergency_checkpoint(
                 epoch=max(start_epoch, self._current_epoch),
                 reason="runtime_error",
             )
-            raise
+            self.actual_epochs = len(self.history["train_loss"])
+
+        if self.actual_epochs <= 0:
+            self.actual_epochs = len(self.history["train_loss"])
 
         # --- Post-training ---
         # Ripristina il miglior modello
+        has_history = len(self.history["train_loss"]) > 0
         if self.early_stopper is not None and self.early_stopper._has_saved:
             self.early_stopper.restore_best_model(self.model)
-        elif config.SAVE_BEST_MODEL and os.path.exists(config.BEST_MODEL_PATH):
+        elif has_history and config.SAVE_BEST_MODEL and os.path.exists(config.BEST_MODEL_PATH):
             checkpoint = torch.load(config.BEST_MODEL_PATH, weights_only=False, map_location="cpu")
             self.model.load_state_dict(checkpoint["model_state_dict"])
             del checkpoint
 
-        return dict(self.history)
+        out = dict(self.history)
+        out["stop_reason"] = self.stop_reason
+        out["stop_exception"] = self.stop_exception
+        return out
 
     def print_training_summary(self):
         """Stampa un riepilogo conciso del training."""
         h = self.history
         n = len(h["train_loss"])
-        if n == 0 or self.best_test_epoch <= 0:
-            print(f"\n  Training interrotto senza epoche complete salvate (tempo: {self.total_train_time:.1f}s).")
+        test_len = min(len(h["test_loss"]), len(h["test_ppl"]), len(h["test_fidelity"]))
+        stamp = self._timestamp_now()
+        status = "completato" if self.stop_reason == "completed" else f"terminato anticipatamente ({self.stop_reason})"
+
+        if n == 0 or test_len == 0:
+            print(
+                f"\n  [{stamp}] Training {status} senza epoche complete salvate "
+                f"(tempo: {self.total_train_time:.1f}s)."
+            )
+            if self.stop_exception:
+                print(f"  [{stamp}] Errore: {self.stop_exception}")
             return
 
-        print(f"\n  Training completato: {n}/{config.EPOCHS} ep. in {self.total_train_time:.1f}s")
-        print(f"  Best test: Loss={h['test_loss'][self.best_test_epoch-1]:.4f}  PPL={h['test_ppl'][self.best_test_epoch-1]:.4f}  (ep.{self.best_test_epoch})")
+        best_idx = self.best_test_epoch - 1
+        if best_idx < 0 or best_idx >= test_len:
+            best_idx = max(range(test_len), key=lambda i: h["test_fidelity"][i])
+
+        print(f"\n  [{stamp}] Training {status}: {n}/{config.EPOCHS} ep. in {self.total_train_time:.1f}s")
+        print(
+            f"  [{stamp}] Best test: Loss={h['test_loss'][best_idx]:.4f}  "
+            f"PPL={h['test_ppl'][best_idx]:.4f}  (ep.{best_idx + 1})"
+        )
         if h["train_phase_time"]:
             mean_train = sum(h["train_phase_time"]) / len(h["train_phase_time"])
             mean_eval = sum(h["eval_phase_time"]) / len(h["eval_phase_time"])
             mean_thr = sum(h["train_samples_per_sec"]) / len(h["train_samples_per_sec"])
             print(
-                f"  Medie runtime: train={mean_train:.2f}s/ep  "
+                f"  [{stamp}] Medie runtime: train={mean_train:.2f}s/ep  "
                 f"eval={mean_eval:.2f}s/ep  throughput={mean_thr:.1f} samp/s"
             )
+        if self.stop_exception:
+            print(f"  [{stamp}] Errore: {self.stop_exception}")

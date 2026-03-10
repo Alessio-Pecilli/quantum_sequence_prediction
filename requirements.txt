@@ -1,4 +1,5 @@
-# NOTE (Colab): non installare `torch` da PyPI (rischi di finire con una wheel `+cpu`).
-# Usa il PyTorch preinstallato in Colab con runtime GPU, oppure installa esplicitamente una wheel CUDA.
+# Dipendenze Python del progetto
+# NOTE (Colab): spesso conviene NON installare `torch` da qui e usare quello preinstallato nel runtime GPU.
+torch
 numpy
 matplotlib

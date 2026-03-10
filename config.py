@@ -42,7 +42,7 @@ def _env_bool(name: str, default: bool) -> bool:
 # ===== Configurazione Sistema Quantistico =====
 
 # Numero di qubit del sistema.
-N_QUBITS = _env_int("QSP_N_QUBITS", 4)
+N_QUBITS = _env_int("QSP_N_QUBITS", 6)
 DIM_2N = 2**N_QUBITS
 
 # ===== Configurazione Modello (Custom per CPU Test) =====
@@ -128,7 +128,7 @@ SAVE_BEST_MODEL = True
 BEST_MODEL_PATH = "results/best_model.pt"
 # Disattiviamo i checkpoint continui per non usurare il disco / rallentare l'I/O
 CHECKPOINT_EVERY_N_EPOCHS = 0
-RESUME_TRAINING = False
+RESUME_TRAINING = True
 LAST_CHECKPOINT_PATH = "results/last_checkpoint.pt"
 
 # ===== Configurazione EMA e Precisione =====
