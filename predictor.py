@@ -188,6 +188,9 @@ class QuantumStatePredictor(nn.Module):
             nn.GELU(),
             nn.Linear(d * 2, 2 * dim_2n * dim_2n),
         )
+        # ZERO-INIT per la stabilita' dell'esponenziale di matrice
+        nn.init.zeros_(self.output_head[-1].weight)
+        nn.init.zeros_(self.output_head[-1].bias)
 
     def forward(self, x_complex):
         """

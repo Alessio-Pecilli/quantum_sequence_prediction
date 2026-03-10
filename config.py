@@ -99,17 +99,17 @@ BATCH_SIZE = _env_int("QSP_BATCH_SIZE", 20)
 EPOCHS = _env_int("QSP_EPOCHS", 200)
 
 # Pesi Loss (Fidelity + Physics-Informed terms)
-# Diamo una penalità enorme all'appiattimento di Mx e Mz
+# Pesi osservabili ridotti per stabilizzare la convergenza iniziale con matrix_exp
 LAMBDA_FID = _env_float("QSP_LAMBDA_FID", 1.0)
-LAMBDA_MZ = _env_float("QSP_LAMBDA_MZ", 2.0)
-LAMBDA_MX = _env_float("QSP_LAMBDA_MX", 2.0)
-LAMBDA_CZ = _env_float("QSP_LAMBDA_CZ", 1.0)
+LAMBDA_MZ = _env_float("QSP_LAMBDA_MZ", 0.5)
+LAMBDA_MX = _env_float("QSP_LAMBDA_MX", 0.5)
+LAMBDA_CZ = _env_float("QSP_LAMBDA_CZ", 0.1)
 
 # ===== Configurazione Ottimizzatore =====
-# LR leggermente più alto per convergere in fretta
-LEARNING_RATE = 2e-3
+# LR ridotto per stabilizzare l'ottimizzazione con esponenziale di matrice
+LEARNING_RATE = 5e-4
 WEIGHT_DECAY = 1e-5
-GRAD_CLIP_MAX_NORM = 1.0
+GRAD_CLIP_MAX_NORM = 0.5
 
 # ===== Configurazione Learning Rate Scheduler =====
 LR_WARMUP_EPOCHS = 5
