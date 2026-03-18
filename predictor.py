@@ -32,6 +32,24 @@ class NegativeLogFidelityLoss(nn.Module):
         return loss, fidelity.mean(), fidelity
 
 
+class ComplexMSELoss(nn.Module):
+    """
+    Allinea ampiezze e fase (non solo la fidelity) con MSE sulle componenti reali/immaginarie.
+    """
+
+    def forward(self, predicted: torch.Tensor, target: torch.Tensor):
+        # predicted/target sono attesi come stati complessi normalizzati.
+        pred_real = torch.view_as_real(predicted)
+        target_real = torch.view_as_real(target)
+        loss = torch.nn.functional.mse_loss(pred_real, target_real)
+
+        # Fidelity solo per reporting/plot: non influenza direttamente il gradiente.
+        with torch.no_grad():
+            fidelity = quantum_fidelity(predicted, target)
+
+        return loss, fidelity.mean(), fidelity
+
+
 class SinusoidalPositionalEncoding(nn.Module):
     def __init__(self, d_model: int, max_len: int):
         super().__init__()

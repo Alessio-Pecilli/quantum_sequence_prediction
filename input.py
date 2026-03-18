@@ -126,6 +126,12 @@ def choose_initial_state_family(total_sequences: int, n_qubits: int) -> tuple[st
     if config.INITIAL_STATE_FAMILY == "basis":
         return "basis", basis_support, "forzato da config"
 
+    if config.INITIAL_STATE_FAMILY == "pauli_basis":
+        # Codifica per qubit: (bit valore b_j, scelta Pauli P_j in {I,X,Y,Z}) => 8 possibilità.
+        # Usiamo questa ampiezza come "supporto" per garantire campioni distinti finche' possibile.
+        support_size = 8**n_qubits
+        return "pauli_basis", support_size, "forzato da config"
+
     if config.INITIAL_STATE_FAMILY == "local_clifford":
         return (
             "local_clifford",
@@ -135,16 +141,16 @@ def choose_initial_state_family(total_sequences: int, n_qubits: int) -> tuple[st
 
     if total_sequences > basis_support:
         return (
-            "local_clifford",
-            6 ** n_qubits,
-            "supporto basis insufficiente; uso local Clifford perche' le sole Pauli non aumentano il supporto fisico",
+            "pauli_basis",
+            8**n_qubits,
+            "supporto basis insufficiente; uso Pauli random per ottenere varianti anche quando 2K~2^n",
         )
 
     if support_fraction > config.BASIS_SUPPORT_FRACTION_LIMIT:
         return (
-            "local_clifford",
-            6 ** n_qubits,
-            "2K non abbastanza piccolo rispetto a 2^n; uso local Clifford perche' le sole Pauli non aumentano il supporto fisico",
+            "pauli_basis",
+            8**n_qubits,
+            "2K non abbastanza piccolo rispetto a 2^n; uso Pauli random per aggiungere differenze di fase globali",
         )
 
     return "basis", basis_support, "supporto basis sufficiente"
@@ -208,11 +214,70 @@ def local_clifford_state_from_code(code: int, n_qubits: int) -> torch.Tensor:
     return state.to(torch.complex64)
 
 
+def pauli_basis_state_from_code(code: int, n_qubits: int) -> torch.Tensor:
+    """
+    Stato iniziale del tipo:
+      |psi(0)> = P_1 |b_1> x P_2 |b_2> x ... x P_n |b_n>
+    dove P_j in {I,X,Y,Z} scelto in modo deterministico dalla codifica `code`.
+
+    La codifica usa base 8 per qubit:
+      digit = 2-bit per Pauli (I=0,X=1,Y=2,Z=3) + 1-bit per b_j.
+    """
+
+    dim = 2**n_qubits
+    remaining = int(code)
+
+    # Estrai cifre in base 8 (LSB->MSB), poi inverti per avere qubit 0 come MSB.
+    digits: list[int] = []
+    for _ in range(n_qubits):
+        remaining, digit = divmod(remaining, 8)
+        digits.append(int(digit))
+    digits = list(reversed(digits))  # ora digits[0] -> qubit 0
+
+    final_bits: list[int] = [0] * n_qubits
+    phase_total: complex = 1.0 + 0.0j
+
+    for q in range(n_qubits):
+        digit = digits[q]
+        b = digit & 1
+        p = digit >> 1  # 0..3
+
+        if p == 0:  # I
+            new_b = b
+            phase_factor = 1.0 + 0.0j
+        elif p == 1:  # X
+            new_b = 1 - b
+            phase_factor = 1.0 + 0.0j
+        elif p == 2:  # Y
+            new_b = 1 - b
+            # Y|0> = i|1>, Y|1> = -i|0>
+            phase_factor = 1j if b == 0 else -1j
+        elif p == 3:  # Z
+            new_b = b
+            # Z|0> = |0>, Z|1> = -|1>
+            phase_factor = 1.0 + 0.0j if b == 0 else -1.0 + 0.0j
+        else:
+            raise ValueError(f"Codifica Pauli non valida (p={p})")
+
+        final_bits[q] = new_b
+        phase_total *= phase_factor
+
+    final_code = 0
+    for q in range(n_qubits):
+        final_code = (final_code << 1) | int(final_bits[q])
+
+    state = torch.zeros((dim,), dtype=torch.complex64)
+    state[final_code] = torch.tensor(phase_total, dtype=torch.complex64)
+    return state
+
+
 def initial_state_from_code(code: int, family: str, n_qubits: int) -> torch.Tensor:
     if family == "basis":
         return basis_state_from_code(code, n_qubits)
     if family == "local_clifford":
         return local_clifford_state_from_code(code, n_qubits)
+    if family == "pauli_basis":
+        return pauli_basis_state_from_code(code, n_qubits)
     raise ValueError(f"Famiglia di stati iniziali non supportata: {family}")
 
 

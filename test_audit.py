@@ -17,7 +17,7 @@ import torch
 
 import config
 from input import QuantumSequenceDataset, generate_fixed_tfim_dataset
-from predictor import NegativeLogFidelityLoss, QuantumSequencePredictor, quantum_fidelity
+from predictor import ComplexMSELoss, QuantumSequencePredictor, quantum_fidelity
 from trainer import evaluate_autoregressive, evaluate_teacher_forced, set_seed
 
 
@@ -42,7 +42,7 @@ model = QuantumSequencePredictor()
 predictions = model(bundle.train.inputs[:2])
 assert predictions.shape == (2, config.SEQ_LEN, config.DIM_2N)
 
-criterion = NegativeLogFidelityLoss()
+criterion = ComplexMSELoss()
 loss, mean_fidelity, fidelity_matrix = criterion(predictions, bundle.train.targets[:2])
 assert loss.ndim == 0
 assert mean_fidelity.ndim == 0

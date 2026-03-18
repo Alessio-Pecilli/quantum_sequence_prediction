@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import json
 from typing import Any
 
@@ -75,6 +76,8 @@ def _plot_split_curves(
 
 
 def main():
+    # Usa i valori di `config.py` (eventualmente sovrascrivibili via env vars).
+
     set_seed(config.SEED)
     config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 

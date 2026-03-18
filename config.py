@@ -76,14 +76,14 @@ TRAINING_CURVES_PATH = RESULTS_DIR / "training_curves.png"
 SEED = _env_int("QSP_SEED", 7)
 
 
-N_QUBITS = _env_int("QSP_N_QUBITS", 5)
+N_QUBITS = _env_int("QSP_N_QUBITS", 8)
 if N_QUBITS < 1:
     raise ValueError(f"N_QUBITS deve essere >= 1, ricevuto: {N_QUBITS}")
 
 DIM_2N = 2 ** N_QUBITS
 
 # Numero totale di stati in ogni traiettoria, incluso psi(0).
-NUM_STATES = _env_int("QSP_NUM_STATES", 25)
+NUM_STATES = _env_int("QSP_NUM_STATES", 12)
 if NUM_STATES < 2:
     raise ValueError(f"NUM_STATES deve essere >= 2, ricevuto: {NUM_STATES}")
 
@@ -91,8 +91,8 @@ if NUM_STATES < 2:
 SEQ_LEN = NUM_STATES - 1
 
 
-TRAIN_SEQUENCES = _env_int("QSP_TRAIN_SEQUENCES", 128)
-TEST_SEQUENCES = _env_int("QSP_TEST_SEQUENCES", 128)
+TRAIN_SEQUENCES = _env_int("QSP_TRAIN_SEQUENCES", 2048)
+TEST_SEQUENCES = _env_int("QSP_TEST_SEQUENCES", 256)
 if TRAIN_SEQUENCES < 1 or TEST_SEQUENCES < 1:
     raise ValueError("TRAIN_SEQUENCES e TEST_SEQUENCES devono essere >= 1.")
 
@@ -132,11 +132,11 @@ if EXACT_DIAG_MAX_DIM < 2:
     raise ValueError(f"EXACT_DIAG_MAX_DIM deve essere >= 2, ricevuto: {EXACT_DIAG_MAX_DIM}")
 
 
-INITIAL_STATE_FAMILY = _env_str("QSP_INITIAL_STATE_FAMILY", "auto")
-if INITIAL_STATE_FAMILY not in {"auto", "basis", "local_clifford"}:
+INITIAL_STATE_FAMILY = _env_str("QSP_INITIAL_STATE_FAMILY", "local_clifford")
+if INITIAL_STATE_FAMILY not in {"auto", "basis", "pauli_basis", "local_clifford"}:
     raise ValueError(
         f"INITIAL_STATE_FAMILY={INITIAL_STATE_FAMILY!r} non valida. "
-        "Valori ammessi: auto, basis, local_clifford."
+        "Valori ammessi: auto, basis, pauli_basis, local_clifford."
     )
 BASIS_SUPPORT_FRACTION_LIMIT = _env_float("QSP_BASIS_SUPPORT_FRACTION_LIMIT", 0.125)
 if not (0.0 < BASIS_SUPPORT_FRACTION_LIMIT <= 1.0):
@@ -146,10 +146,10 @@ if not (0.0 < BASIS_SUPPORT_FRACTION_LIMIT <= 1.0):
     )
 
 
-D_MODEL = _env_int("QSP_D_MODEL", 128)
-NUM_HEADS = _env_int("QSP_NUM_HEADS", 4)
-NUM_LAYERS = _env_int("QSP_NUM_LAYERS", 3)
-DIM_FEEDFORWARD = _env_int("QSP_DIM_FEEDFORWARD", D_MODEL * 4)
+D_MODEL = _env_int("QSP_D_MODEL", 512)
+NUM_HEADS = _env_int("QSP_NUM_HEADS", 8)
+NUM_LAYERS = _env_int("QSP_NUM_LAYERS", 4)
+DIM_FEEDFORWARD = _env_int("QSP_DIM_FEEDFORWARD", 2048)
 DROPOUT = _env_float("QSP_DROPOUT", 0.0)
 if D_MODEL <= 0 or NUM_HEADS <= 0 or NUM_LAYERS <= 0 or DIM_FEEDFORWARD <= 0:
     raise ValueError("D_MODEL, NUM_HEADS, NUM_LAYERS e DIM_FEEDFORWARD devono essere > 0.")
@@ -157,9 +157,9 @@ if D_MODEL % NUM_HEADS != 0:
     raise ValueError("D_MODEL deve essere divisibile per NUM_HEADS.")
 
 
-BATCH_SIZE = _env_int("QSP_BATCH_SIZE", 16)
-EPOCHS = _env_int("QSP_EPOCHS", 80)
-LEARNING_RATE = _env_float("QSP_LEARNING_RATE", 3e-4)
+BATCH_SIZE = _env_int("QSP_BATCH_SIZE", 32)
+EPOCHS = _env_int("QSP_EPOCHS", 1000)
+LEARNING_RATE = _env_float("QSP_LEARNING_RATE", 1e-4)
 WEIGHT_DECAY = _env_float("QSP_WEIGHT_DECAY", 1e-4)
 GRAD_CLIP_MAX_NORM = _env_float("QSP_GRAD_CLIP_MAX_NORM", 1.0)
 LOG_FIDELITY_EPS = _env_float("QSP_LOG_FIDELITY_EPS", 1e-8)

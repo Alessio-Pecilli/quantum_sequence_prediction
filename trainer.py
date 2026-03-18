@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 
 import config
 from input import QuantumSequenceDataset
-from predictor import NegativeLogFidelityLoss, QuantumSequencePredictor, quantum_fidelity
+from predictor import ComplexMSELoss, QuantumSequencePredictor, quantum_fidelity
 
 
 @dataclass
@@ -59,13 +59,19 @@ def train_model(model: QuantumSequencePredictor, train_states: torch.Tensor) -> 
         lr=config.LEARNING_RATE,
         weight_decay=config.WEIGHT_DECAY,
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=max(1, config.EPOCHS),
-        eta_min=config.LEARNING_RATE * 0.1,
-    )
-    criterion = NegativeLogFidelityLoss()
     loader = build_loader(train_states, shuffle=True)
+    steps_per_epoch = len(loader)
+
+    # OneCycleLR: warmup sul learning rate per accelerare la convergenza del Transformer.
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=config.LEARNING_RATE,
+        epochs=config.EPOCHS,
+        steps_per_epoch=steps_per_epoch,
+        pct_start=0.1,  # 10% warmup
+        anneal_strategy="cos",
+    )
+    criterion = ComplexMSELoss()
 
     best_state = None
     best_loss = float("inf")
@@ -89,13 +95,12 @@ def train_model(model: QuantumSequencePredictor, train_states: torch.Tensor) -> 
                 torch.nn.utils.clip_grad_norm_(model.parameters(), config.GRAD_CLIP_MAX_NORM)
 
             optimizer.step()
+            scheduler.step()
 
             batch_size = int(inputs.shape[0])
             loss_sum += float(loss.item()) * batch_size
             fidelity_sum += float(mean_fidelity.item()) * batch_size
             sample_count += batch_size
-
-        scheduler.step()
 
         epoch_loss = loss_sum / max(1, sample_count)
         epoch_fidelity = fidelity_sum / max(1, sample_count)
@@ -127,7 +132,7 @@ def train_model(model: QuantumSequencePredictor, train_states: torch.Tensor) -> 
 @torch.no_grad()
 def evaluate_teacher_forced(model: QuantumSequencePredictor, states: torch.Tensor) -> EvaluationResult:
     model.eval()
-    criterion = NegativeLogFidelityLoss()
+    criterion = ComplexMSELoss()
     loader = build_loader(states, shuffle=False)
 
     total_loss = 0.0
@@ -270,7 +275,7 @@ def plot_training_curves(history: TrainingHistory):
     axes[0].plot(history.epochs, history.train_loss, color="#b03a2e", linewidth=2.0)
     axes[0].set_title("Training Loss")
     axes[0].set_xlabel("Epoca")
-    axes[0].set_ylabel("-log fidelity")
+    axes[0].set_ylabel("Complex MSE loss")
     axes[0].grid(alpha=0.25)
 
     axes[1].plot(history.epochs, history.train_fidelity, color="#1f618d", linewidth=2.0)
