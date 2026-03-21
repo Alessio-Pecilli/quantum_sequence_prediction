@@ -52,6 +52,58 @@ def build_model() -> QuantumSequencePredictor:
     return QuantumSequencePredictor().to(config.DEVICE)
 
 
+def _scheduled_sampling_probability(epoch: int) -> float:
+    progress = min(1.0, float(epoch) / float(config.SCHEDULED_SAMPLING_RAMP_EPOCHS))
+    return float(config.SCHEDULED_SAMPLING_MAX_PROB) * progress
+
+
+def _rollout_training_steps(seq_len: int, epoch: int) -> int:
+    progress = min(1.0, float(epoch) / float(config.ROLLOUT_CURRICULUM_EPOCHS))
+    return max(1, min(seq_len, int(round(progress * seq_len))))
+
+
+def _autoregressive_unroll_loss(
+    model: QuantumSequencePredictor,
+    criterion: ComplexMSELoss,
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    steps: int,
+    scheduled_sampling_prob: float,
+):
+    context = inputs[:, :1, :]
+    per_step_losses: list[torch.Tensor] = []
+    per_step_fidelities: list[torch.Tensor] = []
+
+    max_steps = min(int(steps), int(targets.shape[1]))
+    for step in range(max_steps):
+        predicted_next = model(context)[:, -1, :]
+        step_target = targets[:, step : step + 1, :]
+        step_loss, step_mean_fidelity, _ = criterion(predicted_next.unsqueeze(1), step_target)
+        per_step_losses.append(step_loss)
+        per_step_fidelities.append(step_mean_fidelity)
+
+        if step + 1 >= max_steps:
+            continue
+
+        gold_next_context = inputs[:, step + 1 : step + 2, :]
+        if scheduled_sampling_prob <= 0.0:
+            next_context = gold_next_context
+        else:
+            use_model_mask = (
+                torch.rand((inputs.shape[0], 1, 1), device=inputs.device) < scheduled_sampling_prob
+            )
+            next_context = torch.where(
+                use_model_mask,
+                predicted_next.detach().unsqueeze(1),
+                gold_next_context,
+            )
+        context = torch.cat([context, next_context], dim=1)
+
+    rollout_loss = torch.stack(per_step_losses).mean()
+    rollout_fidelity = torch.stack(per_step_fidelities).mean()
+    return rollout_loss, rollout_fidelity
+
+
 def train_model(model: QuantumSequencePredictor, train_states: torch.Tensor) -> TrainingHistory:
     history = TrainingHistory(epochs=[], train_loss=[], train_fidelity=[])
     optimizer = torch.optim.AdamW(
@@ -81,6 +133,8 @@ def train_model(model: QuantumSequencePredictor, train_states: torch.Tensor) -> 
         loss_sum = 0.0
         fidelity_sum = 0.0
         sample_count = 0
+        scheduled_sampling_prob = _scheduled_sampling_probability(epoch)
+        rollout_steps = _rollout_training_steps(config.SEQ_LEN, epoch)
 
         for inputs, targets in loader:
             inputs = inputs.to(config.DEVICE)
@@ -88,8 +142,23 @@ def train_model(model: QuantumSequencePredictor, train_states: torch.Tensor) -> 
 
             optimizer.zero_grad(set_to_none=True)
             predicted = model(inputs)
-            loss, mean_fidelity, _ = criterion(predicted, targets)
-            loss.backward()
+            teacher_forced_loss, teacher_forced_fidelity, _ = criterion(predicted, targets)
+            total_loss = teacher_forced_loss
+            total_fidelity = teacher_forced_fidelity
+
+            if config.ROLLOUT_AUX_WEIGHT > 0.0:
+                rollout_loss, rollout_fidelity = _autoregressive_unroll_loss(
+                    model=model,
+                    criterion=criterion,
+                    inputs=inputs,
+                    targets=targets,
+                    steps=rollout_steps,
+                    scheduled_sampling_prob=scheduled_sampling_prob,
+                )
+                total_loss = teacher_forced_loss + config.ROLLOUT_AUX_WEIGHT * rollout_loss
+                total_fidelity = 0.5 * (teacher_forced_fidelity + rollout_fidelity)
+
+            total_loss.backward()
 
             if config.GRAD_CLIP_MAX_NORM > 0.0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), config.GRAD_CLIP_MAX_NORM)
@@ -98,8 +167,8 @@ def train_model(model: QuantumSequencePredictor, train_states: torch.Tensor) -> 
             scheduler.step()
 
             batch_size = int(inputs.shape[0])
-            loss_sum += float(loss.item()) * batch_size
-            fidelity_sum += float(mean_fidelity.item()) * batch_size
+            loss_sum += float(total_loss.item()) * batch_size
+            fidelity_sum += float(total_fidelity.item()) * batch_size
             sample_count += batch_size
 
         epoch_loss = loss_sum / max(1, sample_count)
@@ -116,6 +185,7 @@ def train_model(model: QuantumSequencePredictor, train_states: torch.Tensor) -> 
             print(
                 f"  Epoca {epoch:4d}/{config.EPOCHS} | "
                 f"loss={epoch_loss:.6f} | fidelity={epoch_fidelity:.6f} | "
+                f"ss_p={scheduled_sampling_prob:.3f} | rollout_steps={rollout_steps:2d} | "
                 f"lr={optimizer.param_groups[0]['lr']:.2e}"
             )
 

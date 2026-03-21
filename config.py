@@ -158,11 +158,15 @@ if D_MODEL % NUM_HEADS != 0:
 
 
 BATCH_SIZE = _env_int("QSP_BATCH_SIZE", 32)
-EPOCHS = _env_int("QSP_EPOCHS", 1000)
+EPOCHS = _env_int("QSP_EPOCHS", 200)
 LEARNING_RATE = _env_float("QSP_LEARNING_RATE", 1e-4)
 WEIGHT_DECAY = _env_float("QSP_WEIGHT_DECAY", 1e-4)
 GRAD_CLIP_MAX_NORM = _env_float("QSP_GRAD_CLIP_MAX_NORM", 1.0)
 LOG_FIDELITY_EPS = _env_float("QSP_LOG_FIDELITY_EPS", 1e-8)
+SCHEDULED_SAMPLING_MAX_PROB = _env_float("QSP_SCHEDULED_SAMPLING_MAX_PROB", 0.30)
+SCHEDULED_SAMPLING_RAMP_EPOCHS = _env_int("QSP_SCHEDULED_SAMPLING_RAMP_EPOCHS", 120)
+ROLLOUT_AUX_WEIGHT = _env_float("QSP_ROLLOUT_AUX_WEIGHT", 0.50)
+ROLLOUT_CURRICULUM_EPOCHS = _env_int("QSP_ROLLOUT_CURRICULUM_EPOCHS", 120)
 if BATCH_SIZE < 1 or EPOCHS < 1:
     raise ValueError("BATCH_SIZE e EPOCHS devono essere >= 1.")
 if LEARNING_RATE <= 0.0:
@@ -171,6 +175,21 @@ if WEIGHT_DECAY < 0.0 or GRAD_CLIP_MAX_NORM < 0.0:
     raise ValueError("WEIGHT_DECAY e GRAD_CLIP_MAX_NORM devono essere >= 0.")
 if not (0.0 < LOG_FIDELITY_EPS < 1.0):
     raise ValueError(f"LOG_FIDELITY_EPS deve stare in (0,1), ricevuto: {LOG_FIDELITY_EPS}")
+if not (0.0 <= SCHEDULED_SAMPLING_MAX_PROB <= 1.0):
+    raise ValueError(
+        "SCHEDULED_SAMPLING_MAX_PROB deve stare in [0,1], "
+        f"ricevuto: {SCHEDULED_SAMPLING_MAX_PROB}"
+    )
+if SCHEDULED_SAMPLING_RAMP_EPOCHS < 1:
+    raise ValueError(
+        f"SCHEDULED_SAMPLING_RAMP_EPOCHS deve essere >= 1, ricevuto: {SCHEDULED_SAMPLING_RAMP_EPOCHS}"
+    )
+if ROLLOUT_AUX_WEIGHT < 0.0:
+    raise ValueError(f"ROLLOUT_AUX_WEIGHT deve essere >= 0, ricevuto: {ROLLOUT_AUX_WEIGHT}")
+if ROLLOUT_CURRICULUM_EPOCHS < 1:
+    raise ValueError(
+        f"ROLLOUT_CURRICULUM_EPOCHS deve essere >= 1, ricevuto: {ROLLOUT_CURRICULUM_EPOCHS}"
+    )
 
 
 EXPOSURE_BIAS_GAP_THRESHOLD = _env_float("QSP_EXPOSURE_BIAS_GAP_THRESHOLD", 0.10)
