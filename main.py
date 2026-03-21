@@ -119,6 +119,13 @@ def main():
         f"epochs={config.EPOCHS}, batch={config.BATCH_SIZE}, lr={config.LEARNING_RATE:.2e}, "
         f"wd={config.WEIGHT_DECAY:.2e}"
     )
+    print(
+        "Rollout robustness:    "
+        f"ss_max_p={config.SCHEDULED_SAMPLING_MAX_PROB:.2f}, "
+        f"ss_ramp_epochs={config.SCHEDULED_SAMPLING_RAMP_EPOCHS}, "
+        f"aux_weight={config.ROLLOUT_AUX_WEIGHT:.2f}, "
+        f"curriculum_epochs={config.ROLLOUT_CURRICULUM_EPOCHS}"
+    )
     print("=" * 78)
 
     model = build_model()
@@ -213,6 +220,10 @@ def main():
             "COUPLING_STD": float(config.COUPLING_STD),
             "FIELD_STRENGTH": float(config.FIELD_STRENGTH),
             "TIME_STEP": float(config.TIME_STEP),
+            "SCHEDULED_SAMPLING_MAX_PROB": float(config.SCHEDULED_SAMPLING_MAX_PROB),
+            "SCHEDULED_SAMPLING_RAMP_EPOCHS": int(config.SCHEDULED_SAMPLING_RAMP_EPOCHS),
+            "ROLLOUT_AUX_WEIGHT": float(config.ROLLOUT_AUX_WEIGHT),
+            "ROLLOUT_CURRICULUM_EPOCHS": int(config.ROLLOUT_CURRICULUM_EPOCHS),
             "INITIAL_STATE_FAMILY": config.INITIAL_STATE_FAMILY,
             "active_env_overrides": config.get_active_env_overrides(),
         },

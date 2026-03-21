@@ -37,17 +37,23 @@ class ComplexMSELoss(nn.Module):
     Allinea ampiezze e fase (non solo la fidelity) con MSE sulle componenti reali/immaginarie.
     """
 
+    def __init__(self):
+        super().__init__()
+        # MSE su rappresentazione [real, imag] per forzare anche l'allineamento della fase globale.
+        self.mse = nn.MSELoss()
+
     def forward(self, predicted: torch.Tensor, target: torch.Tensor):
-        # predicted/target sono attesi come stati complessi normalizzati.
-        pred_real = torch.view_as_real(predicted)
-        target_real = torch.view_as_real(target)
-        loss = torch.nn.functional.mse_loss(pred_real, target_real)
+        # predicted/target: complessi normalizzati con shape [Batch, Seq, Dim] (dtype complex64/complex*).
+        pred_real = torch.view_as_real(predicted)  # -> [Batch, Seq, Dim, 2]
+        target_real = torch.view_as_real(target)  # -> [Batch, Seq, Dim, 2]
+        loss = self.mse(pred_real, target_real)
 
         # Fidelity solo per reporting/plot: non influenza direttamente il gradiente.
         with torch.no_grad():
             fidelity = quantum_fidelity(predicted, target)
+            mean_fidelity = fidelity.mean()
 
-        return loss, fidelity.mean(), fidelity
+        return loss, mean_fidelity, fidelity
 
 
 class SinusoidalPositionalEncoding(nn.Module):
