@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import gc
+import os
 import random
 from dataclasses import dataclass
 
@@ -39,12 +41,13 @@ def set_seed(seed: int):
 
 def build_loader(states: torch.Tensor, shuffle: bool) -> DataLoader:
     dataset = QuantumSequenceDataset(states)
+    safe_batch_size = max(1, int(config.BATCH_SIZE) // 2)
     return DataLoader(
         dataset,
-        batch_size=config.BATCH_SIZE,
+        batch_size=safe_batch_size,
         shuffle=shuffle,
-        num_workers=config.NUM_WORKERS,
-        pin_memory=bool(config.PIN_MEMORY and config.DEVICE == "cuda"),
+        num_workers=0,
+        pin_memory=False,
     )
 
 
@@ -104,8 +107,64 @@ def _autoregressive_unroll_loss(
     return rollout_loss, rollout_fidelity
 
 
-def train_model(model: QuantumSequencePredictor, train_states: torch.Tensor) -> TrainingHistory:
-    history = TrainingHistory(epochs=[], train_loss=[], train_fidelity=[])
+def _atomic_torch_save(payload: dict, destination: os.PathLike):
+    destination_path = os.fspath(destination)
+    tmp_path = f"{destination_path}.tmp"
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, destination_path)
+
+
+def _save_last_checkpoint(
+    model: QuantumSequencePredictor,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    history: TrainingHistory,
+    epoch: int,
+    best_loss: float,
+    best_state: dict | None,
+):
+    if not config.SAVE_MODEL:
+        return
+    config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    checkpoint_payload = {
+        "epoch": int(epoch),
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "history": {
+            "epochs": list(history.epochs),
+            "train_loss": list(history.train_loss),
+            "train_fidelity": list(history.train_fidelity),
+        },
+        "best_loss": float(best_loss),
+        "best_state_dict": best_state,
+        "config": {
+            "EPOCHS": int(config.EPOCHS),
+            "BATCH_SIZE": int(config.BATCH_SIZE),
+            "LEARNING_RATE": float(config.LEARNING_RATE),
+            "WEIGHT_DECAY": float(config.WEIGHT_DECAY),
+            "D_MODEL": int(config.D_MODEL),
+            "NUM_HEADS": int(config.NUM_HEADS),
+            "NUM_LAYERS": int(config.NUM_LAYERS),
+            "DIM_FEEDFORWARD": int(config.DIM_FEEDFORWARD),
+            "NUM_STATES": int(config.NUM_STATES),
+            "TRAIN_SEQUENCES": int(config.TRAIN_SEQUENCES),
+        },
+    }
+    _atomic_torch_save(checkpoint_payload, config.LAST_CHECKPOINT_PATH)
+
+
+def train_model(
+    model: QuantumSequencePredictor,
+    train_states: torch.Tensor,
+    start_epoch: int = 1,
+    history: TrainingHistory | None = None,
+    optimizer_state_dict: dict | None = None,
+    scheduler_state_dict: dict | None = None,
+    best_loss: float | None = None,
+    best_state: dict | None = None,
+) -> TrainingHistory:
+    history = history or TrainingHistory(epochs=[], train_loss=[], train_fidelity=[])
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config.LEARNING_RATE,
@@ -113,6 +172,8 @@ def train_model(model: QuantumSequencePredictor, train_states: torch.Tensor) -> 
     )
     loader = build_loader(train_states, shuffle=True)
     steps_per_epoch = len(loader)
+    use_amp = config.DEVICE == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     # OneCycleLR: warmup sul learning rate per accelerare la convergenza del Transformer.
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
@@ -125,69 +186,124 @@ def train_model(model: QuantumSequencePredictor, train_states: torch.Tensor) -> 
     )
     criterion = ComplexMSELoss()
 
-    best_state = None
-    best_loss = float("inf")
+    if optimizer_state_dict is not None:
+        optimizer.load_state_dict(optimizer_state_dict)
+    if scheduler_state_dict is not None:
+        scheduler.load_state_dict(scheduler_state_dict)
 
-    for epoch in range(1, config.EPOCHS + 1):
-        model.train()
-        loss_sum = 0.0
-        fidelity_sum = 0.0
-        sample_count = 0
-        scheduled_sampling_prob = _scheduled_sampling_probability(epoch)
-        rollout_steps = _rollout_training_steps(config.SEQ_LEN, epoch)
+    best_loss = float("inf") if best_loss is None else float(best_loss)
 
-        for inputs, targets in loader:
-            inputs = inputs.to(config.DEVICE)
-            targets = targets.to(config.DEVICE)
+    last_completed_epoch = history.epochs[-1] if history.epochs else max(0, start_epoch - 1)
+    interrupted = False
+    try:
+        for epoch in range(max(1, start_epoch), config.EPOCHS + 1):
+            model.train()
+            loss_sum = 0.0
+            fidelity_sum = 0.0
+            sample_count = 0
+            scheduled_sampling_prob = _scheduled_sampling_probability(epoch)
+            rollout_steps = _rollout_training_steps(config.SEQ_LEN, epoch)
 
-            optimizer.zero_grad(set_to_none=True)
-            predicted = model(inputs)
-            teacher_forced_loss, teacher_forced_fidelity, _ = criterion(predicted, targets)
-            total_loss = teacher_forced_loss
-            total_fidelity = teacher_forced_fidelity
+            for batch_idx, (inputs, targets) in enumerate(loader, start=1):
+                inputs = inputs.to(config.DEVICE)
+                targets = targets.to(config.DEVICE)
 
-            if config.ROLLOUT_AUX_WEIGHT > 0.0:
-                rollout_loss, rollout_fidelity = _autoregressive_unroll_loss(
-                    model=model,
-                    criterion=criterion,
-                    inputs=inputs,
-                    targets=targets,
-                    steps=rollout_steps,
-                    scheduled_sampling_prob=scheduled_sampling_prob,
+                optimizer.zero_grad(set_to_none=True)
+                with torch.autocast(
+                    device_type="cuda",
+                    dtype=torch.float16,
+                    enabled=use_amp,
+                ):
+                    predicted = model(inputs)
+                    teacher_forced_loss, teacher_forced_fidelity, _ = criterion(predicted, targets)
+                    total_loss = teacher_forced_loss
+                    total_fidelity = teacher_forced_fidelity
+
+                    if config.ROLLOUT_AUX_WEIGHT > 0.0:
+                        rollout_loss, rollout_fidelity = _autoregressive_unroll_loss(
+                            model=model,
+                            criterion=criterion,
+                            inputs=inputs,
+                            targets=targets,
+                            steps=rollout_steps,
+                            scheduled_sampling_prob=scheduled_sampling_prob,
+                        )
+                        total_loss = teacher_forced_loss + config.ROLLOUT_AUX_WEIGHT * rollout_loss
+                        total_fidelity = 0.5 * (teacher_forced_fidelity + rollout_fidelity)
+
+                scaler.scale(total_loss).backward()
+
+                if config.GRAD_CLIP_MAX_NORM > 0.0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.GRAD_CLIP_MAX_NORM)
+
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+
+                batch_size = int(inputs.shape[0])
+                loss_sum += float(total_loss.item()) * batch_size
+                fidelity_sum += float(total_fidelity.item()) * batch_size
+                sample_count += batch_size
+
+                if (
+                    config.CHECKPOINT_EVERY_BATCH > 0
+                    and batch_idx % config.CHECKPOINT_EVERY_BATCH == 0
+                ):
+                    _save_last_checkpoint(
+                        model=model,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        history=history,
+                        epoch=last_completed_epoch,
+                        best_loss=best_loss,
+                        best_state=best_state,
+                    )
+
+            epoch_loss = loss_sum / max(1, sample_count)
+            epoch_fidelity = fidelity_sum / max(1, sample_count)
+            history.epochs.append(epoch)
+            history.train_loss.append(epoch_loss)
+            history.train_fidelity.append(epoch_fidelity)
+            last_completed_epoch = epoch
+
+            if epoch_loss < best_loss:
+                best_loss = epoch_loss
+                best_state = copy.deepcopy(model.state_dict())
+
+            if epoch == 1 or epoch == config.EPOCHS or epoch % max(1, config.EPOCHS // 10) == 0:
+                print(
+                    f"  Epoca {epoch:4d}/{config.EPOCHS} | "
+                    f"loss={epoch_loss:.6f} | fidelity={epoch_fidelity:.6f} | "
+                    f"ss_p={scheduled_sampling_prob:.3f} | rollout_steps={rollout_steps:2d} | "
+                    f"lr={optimizer.param_groups[0]['lr']:.2e}"
                 )
-                total_loss = teacher_forced_loss + config.ROLLOUT_AUX_WEIGHT * rollout_loss
-                total_fidelity = 0.5 * (teacher_forced_fidelity + rollout_fidelity)
 
-            total_loss.backward()
-
-            if config.GRAD_CLIP_MAX_NORM > 0.0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), config.GRAD_CLIP_MAX_NORM)
-
-            optimizer.step()
-            scheduler.step()
-
-            batch_size = int(inputs.shape[0])
-            loss_sum += float(total_loss.item()) * batch_size
-            fidelity_sum += float(total_fidelity.item()) * batch_size
-            sample_count += batch_size
-
-        epoch_loss = loss_sum / max(1, sample_count)
-        epoch_fidelity = fidelity_sum / max(1, sample_count)
-        history.epochs.append(epoch)
-        history.train_loss.append(epoch_loss)
-        history.train_fidelity.append(epoch_fidelity)
-
-        if epoch_loss < best_loss:
-            best_loss = epoch_loss
-            best_state = copy.deepcopy(model.state_dict())
-
-        if epoch == 1 or epoch == config.EPOCHS or epoch % max(1, config.EPOCHS // 10) == 0:
-            print(
-                f"  Epoca {epoch:4d}/{config.EPOCHS} | "
-                f"loss={epoch_loss:.6f} | fidelity={epoch_fidelity:.6f} | "
-                f"ss_p={scheduled_sampling_prob:.3f} | rollout_steps={rollout_steps:2d} | "
-                f"lr={optimizer.param_groups[0]['lr']:.2e}"
-            )
+            if epoch % config.CHECKPOINT_EVERY_EPOCH == 0:
+                _save_last_checkpoint(
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    history=history,
+                    epoch=epoch,
+                    best_loss=best_loss,
+                    best_state=best_state,
+                )
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\nInterruzione manuale rilevata (Ctrl+C): salvo checkpoint e genero i risultati correnti...")
+        _save_last_checkpoint(
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            history=history,
+            epoch=last_completed_epoch,
+            best_loss=best_loss,
+            best_state=best_state,
+        )
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -195,6 +311,15 @@ def train_model(model: QuantumSequencePredictor, train_states: torch.Tensor) -> 
     if config.SAVE_MODEL:
         config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
         torch.save(model.state_dict(), config.CHECKPOINT_PATH)
+        _save_last_checkpoint(
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            history=history,
+            epoch=last_completed_epoch if interrupted else config.EPOCHS,
+            best_loss=best_loss,
+            best_state=best_state,
+        )
 
     return history
 
@@ -248,10 +373,10 @@ def evaluate_autoregressive(
     pred_steps = states.shape[1] - 1
     loader = DataLoader(
         states,
-        batch_size=config.BATCH_SIZE,
+        batch_size=max(1, int(config.BATCH_SIZE) // 2),
         shuffle=False,
-        num_workers=config.NUM_WORKERS,
-        pin_memory=bool(config.PIN_MEMORY and config.DEVICE == "cuda"),
+        num_workers=0,
+        pin_memory=False,
     )
 
     loss_sum = torch.zeros(pred_steps, dtype=torch.float64)

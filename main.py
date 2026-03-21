@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+
+import gc
 import json
 from typing import Any
 
@@ -9,10 +13,13 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
+torch.set_num_threads(1)
 
 import config
 from input import generate_fixed_tfim_dataset
 from trainer import (
+    TrainingHistory,
     build_model,
     evaluate_autoregressive,
     evaluate_teacher_forced,
@@ -22,6 +29,53 @@ from trainer import (
     set_seed,
     train_model,
 )
+
+
+def _build_empty_resume_state() -> dict[str, Any]:
+    return {
+        "start_epoch": 1,
+        "history": TrainingHistory(epochs=[], train_loss=[], train_fidelity=[]),
+        "optimizer_state_dict": None,
+        "scheduler_state_dict": None,
+        "best_loss": None,
+        "best_state": None,
+        "resumed": False,
+        "last_epoch": 0,
+    }
+
+
+def _try_resume_from_last_checkpoint(model) -> dict[str, Any]:
+    if not config.AUTO_RESUME:
+        return _build_empty_resume_state()
+    if not config.LAST_CHECKPOINT_PATH.exists():
+        return _build_empty_resume_state()
+
+    try:
+        payload = torch.load(config.LAST_CHECKPOINT_PATH, map_location=config.DEVICE)
+        model.load_state_dict(payload["model_state_dict"])
+        history_payload = payload.get("history", {})
+        history = TrainingHistory(
+            epochs=[int(value) for value in history_payload.get("epochs", [])],
+            train_loss=[float(value) for value in history_payload.get("train_loss", [])],
+            train_fidelity=[float(value) for value in history_payload.get("train_fidelity", [])],
+        )
+        last_epoch = int(payload.get("epoch", 0))
+        return {
+            "start_epoch": last_epoch + 1,
+            "history": history,
+            "optimizer_state_dict": payload.get("optimizer_state_dict"),
+            "scheduler_state_dict": payload.get("scheduler_state_dict"),
+            "best_loss": payload.get("best_loss"),
+            "best_state": payload.get("best_state_dict"),
+            "resumed": last_epoch > 0,
+            "last_epoch": last_epoch,
+        }
+    except Exception as exc:
+        print(
+            "Resume automatico:     checkpoint non leggibile, riparto da epoca 1 "
+            f"({type(exc).__name__})"
+        )
+        return _build_empty_resume_state()
 
 
 def _as_serializable(result) -> dict[str, Any]:
@@ -73,6 +127,12 @@ def _plot_split_curves(
     ax.set_ylim(0.0, 1.02)
     ax.grid(alpha=0.25)
     ax.legend(frameon=False, fontsize=9)
+
+
+def _flush_device_memory():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def main():
@@ -131,18 +191,37 @@ def main():
     model = build_model()
     num_params = sum(parameter.numel() for parameter in model.parameters())
     print(f"Parametri modello:     {num_params:,}")
+    resume_state = _try_resume_from_last_checkpoint(model)
+    if resume_state["resumed"]:
+        print(
+            f"Resume automatico:     checkpoint trovato a epoca {resume_state['last_epoch']}, "
+            f"riparto da epoca {resume_state['start_epoch']}"
+        )
+    else:
+        print("Resume automatico:     nessun checkpoint valido, training da epoca 1")
 
     print("\n[1/4] Training")
-    history = train_model(model, dataset.train.states)
+    history = train_model(
+        model,
+        dataset.train.states,
+        start_epoch=int(resume_state["start_epoch"]),
+        history=resume_state["history"],
+        optimizer_state_dict=resume_state["optimizer_state_dict"],
+        scheduler_state_dict=resume_state["scheduler_state_dict"],
+        best_loss=resume_state["best_loss"],
+        best_state=resume_state["best_state"],
+    )
     plot_training_curves(history)
 
     print("\n[2/4] Valutazione teacher forced")
     train_teacher = evaluate_teacher_forced(model, dataset.train.states)
     test_teacher = evaluate_teacher_forced(model, dataset.test.states)
+    _flush_device_memory()
 
     print("\n[3/4] Valutazione autoregressiva")
     train_rollout = evaluate_autoregressive(model, dataset.train.states, warmup_states=1)
     test_rollout = evaluate_autoregressive(model, dataset.test.states, warmup_states=1)
+    _flush_device_memory()
 
     train_exposure_bias = exposure_bias_detected(
         train_teacher.fidelity_curve,
@@ -177,6 +256,7 @@ def main():
             )
     else:
         print("\n[4/4] Nessun exposure bias marcato: mantengo solo metodo 1 e 2.")
+    _flush_device_memory()
 
     fig, axes = plt.subplots(1, 2, figsize=(16, 5.5), sharey=True)
     _plot_split_curves(
@@ -224,6 +304,10 @@ def main():
             "SCHEDULED_SAMPLING_RAMP_EPOCHS": int(config.SCHEDULED_SAMPLING_RAMP_EPOCHS),
             "ROLLOUT_AUX_WEIGHT": float(config.ROLLOUT_AUX_WEIGHT),
             "ROLLOUT_CURRICULUM_EPOCHS": int(config.ROLLOUT_CURRICULUM_EPOCHS),
+            "AUTO_RESUME": bool(config.AUTO_RESUME),
+            "CHECKPOINT_EVERY_EPOCH": int(config.CHECKPOINT_EVERY_EPOCH),
+            "CHECKPOINT_EVERY_BATCH": int(config.CHECKPOINT_EVERY_BATCH),
+            "EMPTY_CACHE_EVERY_EPOCH": bool(config.EMPTY_CACHE_EVERY_EPOCH),
             "INITIAL_STATE_FAMILY": config.INITIAL_STATE_FAMILY,
             "active_env_overrides": config.get_active_env_overrides(),
         },
@@ -265,6 +349,7 @@ def main():
         "artifacts": {
             "fidelity_plot": str(config.FIDELITY_PLOT_PATH),
             "training_curves_plot": str(config.TRAINING_CURVES_PATH),
+            "last_checkpoint": str(config.LAST_CHECKPOINT_PATH),
             "checkpoint": str(config.CHECKPOINT_PATH),
         },
     }

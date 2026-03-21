@@ -68,6 +68,7 @@ def get_active_env_overrides() -> dict[str, dict[str, object]]:
 PROJECT_ROOT = Path(__file__).resolve().parent
 RESULTS_DIR = PROJECT_ROOT / "results"
 CHECKPOINT_PATH = RESULTS_DIR / "best_model.pt"
+LAST_CHECKPOINT_PATH = RESULTS_DIR / "last_checkpoint.pt"
 SUMMARY_PATH = RESULTS_DIR / "run_summary.json"
 FIDELITY_PLOT_PATH = RESULTS_DIR / "fidelity_vs_time.png"
 TRAINING_CURVES_PATH = RESULTS_DIR / "training_curves.png"
@@ -76,7 +77,7 @@ TRAINING_CURVES_PATH = RESULTS_DIR / "training_curves.png"
 SEED = _env_int("QSP_SEED", 7)
 
 
-N_QUBITS = _env_int("QSP_N_QUBITS", 8)
+N_QUBITS = _env_int("QSP_N_QUBITS", 6)
 if N_QUBITS < 1:
     raise ValueError(f"N_QUBITS deve essere >= 1, ricevuto: {N_QUBITS}")
 
@@ -91,8 +92,8 @@ if NUM_STATES < 2:
 SEQ_LEN = NUM_STATES - 1
 
 
-TRAIN_SEQUENCES = _env_int("QSP_TRAIN_SEQUENCES", 2048)
-TEST_SEQUENCES = _env_int("QSP_TEST_SEQUENCES", 256)
+TRAIN_SEQUENCES = _env_int("QSP_TRAIN_SEQUENCES", 1024)
+TEST_SEQUENCES = _env_int("QSP_TEST_SEQUENCES", 128)
 if TRAIN_SEQUENCES < 1 or TEST_SEQUENCES < 1:
     raise ValueError("TRAIN_SEQUENCES e TEST_SEQUENCES devono essere >= 1.")
 
@@ -146,10 +147,10 @@ if not (0.0 < BASIS_SUPPORT_FRACTION_LIMIT <= 1.0):
     )
 
 
-D_MODEL = _env_int("QSP_D_MODEL", 512)
-NUM_HEADS = _env_int("QSP_NUM_HEADS", 8)
-NUM_LAYERS = _env_int("QSP_NUM_LAYERS", 4)
-DIM_FEEDFORWARD = _env_int("QSP_DIM_FEEDFORWARD", 2048)
+D_MODEL = _env_int("QSP_D_MODEL", 256)
+NUM_HEADS = _env_int("QSP_NUM_HEADS", 4)
+NUM_LAYERS = _env_int("QSP_NUM_LAYERS", 3)
+DIM_FEEDFORWARD = _env_int("QSP_DIM_FEEDFORWARD", 1024)
 DROPOUT = _env_float("QSP_DROPOUT", 0.0)
 if D_MODEL <= 0 or NUM_HEADS <= 0 or NUM_LAYERS <= 0 or DIM_FEEDFORWARD <= 0:
     raise ValueError("D_MODEL, NUM_HEADS, NUM_LAYERS e DIM_FEEDFORWARD devono essere > 0.")
@@ -157,16 +158,16 @@ if D_MODEL % NUM_HEADS != 0:
     raise ValueError("D_MODEL deve essere divisibile per NUM_HEADS.")
 
 
-BATCH_SIZE = _env_int("QSP_BATCH_SIZE", 32)
-EPOCHS = _env_int("QSP_EPOCHS", 200)
+BATCH_SIZE = _env_int("QSP_BATCH_SIZE", 24)
+EPOCHS = _env_int("QSP_EPOCHS", 100)
 LEARNING_RATE = _env_float("QSP_LEARNING_RATE", 1e-4)
 WEIGHT_DECAY = _env_float("QSP_WEIGHT_DECAY", 1e-4)
 GRAD_CLIP_MAX_NORM = _env_float("QSP_GRAD_CLIP_MAX_NORM", 1.0)
 LOG_FIDELITY_EPS = _env_float("QSP_LOG_FIDELITY_EPS", 1e-8)
 SCHEDULED_SAMPLING_MAX_PROB = _env_float("QSP_SCHEDULED_SAMPLING_MAX_PROB", 0.30)
-SCHEDULED_SAMPLING_RAMP_EPOCHS = _env_int("QSP_SCHEDULED_SAMPLING_RAMP_EPOCHS", 120)
+SCHEDULED_SAMPLING_RAMP_EPOCHS = _env_int("QSP_SCHEDULED_SAMPLING_RAMP_EPOCHS", 70)
 ROLLOUT_AUX_WEIGHT = _env_float("QSP_ROLLOUT_AUX_WEIGHT", 0.50)
-ROLLOUT_CURRICULUM_EPOCHS = _env_int("QSP_ROLLOUT_CURRICULUM_EPOCHS", 120)
+ROLLOUT_CURRICULUM_EPOCHS = _env_int("QSP_ROLLOUT_CURRICULUM_EPOCHS", 70)
 if BATCH_SIZE < 1 or EPOCHS < 1:
     raise ValueError("BATCH_SIZE e EPOCHS devono essere >= 1.")
 if LEARNING_RATE <= 0.0:
@@ -199,8 +200,21 @@ PLOT_DPI = _env_int("QSP_PLOT_DPI", 160)
 
 
 NUM_WORKERS = _env_int("QSP_NUM_WORKERS", 0)
-PIN_MEMORY = _env_bool("QSP_PIN_MEMORY", True)
+PIN_MEMORY = _env_bool("QSP_PIN_MEMORY", False)
 SAVE_MODEL = _env_bool("QSP_SAVE_MODEL", True)
+AUTO_RESUME = _env_bool("QSP_AUTO_RESUME", True)
+CHECKPOINT_EVERY_EPOCH = _env_int("QSP_CHECKPOINT_EVERY_EPOCH", 1)
+if CHECKPOINT_EVERY_EPOCH < 1:
+    raise ValueError(
+        f"CHECKPOINT_EVERY_EPOCH deve essere >= 1, ricevuto: {CHECKPOINT_EVERY_EPOCH}"
+    )
+CHECKPOINT_EVERY_BATCH = _env_int("QSP_CHECKPOINT_EVERY_BATCH", 0)
+if CHECKPOINT_EVERY_BATCH < 0:
+    raise ValueError(
+        f"CHECKPOINT_EVERY_BATCH deve essere >= 0, ricevuto: {CHECKPOINT_EVERY_BATCH}"
+    )
+
+EMPTY_CACHE_EVERY_EPOCH = _env_bool("QSP_EMPTY_CACHE_EVERY_EPOCH", True)
 
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
