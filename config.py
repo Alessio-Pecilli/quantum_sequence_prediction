@@ -72,6 +72,7 @@ LAST_CHECKPOINT_PATH = RESULTS_DIR / "last_checkpoint.pt"
 SUMMARY_PATH = RESULTS_DIR / "run_summary.json"
 FIDELITY_PLOT_PATH = RESULTS_DIR / "fidelity_vs_time.png"
 TRAINING_CURVES_PATH = RESULTS_DIR / "training_curves.png"
+OBSERVABLES_PLOT_PATH = RESULTS_DIR / "observables_vs_time.png"
 
 
 SEED = _env_int("QSP_SEED", 7)

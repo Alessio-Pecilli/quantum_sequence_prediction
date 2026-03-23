@@ -4,6 +4,8 @@ import copy
 import gc
 import os
 import random
+import shutil
+import time
 from dataclasses import dataclass
 
 import matplotlib.pyplot as plt
@@ -13,6 +15,7 @@ from torch.utils.data import DataLoader
 
 import config
 from input import QuantumSequenceDataset
+from observables import batch_observables_tfim, precompute_observables
 from predictor import ComplexMSELoss, QuantumSequencePredictor, quantum_fidelity
 
 
@@ -29,6 +32,20 @@ class EvaluationResult:
     mean_fidelity: float
     fidelity_curve: list[float]
     coverage_curve: list[float]
+
+
+@dataclass
+class TrainObservableCurves:
+    """Medie sul training set: traiettoria esatta vs rollout autoregressivo (stesso warmup dell'eval)."""
+
+    time_indices: np.ndarray
+    physical_time: np.ndarray
+    mz_exact: np.ndarray
+    mz_pred: np.ndarray
+    mx_exact: np.ndarray
+    mx_pred: np.ndarray
+    cz_exact: np.ndarray
+    cz_pred: np.ndarray
 
 
 def set_seed(seed: int):
@@ -111,7 +128,26 @@ def _atomic_torch_save(payload: dict, destination: os.PathLike):
     destination_path = os.fspath(destination)
     tmp_path = f"{destination_path}.tmp"
     torch.save(payload, tmp_path)
-    os.replace(tmp_path, destination_path)
+    backoff = 0.05
+    for attempt in range(4):
+        try:
+            os.replace(tmp_path, destination_path)
+            return
+        except (PermissionError, OSError):
+            if attempt < 3:
+                time.sleep(backoff)
+                backoff *= 2.0
+                continue
+            break
+    # Windows: destination may be read-locked (IDE, indexer); replace() can fail while overwrite works.
+    try:
+        shutil.copyfile(tmp_path, destination_path)
+    except OSError:
+        torch.save(payload, destination_path)
+    try:
+        os.unlink(tmp_path)
+    except OSError:
+        pass
 
 
 def _save_last_checkpoint(
@@ -173,7 +209,7 @@ def train_model(
     loader = build_loader(train_states, shuffle=True)
     steps_per_epoch = len(loader)
     use_amp = config.DEVICE == "cuda"
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     # OneCycleLR: warmup sul learning rate per accelerare la convergenza del Transformer.
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
@@ -190,6 +226,11 @@ def train_model(
         optimizer.load_state_dict(optimizer_state_dict)
     if scheduler_state_dict is not None:
         scheduler.load_state_dict(scheduler_state_dict)
+        # last_epoch = batch index; checkpoint "epoch" can still be last_completed_epoch-1
+        # if we saved right after the last batch of an epoch. Avoid replaying a full epoch
+        # and stepping OneCycleLR past total_steps.
+        completed_epochs = int(scheduler.last_epoch) // int(steps_per_epoch)
+        start_epoch = max(int(start_epoch), completed_epochs + 1)
 
     best_loss = float("inf") if best_loss is None else float(best_loss)
 
@@ -239,7 +280,8 @@ def train_model(
 
                 scaler.step(optimizer)
                 scaler.update()
-                scheduler.step()
+                if scheduler.last_epoch < scheduler.total_steps:
+                    scheduler.step()
 
                 batch_size = int(inputs.shape[0])
                 loss_sum += float(total_loss.item()) * batch_size
@@ -420,6 +462,144 @@ def evaluate_autoregressive(
         fidelity_curve=fidelity_curve,
         coverage_curve=coverage_curve,
     )
+
+
+@torch.no_grad()
+def compute_train_observable_curves(
+    model: QuantumSequencePredictor,
+    states: torch.Tensor,
+    warmup_states: int = 1,
+) -> TrainObservableCurves:
+    """
+    Per ogni sequenza del training set: stati esatti dalla Hamiltoniana e stati dal rollout LLM
+    (stesso schema di `evaluate_autoregressive`). Medie di m^z, m^x, c^z sul dataset.
+    """
+    if warmup_states < 1:
+        raise ValueError(f"warmup_states deve essere >= 1, ricevuto {warmup_states}")
+    if warmup_states >= states.shape[1]:
+        raise ValueError(
+            f"warmup_states={warmup_states} deve essere < num_states={states.shape[1]}"
+        )
+
+    device = torch.device(config.DEVICE)
+    model.eval()
+    z_eigs, zz_nn_eigs, _, x_flip_idx = precompute_observables(config.N_QUBITS, device)
+    z_eigs = z_eigs.to(device)
+    zz_nn_eigs = zz_nn_eigs.to(device)
+    x_flip_idx = [idx.to(device) for idx in x_flip_idx]
+
+    num_states = int(states.shape[1])
+    total_sequences = int(states.shape[0])
+
+    exact_mz = torch.zeros(num_states, dtype=torch.float64, device=device)
+    exact_mx = torch.zeros(num_states, dtype=torch.float64, device=device)
+    exact_cz = torch.zeros(num_states, dtype=torch.float64, device=device)
+    pred_mz = torch.zeros(num_states, dtype=torch.float64, device=device)
+    pred_mx = torch.zeros(num_states, dtype=torch.float64, device=device)
+    pred_cz = torch.zeros(num_states, dtype=torch.float64, device=device)
+
+    loader = DataLoader(
+        states,
+        batch_size=max(1, int(config.BATCH_SIZE) // 2),
+        shuffle=False,
+        num_workers=0,
+        pin_memory=False,
+    )
+
+    for batch_states in loader:
+        true_states = batch_states.to(device)
+
+        for t in range(num_states):
+            mz, mx, cz = batch_observables_tfim(
+                true_states[:, t, :],
+                z_eigs,
+                zz_nn_eigs,
+                x_flip_idx,
+            )
+            exact_mz[t] += mz.double().sum()
+            exact_mx[t] += mx.double().sum()
+            exact_cz[t] += cz.double().sum()
+
+        context = true_states[:, :warmup_states, :]
+        for t in range(warmup_states):
+            mz, mx, cz = batch_observables_tfim(
+                true_states[:, t, :],
+                z_eigs,
+                zz_nn_eigs,
+                x_flip_idx,
+            )
+            pred_mz[t] += mz.double().sum()
+            pred_mx[t] += mx.double().sum()
+            pred_cz[t] += cz.double().sum()
+
+        for t in range(warmup_states, num_states):
+            predicted_next = model(context)[:, -1, :]
+            mz, mx, cz = batch_observables_tfim(
+                predicted_next,
+                z_eigs,
+                zz_nn_eigs,
+                x_flip_idx,
+            )
+            pred_mz[t] += mz.double().sum()
+            pred_mx[t] += mx.double().sum()
+            pred_cz[t] += cz.double().sum()
+            context = torch.cat([context, predicted_next.unsqueeze(1)], dim=1)
+
+    scale = float(max(1, total_sequences))
+    time_indices = np.arange(num_states, dtype=np.float64)
+    physical_time = time_indices * float(config.TIME_STEP)
+
+    inv_scale = 1.0 / scale
+    return TrainObservableCurves(
+        time_indices=time_indices,
+        physical_time=physical_time,
+        mz_exact=(exact_mz * inv_scale).cpu().numpy(),
+        mz_pred=(pred_mz * inv_scale).cpu().numpy(),
+        mx_exact=(exact_mx * inv_scale).cpu().numpy(),
+        mx_pred=(pred_mx * inv_scale).cpu().numpy(),
+        cz_exact=(exact_cz * inv_scale).cpu().numpy(),
+        cz_pred=(pred_cz * inv_scale).cpu().numpy(),
+    )
+
+
+def plot_train_observables(curves: TrainObservableCurves, warmup_states: int):
+    config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4.8), sharex=True)
+
+    t = curves.physical_time
+    axes[0].plot(t, curves.mz_exact, label="Esatto (Hamiltoniana)", color="#1f618d", linewidth=2.2)
+    axes[0].plot(t, curves.mz_pred, label="Predetto (LLM rollout)", color="#b03a2e", linewidth=2.2)
+    axes[0].set_title(r"Magnetizzazione $m^z = \frac{1}{N}\sum_i \langle Z_i \rangle$")
+    axes[0].set_ylabel(r"$m^z$")
+    axes[0].grid(alpha=0.25)
+    axes[0].legend(frameon=False, fontsize=9)
+
+    axes[1].plot(t, curves.mx_exact, label="Esatto (Hamiltoniana)", color="#1f618d", linewidth=2.2)
+    axes[1].plot(t, curves.mx_pred, label="Predetto (LLM rollout)", color="#b03a2e", linewidth=2.2)
+    axes[1].set_title(r"Magnetizzazione $m^x = \frac{1}{N}\sum_i \langle X_i \rangle$")
+    axes[1].set_ylabel(r"$m^x$")
+    axes[1].grid(alpha=0.25)
+    axes[1].legend(frameon=False, fontsize=9)
+
+    axes[2].plot(t, curves.cz_exact, label="Esatto (Hamiltoniana)", color="#1f618d", linewidth=2.2)
+    axes[2].plot(t, curves.cz_pred, label="Predetto (LLM rollout)", color="#b03a2e", linewidth=2.2)
+    axes[2].set_title(
+        r"Correlazione NN $c^z = \frac{2}{N(N-1)}\sum_{\langle i,j\rangle}\langle Z_i Z_j\rangle$"
+    )
+    axes[2].set_ylabel(r"$c^z$")
+    axes[2].grid(alpha=0.25)
+    axes[2].legend(frameon=False, fontsize=9)
+
+    axes[2].set_xlabel(r"Tempo $t = k\,\Delta t$ (indice stato $k$)")
+
+    fig.suptitle(
+        f"Osservabili | training set | "
+        f"{curves.time_indices.size} stati per traiettoria, warmup={warmup_states}",
+        fontsize=13,
+    )
+    fig.tight_layout()
+    fig.savefig(config.OBSERVABLES_PLOT_PATH, dpi=config.PLOT_DPI, bbox_inches="tight")
+    plt.close(fig)
 
 
 def exposure_bias_detected(

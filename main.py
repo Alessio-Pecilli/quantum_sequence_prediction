@@ -17,13 +17,21 @@ import torch
 torch.set_num_threads(1)
 
 import config
-from input import generate_fixed_tfim_dataset
+from input import (
+    build_initial_states,
+    build_tfim_hamiltonian,
+    compute_evolution_operator,
+    evolve_sequences,
+    generate_fixed_tfim_dataset,
+)
 from trainer import (
     TrainingHistory,
     build_model,
+    compute_train_observable_curves,
     evaluate_autoregressive,
     evaluate_teacher_forced,
     exposure_bias_detected,
+    plot_train_observables,
     plot_training_curves,
     resolve_partial_warmup_steps,
     set_seed,
@@ -135,6 +143,125 @@ def _flush_device_memory():
         torch.cuda.empty_cache()
 
 
+def _resolve_three_n1_values(seq_len: int) -> list[int]:
+    """
+    Seleziona automaticamente 3 valori sensati per N_1 (dimensione del contesto vero).
+    N_1 deve stare in [1, seq_len].
+    """
+    seq_len = int(seq_len)
+    if seq_len < 3:
+        # Caso piccolo: prendiamo i primi valori unici disponibili.
+        return list(range(1, seq_len + 1))[:3]
+
+    candidates = [1, max(1, seq_len // 2), max(1, seq_len - 1)]
+    unique: list[int] = []
+    seen: set[int] = set()
+    for v in candidates:
+        if 1 <= v <= seq_len and v not in seen:
+            unique.append(v)
+            seen.add(v)
+
+    if len(unique) >= 3:
+        return unique[:3]
+
+    for v in range(1, seq_len + 1):
+        if v not in seen:
+            unique.append(v)
+            seen.add(v)
+        if len(unique) >= 3:
+            break
+    return unique[:3]
+
+
+@torch.no_grad()
+def _generate_test_states_with_h_new_tfim(
+    test_initial_state_codes: list[int],
+    initial_state_family: str,
+    *,
+    seed: int,
+    n_qubits: int,
+    num_states: int,
+) -> tuple[torch.Tensor, dict[str, object]]:
+    """
+    Crea un test set generando traiettorie con una Hamiltoniana TFIM fissata H_new:
+      - campo trasverso uguale a config.FIELD_STRENGTH
+      - couplings J_i ~ Normal(mean=1, std=1) (varianza 1)
+    """
+    n_qubits = int(n_qubits)
+    num_states = int(num_states)
+    if n_qubits < 1:
+        raise ValueError(f"n_qubits deve essere >= 1, ricevuto: {n_qubits}")
+    if num_states < 2:
+        raise ValueError(f"num_states deve essere >= 2, ricevuto: {num_states}")
+
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(seed))
+
+    if n_qubits == 1:
+        couplings = torch.empty((0,), dtype=torch.float32)
+    else:
+        couplings = torch.normal(
+            mean=1.0,
+            std=1.0,
+            size=(n_qubits - 1,),
+            generator=generator,
+        ).to(torch.float32)
+
+    hamiltonian = build_tfim_hamiltonian(
+        n_qubits=n_qubits,
+        couplings=couplings,
+        field_strength=float(config.FIELD_STRENGTH),
+    )
+    evolution_operator, backend = compute_evolution_operator(hamiltonian, float(config.TIME_STEP))
+
+    initial_states = build_initial_states(
+        codes=list(test_initial_state_codes),
+        family=str(initial_state_family),
+        n_qubits=n_qubits,
+    )
+    states = evolve_sequences(
+        initial_states=initial_states,
+        evolution_operator=evolution_operator,
+        num_states=num_states,
+        device=config.DEVICE,
+    )
+
+    h_new_payload = {
+        "couplings": [float(value) for value in couplings.tolist()],
+        "field_strength": float(config.FIELD_STRENGTH),
+        "backend": backend,
+    }
+    return states, h_new_payload
+
+
+@torch.no_grad()
+def _exposure_bias_gap_and_detected(
+    teacher_forced_curve: list[float],
+    autoregressive_curve: list[float],
+) -> tuple[float, bool]:
+    """
+    Gap alla coda e rilevamento (coerente con la logica di `exposure_bias_detected`):
+      gap = mean( teacher_tail - rollout_tail )
+      drop = mean( rollout_head - rollout_tail )
+    """
+    tf = torch.tensor(teacher_forced_curve, dtype=torch.float32)
+    ar = torch.tensor(autoregressive_curve, dtype=torch.float32)
+    valid = torch.isfinite(ar)
+    if valid.sum() < 4:
+        return float("nan"), False
+
+    tf_valid = tf[valid]
+    ar_valid = ar[valid]
+    tail = max(1, int(ar_valid.numel()) // 4)
+
+    gap = float((tf_valid[-tail:] - ar_valid[-tail:]).mean().item())
+    drop = float((ar_valid[:tail].mean() - ar_valid[-tail:].mean()).item())
+    detected = gap >= float(config.EXPOSURE_BIAS_GAP_THRESHOLD) and drop >= float(
+        config.EXPOSURE_BIAS_DROP_THRESHOLD
+    )
+    return gap, bool(detected)
+
+
 def main():
     # Usa i valori di `config.py` (eventualmente sovrascrivibili via env vars).
 
@@ -215,12 +342,37 @@ def main():
 
     print("\n[2/4] Valutazione teacher forced")
     train_teacher = evaluate_teacher_forced(model, dataset.train.states)
-    test_teacher = evaluate_teacher_forced(model, dataset.test.states)
+    h_new_seed = int(config.SEED) + 999
+    test_states_h_new, h_new_payload = _generate_test_states_with_h_new_tfim(
+        dataset.test.initial_state_codes,
+        dataset.test.initial_state_family,
+        seed=h_new_seed,
+        n_qubits=config.N_QUBITS,
+        num_states=config.NUM_STATES,
+    )
+    print("\nHamiltoniana H_new (test set, TFIM)")
+    print(
+        f"  couplings J_i ~ Normal(mean=1, var=1), seed={h_new_seed}. "
+        f"field_strength={h_new_payload['field_strength']:.3f}, dt={config.TIME_STEP:.3f}, "
+        f"backend={h_new_payload['backend']}"
+    )
+    print("  J_i: " + ", ".join(f"{value:.4f}" for value in h_new_payload["couplings"]))
+    test_teacher = evaluate_teacher_forced(model, test_states_h_new)
     _flush_device_memory()
 
     print("\n[3/4] Valutazione autoregressiva")
-    train_rollout = evaluate_autoregressive(model, dataset.train.states, warmup_states=1)
-    test_rollout = evaluate_autoregressive(model, dataset.test.states, warmup_states=1)
+    rollout_warmup = 1
+    train_rollout = evaluate_autoregressive(model, dataset.train.states, warmup_states=rollout_warmup)
+    test_rollout = evaluate_autoregressive(model, test_states_h_new, warmup_states=rollout_warmup)
+    _flush_device_memory()
+
+    print("\n[3b] Osservabili (training set: esatto vs rollout)")
+    train_obs_curves = compute_train_observable_curves(
+        model,
+        dataset.train.states,
+        warmup_states=rollout_warmup,
+    )
+    plot_train_observables(train_obs_curves, warmup_states=rollout_warmup)
     _flush_device_memory()
 
     train_exposure_bias = exposure_bias_detected(
@@ -251,7 +403,7 @@ def main():
             )
             partial_results_test[warmup_n1] = evaluate_autoregressive(
                 model,
-                dataset.test.states,
+                test_states_h_new,
                 warmup_states=warmup_states,
             )
     else:
@@ -285,6 +437,64 @@ def main():
     print(
         f"  Test  | teacher={test_teacher.mean_fidelity:.6f} | rollout={test_rollout.mean_fidelity:.6f}"
     )
+
+    # --- Plot exposure bias vs numero stati veri in input (fase di test) ---
+    n1_values = _resolve_three_n1_values(config.SEQ_LEN)
+    bias_gaps: list[float] = []
+    detected_flags: list[bool] = []
+
+    print("\n[5/5] Exposure bias vs N_1 (test set con H_new)")
+    for n1 in n1_values:
+        test_rollout_n1 = evaluate_autoregressive(model, test_states_h_new, warmup_states=n1)
+        gap, detected = _exposure_bias_gap_and_detected(
+            test_teacher.fidelity_curve,
+            test_rollout_n1.fidelity_curve,
+        )
+        bias_gaps.append(gap)
+        detected_flags.append(detected)
+        gap_str = "nan" if not np.isfinite(gap) else f"{gap:.6f}"
+        print(f"  N_1={n1:2d} | exposure_bias_gap={gap_str} | detected={detected}")
+        _flush_device_memory()
+
+    exposure_bias_plot_path = config.RESULTS_DIR / "exposure_bias_vs_N1.png"
+    fig, ax = plt.subplots(figsize=(9.5, 4.8))
+    x = np.array(n1_values, dtype=np.int32)
+    y = np.array(bias_gaps, dtype=np.float64)
+    finite_mask = np.isfinite(y)
+
+    if finite_mask.any():
+        det_mask = np.array(detected_flags, dtype=bool) & finite_mask
+        non_det_mask = (~np.array(detected_flags, dtype=bool)) & finite_mask
+
+        if det_mask.any():
+            ax.scatter(x[det_mask], y[det_mask], color="#117a65", s=75, label="rilevato")
+        if non_det_mask.any():
+            ax.scatter(
+                x[non_det_mask],
+                y[non_det_mask],
+                color="#b03a2e",
+                s=75,
+                label="non rilevato",
+            )
+        ax.plot(x[finite_mask], y[finite_mask], color="#566573", linewidth=2.0, alpha=0.9)
+
+    ax.axhline(
+        float(config.EXPOSURE_BIAS_GAP_THRESHOLD),
+        color="gray",
+        linestyle="--",
+        linewidth=1.4,
+        label="soglia (gap)",
+    )
+    ax.set_title("Exposure bias vs N_1 (test con Hamiltoniana H_new)")
+    ax.set_xlabel("N_1 = numero di stati veri in input (warmup_states)")
+    ax.set_ylabel("gap = mean(teacher_tail - rollout_tail)")
+    ax.grid(alpha=0.25)
+    ax.legend(frameon=False, fontsize=9)
+    fig.tight_layout()
+    fig.savefig(exposure_bias_plot_path, dpi=config.PLOT_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+    print(f"Plot exposure bias: {exposure_bias_plot_path}")
 
     summary = {
         "seed": int(config.SEED),
@@ -324,6 +534,13 @@ def main():
             "field_strength": float(dataset.hamiltonian.field_strength),
             "backend": dataset.hamiltonian.backend,
         },
+        "test_h_new": {
+            "seed": int(h_new_seed),
+            "couplings": h_new_payload["couplings"],
+            "field_strength": float(h_new_payload["field_strength"]),
+            "backend": h_new_payload["backend"],
+            "initial_state_family": dataset.test.initial_state_family,
+        },
         "training_history": {
             "epochs": history.epochs,
             "train_loss": history.train_loss,
@@ -345,12 +562,32 @@ def main():
             "test_partial_warmups": {
                 str(key): _as_serializable(value) for key, value in partial_results_test.items()
             },
+            "exposure_bias_vs_n1": {
+                "n1_values": [int(v) for v in n1_values],
+                "gap_values": [float(v) if np.isfinite(v) else None for v in bias_gaps],
+                "detected_flags": [bool(v) for v in detected_flags],
+                "gap_threshold": float(config.EXPOSURE_BIAS_GAP_THRESHOLD),
+                "drop_threshold": float(config.EXPOSURE_BIAS_DROP_THRESHOLD),
+            },
         },
         "artifacts": {
             "fidelity_plot": str(config.FIDELITY_PLOT_PATH),
             "training_curves_plot": str(config.TRAINING_CURVES_PATH),
+            "observables_plot": str(config.OBSERVABLES_PLOT_PATH),
+            "exposure_bias_plot": str(exposure_bias_plot_path),
             "last_checkpoint": str(config.LAST_CHECKPOINT_PATH),
             "checkpoint": str(config.CHECKPOINT_PATH),
+        },
+        "train_observables": {
+            "time_indices": train_obs_curves.time_indices.tolist(),
+            "physical_time": train_obs_curves.physical_time.tolist(),
+            "mz_exact": train_obs_curves.mz_exact.tolist(),
+            "mz_pred": train_obs_curves.mz_pred.tolist(),
+            "mx_exact": train_obs_curves.mx_exact.tolist(),
+            "mx_pred": train_obs_curves.mx_pred.tolist(),
+            "cz_exact": train_obs_curves.cz_exact.tolist(),
+            "cz_pred": train_obs_curves.cz_pred.tolist(),
+            "rollout_warmup_states": int(rollout_warmup),
         },
     }
 
@@ -359,6 +596,7 @@ def main():
 
     print(f"\nPlot fidelity:         {config.FIDELITY_PLOT_PATH}")
     print(f"Plot training:         {config.TRAINING_CURVES_PATH}")
+    print(f"Plot osservabili:      {config.OBSERVABLES_PLOT_PATH}")
     print(f"Summary JSON:          {config.SUMMARY_PATH}")
     if config.SAVE_MODEL:
         print(f"Checkpoint:            {config.CHECKPOINT_PATH}")

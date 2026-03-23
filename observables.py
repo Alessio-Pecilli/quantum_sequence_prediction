@@ -113,6 +113,55 @@ def batch_observables(
     return mz, mx, cz, zz_corr_all, z_sites
 
 
+@torch.no_grad()
+def batch_observables_tfim(
+    states: torch.Tensor,
+    z_eigs: torch.Tensor,
+    zz_nn_eigs: torch.Tensor,
+    x_flip_idx: list[torch.Tensor],
+):
+    """
+    Per confronti con la TFIM (catena aperta):
+
+      m^z = (1/N) * sum_i <Z_i>
+      m^x = (1/N) * sum_i <X_i>
+      c^z = (2 / (N (N-1))) * sum_{<i,j> NN} <Z_i Z_j>
+
+    dove la somma è sulle coppie ordinate di primi vicini (N-1 legami per catena aperta).
+    Per N=1, c^z = 0.
+    """
+    if states.ndim != 2:
+        raise ValueError(f"states deve avere shape (batch, dim), ricevuto: {tuple(states.shape)}")
+
+    batch, dim = states.shape
+    n_qubits = int(z_eigs.shape[0])
+    if dim != int(z_eigs.shape[1]):
+        raise ValueError(f"dim mismatch: states dim={dim}, z_eigs dim={int(z_eigs.shape[1])}")
+
+    probs = torch.abs(states) ** 2
+    probs = probs.to(torch.float32)
+
+    exp_z_sites = probs @ z_eigs.T
+    mz = exp_z_sites.mean(dim=1)
+
+    if n_qubits >= 2:
+        exp_zz_pairs = probs @ zz_nn_eigs.T
+        sum_nn = exp_zz_pairs.sum(dim=1)
+        cz = (2.0 / (n_qubits * (n_qubits - 1))) * sum_nn
+    else:
+        cz = torch.zeros((batch,), device=states.device, dtype=torch.float32)
+
+    psi_conj = states.conj()
+    mx_sum = torch.zeros((batch,), device=states.device, dtype=torch.float32)
+    for i in range(n_qubits):
+        flipped = states[:, x_flip_idx[i]]
+        exp_x_i = torch.sum(psi_conj * flipped, dim=1)
+        mx_sum += exp_x_i.real.to(torch.float32)
+    mx = mx_sum / max(1, n_qubits)
+
+    return mz, mx, cz
+
+
 def batch_observables_diff(
     states: torch.Tensor,
     z_eigs: torch.Tensor,
