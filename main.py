@@ -6,6 +6,7 @@ os.environ["MKL_NUM_THREADS"] = "1"
 
 import gc
 import json
+import random
 from typing import Any
 
 import matplotlib
@@ -27,11 +28,11 @@ from input import (
 from trainer import (
     TrainingHistory,
     build_model,
-    compute_train_observable_curves,
+    compute_observable_curves,
     evaluate_autoregressive,
     evaluate_teacher_forced,
     exposure_bias_detected,
-    plot_train_observables,
+    plot_observable_curves,
     plot_training_curves,
     resolve_partial_warmup_steps,
     set_seed,
@@ -171,6 +172,38 @@ def _resolve_three_n1_values(seq_len: int) -> list[int]:
         if len(unique) >= 3:
             break
     return unique[:3]
+
+
+@torch.no_grad()
+def _generate_test_states_traditional(
+    test_sequences: int,
+    evolution_operator: torch.Tensor,
+    *,
+    seed: int,
+    n_qubits: int,
+    num_states: int,
+) -> tuple[torch.Tensor, list[int]]:
+    """
+    Test tradizionale:
+      - Hamiltoniana identica al training (stesso U fissato)
+      - stato iniziale scelto random dalla base computazionale, con rimpiazzo
+      - traiettoria: psi(k) = U^k psi(0)
+    """
+    rng = random.Random(int(seed))
+    dim = 2**int(n_qubits)
+    initial_state_codes = [rng.randrange(dim) for _ in range(int(test_sequences))]
+    initial_states = build_initial_states(
+        codes=initial_state_codes,
+        family="basis",
+        n_qubits=int(n_qubits),
+    )
+    states = evolve_sequences(
+        initial_states=initial_states,
+        evolution_operator=evolution_operator,
+        num_states=int(num_states),
+        device=config.DEVICE,
+    )
+    return states, initial_state_codes
 
 
 @torch.no_grad()
@@ -340,8 +373,18 @@ def main():
     )
     plot_training_curves(history)
 
-    print("\n[2/4] Valutazione teacher forced")
+    print("\n[2/5] Valutazione teacher forced")
     train_teacher = evaluate_teacher_forced(model, dataset.train.states)
+    traditional_seed = int(config.SEED) + 777
+    test_states_traditional, traditional_codes = _generate_test_states_traditional(
+        test_sequences=config.TEST_SEQUENCES,
+        evolution_operator=dataset.hamiltonian.evolution_operator,
+        seed=traditional_seed,
+        n_qubits=config.N_QUBITS,
+        num_states=config.NUM_STATES,
+    )
+    test_teacher_traditional = evaluate_teacher_forced(model, test_states_traditional)
+
     h_new_seed = int(config.SEED) + 999
     test_states_h_new, h_new_payload = _generate_test_states_with_h_new_tfim(
         dataset.test.initial_state_codes,
@@ -357,43 +400,80 @@ def main():
         f"backend={h_new_payload['backend']}"
     )
     print("  J_i: " + ", ".join(f"{value:.4f}" for value in h_new_payload["couplings"]))
-    test_teacher = evaluate_teacher_forced(model, test_states_h_new)
+    test_teacher_h_new = evaluate_teacher_forced(model, test_states_h_new)
     _flush_device_memory()
 
-    print("\n[3/4] Valutazione autoregressiva")
-    rollout_warmup = 1
+    print("\n[3/5] Valutazione autoregressiva")
+    rollout_warmup = int(config.ROLLOUT_WARMUP_STATES)
     train_rollout = evaluate_autoregressive(model, dataset.train.states, warmup_states=rollout_warmup)
-    test_rollout = evaluate_autoregressive(model, test_states_h_new, warmup_states=rollout_warmup)
+    test_rollout_traditional = evaluate_autoregressive(
+        model,
+        test_states_traditional,
+        warmup_states=rollout_warmup,
+    )
+    test_rollout_h_new = evaluate_autoregressive(model, test_states_h_new, warmup_states=rollout_warmup)
     _flush_device_memory()
 
-    print("\n[3b] Osservabili (training set: esatto vs rollout)")
-    train_obs_curves = compute_train_observable_curves(
+    print("\n[4/5] Osservabili (esatto vs rollout)")
+    train_obs_curves = compute_observable_curves(
         model,
         dataset.train.states,
         warmup_states=rollout_warmup,
     )
-    plot_train_observables(train_obs_curves, warmup_states=rollout_warmup)
+    traditional_obs_curves = compute_observable_curves(
+        model,
+        test_states_traditional,
+        warmup_states=rollout_warmup,
+    )
+    h_new_obs_curves = compute_observable_curves(
+        model,
+        test_states_h_new,
+        warmup_states=rollout_warmup,
+    )
+    train_obs_path = config.RESULTS_DIR / "observables_train_vs_rollout.png"
+    test_traditional_obs_path = config.RESULTS_DIR / "observables_test_traditional_vs_rollout.png"
+    test_h_new_obs_path = config.RESULTS_DIR / "observables_test_h_new_vs_rollout.png"
+    plot_observable_curves(
+        train_obs_curves,
+        warmup_states=rollout_warmup,
+        output_path=train_obs_path,
+        title=f"Osservabili | train | {config.NUM_STATES} stati, warmup={rollout_warmup}",
+    )
+    plot_observable_curves(
+        traditional_obs_curves,
+        warmup_states=rollout_warmup,
+        output_path=test_traditional_obs_path,
+        title=f"Osservabili | test tradizionale (H train) | {config.NUM_STATES} stati, warmup={rollout_warmup}",
+    )
+    plot_observable_curves(
+        h_new_obs_curves,
+        warmup_states=rollout_warmup,
+        output_path=test_h_new_obs_path,
+        title=f"Osservabili | test H_new gaussiana | {config.NUM_STATES} stati, warmup={rollout_warmup}",
+    )
     _flush_device_memory()
 
     train_exposure_bias = exposure_bias_detected(
         train_teacher.fidelity_curve,
         train_rollout.fidelity_curve,
     )
-    test_exposure_bias = exposure_bias_detected(
-        test_teacher.fidelity_curve,
-        test_rollout.fidelity_curve,
+    test_exposure_bias_traditional = exposure_bias_detected(
+        test_teacher_traditional.fidelity_curve,
+        test_rollout_traditional.fidelity_curve,
     )
-    add_partial_curves = train_exposure_bias or test_exposure_bias
+    test_exposure_bias_h_new = exposure_bias_detected(
+        test_teacher_h_new.fidelity_curve,
+        test_rollout_h_new.fidelity_curve,
+    )
+    add_partial_curves = train_exposure_bias or test_exposure_bias_traditional or test_exposure_bias_h_new
 
     partial_results_train: dict[int, Any] = {}
-    partial_results_test: dict[int, Any] = {}
+    partial_results_test_traditional: dict[int, Any] = {}
+    partial_results_test_h_new: dict[int, Any] = {}
     warmup_n1_values: list[int] = []
     if add_partial_curves:
         warmup_n1_values = resolve_partial_warmup_steps(config.SEQ_LEN)
-        print(
-            "\n[4/4] Exposure bias rilevato, aggiungo warmup parziali N1="
-            + ", ".join(str(value) for value in warmup_n1_values)
-        )
+        print("\n[5/5] Exposure bias rilevato, aggiungo warmup parziali N1=" + ", ".join(str(value) for value in warmup_n1_values))
         for warmup_n1 in warmup_n1_values:
             warmup_states = warmup_n1 + 1
             partial_results_train[warmup_n1] = evaluate_autoregressive(
@@ -401,16 +481,21 @@ def main():
                 dataset.train.states,
                 warmup_states=warmup_states,
             )
-            partial_results_test[warmup_n1] = evaluate_autoregressive(
+            partial_results_test_traditional[warmup_n1] = evaluate_autoregressive(
+                model,
+                test_states_traditional,
+                warmup_states=warmup_states,
+            )
+            partial_results_test_h_new[warmup_n1] = evaluate_autoregressive(
                 model,
                 test_states_h_new,
                 warmup_states=warmup_states,
             )
     else:
-        print("\n[4/4] Nessun exposure bias marcato: mantengo solo metodo 1 e 2.")
+        print("\n[5/5] Nessun exposure bias marcato: mantengo solo metodo 1 e 2.")
     _flush_device_memory()
 
-    fig, axes = plt.subplots(1, 2, figsize=(16, 5.5), sharey=True)
+    fig, axes = plt.subplots(1, 3, figsize=(23, 5.5), sharey=True)
     _plot_split_curves(
         axes[0],
         "Train Set",
@@ -420,12 +505,19 @@ def main():
     )
     _plot_split_curves(
         axes[1],
-        "Test Set",
-        test_teacher,
-        test_rollout,
-        partial_results_test,
+        "Test Tradizionale (H train)",
+        test_teacher_traditional,
+        test_rollout_traditional,
+        partial_results_test_traditional,
     )
-    fig.suptitle("Fidelity vero vs predetto in funzione del tempo", fontsize=14)
+    _plot_split_curves(
+        axes[2],
+        "Test H_new (gaussiana)",
+        test_teacher_h_new,
+        test_rollout_h_new,
+        partial_results_test_h_new,
+    )
+    fig.suptitle("Fidelity vero vs predetto: train, test tradizionale, test H_new", fontsize=14)
     fig.tight_layout()
     fig.savefig(config.FIDELITY_PLOT_PATH, dpi=config.PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
@@ -435,48 +527,73 @@ def main():
         f"  Train | teacher={train_teacher.mean_fidelity:.6f} | rollout={train_rollout.mean_fidelity:.6f}"
     )
     print(
-        f"  Test  | teacher={test_teacher.mean_fidelity:.6f} | rollout={test_rollout.mean_fidelity:.6f}"
+        f"  Test tradizionale | teacher={test_teacher_traditional.mean_fidelity:.6f} | rollout={test_rollout_traditional.mean_fidelity:.6f}"
+    )
+    print(
+        f"  Test H_new        | teacher={test_teacher_h_new.mean_fidelity:.6f} | rollout={test_rollout_h_new.mean_fidelity:.6f}"
     )
 
     # --- Plot exposure bias vs numero stati veri in input (fase di test) ---
     n1_values = _resolve_three_n1_values(config.SEQ_LEN)
-    bias_gaps: list[float] = []
-    detected_flags: list[bool] = []
+    bias_gaps_traditional: list[float] = []
+    detected_flags_traditional: list[bool] = []
+    bias_gaps_h_new: list[float] = []
+    detected_flags_h_new: list[bool] = []
 
-    print("\n[5/5] Exposure bias vs N_1 (test set con H_new)")
+    print("\nExposure bias vs N_1 (entrambi i test set)")
     for n1 in n1_values:
-        test_rollout_n1 = evaluate_autoregressive(model, test_states_h_new, warmup_states=n1)
-        gap, detected = _exposure_bias_gap_and_detected(
-            test_teacher.fidelity_curve,
-            test_rollout_n1.fidelity_curve,
+        test_rollout_n1_traditional = evaluate_autoregressive(
+            model,
+            test_states_traditional,
+            warmup_states=n1,
         )
-        bias_gaps.append(gap)
-        detected_flags.append(detected)
-        gap_str = "nan" if not np.isfinite(gap) else f"{gap:.6f}"
-        print(f"  N_1={n1:2d} | exposure_bias_gap={gap_str} | detected={detected}")
+        gap_traditional, detected_traditional = _exposure_bias_gap_and_detected(
+            test_teacher_traditional.fidelity_curve,
+            test_rollout_n1_traditional.fidelity_curve,
+        )
+        test_rollout_n1_h_new = evaluate_autoregressive(model, test_states_h_new, warmup_states=n1)
+        gap_h_new, detected_h_new = _exposure_bias_gap_and_detected(
+            test_teacher_h_new.fidelity_curve,
+            test_rollout_n1_h_new.fidelity_curve,
+        )
+        bias_gaps_traditional.append(gap_traditional)
+        detected_flags_traditional.append(detected_traditional)
+        bias_gaps_h_new.append(gap_h_new)
+        detected_flags_h_new.append(detected_h_new)
+        gap_traditional_str = "nan" if not np.isfinite(gap_traditional) else f"{gap_traditional:.6f}"
+        gap_h_new_str = "nan" if not np.isfinite(gap_h_new) else f"{gap_h_new:.6f}"
+        print(
+            f"  N_1={n1:2d} | trad_gap={gap_traditional_str}, trad_det={detected_traditional} | "
+            f"hnew_gap={gap_h_new_str}, hnew_det={detected_h_new}"
+        )
         _flush_device_memory()
 
     exposure_bias_plot_path = config.RESULTS_DIR / "exposure_bias_vs_N1.png"
     fig, ax = plt.subplots(figsize=(9.5, 4.8))
     x = np.array(n1_values, dtype=np.int32)
-    y = np.array(bias_gaps, dtype=np.float64)
-    finite_mask = np.isfinite(y)
+    y_trad = np.array(bias_gaps_traditional, dtype=np.float64)
+    y_h_new = np.array(bias_gaps_h_new, dtype=np.float64)
 
-    if finite_mask.any():
-        det_mask = np.array(detected_flags, dtype=bool) & finite_mask
-        non_det_mask = (~np.array(detected_flags, dtype=bool)) & finite_mask
-
-        if det_mask.any():
-            ax.scatter(x[det_mask], y[det_mask], color="#117a65", s=75, label="rilevato")
-        if non_det_mask.any():
-            ax.scatter(
-                x[non_det_mask],
-                y[non_det_mask],
-                color="#b03a2e",
-                s=75,
-                label="non rilevato",
-            )
-        ax.plot(x[finite_mask], y[finite_mask], color="#566573", linewidth=2.0, alpha=0.9)
+    finite_trad = np.isfinite(y_trad)
+    finite_h_new = np.isfinite(y_h_new)
+    if finite_trad.any():
+        ax.plot(
+            x[finite_trad],
+            y_trad[finite_trad],
+            color="#1f618d",
+            linewidth=2.0,
+            marker="o",
+            label="test tradizionale",
+        )
+    if finite_h_new.any():
+        ax.plot(
+            x[finite_h_new],
+            y_h_new[finite_h_new],
+            color="#b03a2e",
+            linewidth=2.0,
+            marker="s",
+            label="test H_new",
+        )
 
     ax.axhline(
         float(config.EXPOSURE_BIAS_GAP_THRESHOLD),
@@ -485,7 +602,7 @@ def main():
         linewidth=1.4,
         label="soglia (gap)",
     )
-    ax.set_title("Exposure bias vs N_1 (test con Hamiltoniana H_new)")
+    ax.set_title("Exposure bias vs N_1 (test tradizionale e H_new)")
     ax.set_xlabel("N_1 = numero di stati veri in input (warmup_states)")
     ax.set_ylabel("gap = mean(teacher_tail - rollout_tail)")
     ax.grid(alpha=0.25)
@@ -528,6 +645,7 @@ def main():
             "initial_state_family_reason": dataset.initial_state_family_reason,
             "train_initial_state_codes": dataset.train.initial_state_codes,
             "test_initial_state_codes": dataset.test.initial_state_codes,
+            "test_traditional_initial_state_codes": traditional_codes,
         },
         "hamiltonian": {
             "couplings": dataset.hamiltonian.couplings,
@@ -549,23 +667,34 @@ def main():
         "evaluation": {
             "train_teacher_forced": _as_serializable(train_teacher),
             "train_autoregressive": _as_serializable(train_rollout),
-            "test_teacher_forced": _as_serializable(test_teacher),
-            "test_autoregressive": _as_serializable(test_rollout),
+            "test_traditional_teacher_forced": _as_serializable(test_teacher_traditional),
+            "test_traditional_autoregressive": _as_serializable(test_rollout_traditional),
+            "test_h_new_teacher_forced": _as_serializable(test_teacher_h_new),
+            "test_h_new_autoregressive": _as_serializable(test_rollout_h_new),
             "exposure_bias": {
                 "train": bool(train_exposure_bias),
-                "test": bool(test_exposure_bias),
+                "test_traditional": bool(test_exposure_bias_traditional),
+                "test_h_new": bool(test_exposure_bias_h_new),
             },
             "partial_warmup_n1_values": warmup_n1_values,
             "train_partial_warmups": {
                 str(key): _as_serializable(value) for key, value in partial_results_train.items()
             },
-            "test_partial_warmups": {
-                str(key): _as_serializable(value) for key, value in partial_results_test.items()
+            "test_traditional_partial_warmups": {
+                str(key): _as_serializable(value)
+                for key, value in partial_results_test_traditional.items()
+            },
+            "test_h_new_partial_warmups": {
+                str(key): _as_serializable(value) for key, value in partial_results_test_h_new.items()
             },
             "exposure_bias_vs_n1": {
                 "n1_values": [int(v) for v in n1_values],
-                "gap_values": [float(v) if np.isfinite(v) else None for v in bias_gaps],
-                "detected_flags": [bool(v) for v in detected_flags],
+                "traditional_gap_values": [
+                    float(v) if np.isfinite(v) else None for v in bias_gaps_traditional
+                ],
+                "traditional_detected_flags": [bool(v) for v in detected_flags_traditional],
+                "h_new_gap_values": [float(v) if np.isfinite(v) else None for v in bias_gaps_h_new],
+                "h_new_detected_flags": [bool(v) for v in detected_flags_h_new],
                 "gap_threshold": float(config.EXPOSURE_BIAS_GAP_THRESHOLD),
                 "drop_threshold": float(config.EXPOSURE_BIAS_DROP_THRESHOLD),
             },
@@ -573,7 +702,9 @@ def main():
         "artifacts": {
             "fidelity_plot": str(config.FIDELITY_PLOT_PATH),
             "training_curves_plot": str(config.TRAINING_CURVES_PATH),
-            "observables_plot": str(config.OBSERVABLES_PLOT_PATH),
+            "observables_train_plot": str(train_obs_path),
+            "observables_test_traditional_plot": str(test_traditional_obs_path),
+            "observables_test_h_new_plot": str(test_h_new_obs_path),
             "exposure_bias_plot": str(exposure_bias_plot_path),
             "last_checkpoint": str(config.LAST_CHECKPOINT_PATH),
             "checkpoint": str(config.CHECKPOINT_PATH),
@@ -589,6 +720,28 @@ def main():
             "cz_pred": train_obs_curves.cz_pred.tolist(),
             "rollout_warmup_states": int(rollout_warmup),
         },
+        "test_traditional_observables": {
+            "time_indices": traditional_obs_curves.time_indices.tolist(),
+            "physical_time": traditional_obs_curves.physical_time.tolist(),
+            "mz_exact": traditional_obs_curves.mz_exact.tolist(),
+            "mz_pred": traditional_obs_curves.mz_pred.tolist(),
+            "mx_exact": traditional_obs_curves.mx_exact.tolist(),
+            "mx_pred": traditional_obs_curves.mx_pred.tolist(),
+            "cz_exact": traditional_obs_curves.cz_exact.tolist(),
+            "cz_pred": traditional_obs_curves.cz_pred.tolist(),
+            "rollout_warmup_states": int(rollout_warmup),
+        },
+        "test_h_new_observables": {
+            "time_indices": h_new_obs_curves.time_indices.tolist(),
+            "physical_time": h_new_obs_curves.physical_time.tolist(),
+            "mz_exact": h_new_obs_curves.mz_exact.tolist(),
+            "mz_pred": h_new_obs_curves.mz_pred.tolist(),
+            "mx_exact": h_new_obs_curves.mx_exact.tolist(),
+            "mx_pred": h_new_obs_curves.mx_pred.tolist(),
+            "cz_exact": h_new_obs_curves.cz_exact.tolist(),
+            "cz_pred": h_new_obs_curves.cz_pred.tolist(),
+            "rollout_warmup_states": int(rollout_warmup),
+        },
     }
 
     with config.SUMMARY_PATH.open("w", encoding="utf-8") as handle:
@@ -596,7 +749,9 @@ def main():
 
     print(f"\nPlot fidelity:         {config.FIDELITY_PLOT_PATH}")
     print(f"Plot training:         {config.TRAINING_CURVES_PATH}")
-    print(f"Plot osservabili:      {config.OBSERVABLES_PLOT_PATH}")
+    print(f"Plot osservabili train: {train_obs_path}")
+    print(f"Plot osservabili trad.: {test_traditional_obs_path}")
+    print(f"Plot osservabili H_new: {test_h_new_obs_path}")
     print(f"Summary JSON:          {config.SUMMARY_PATH}")
     if config.SAVE_MODEL:
         print(f"Checkpoint:            {config.CHECKPOINT_PATH}")

@@ -66,7 +66,9 @@ def get_active_env_overrides() -> dict[str, dict[str, object]]:
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-RESULTS_DIR = PROJECT_ROOT / "results"
+# Directory risultati separata per la run "paper-like" (logamp+phase),
+# così non sovrascriviamo i risultati del baseline.
+RESULTS_DIR = PROJECT_ROOT / "results_paper_logamp_phase"
 CHECKPOINT_PATH = RESULTS_DIR / "best_model.pt"
 LAST_CHECKPOINT_PATH = RESULTS_DIR / "last_checkpoint.pt"
 SUMMARY_PATH = RESULTS_DIR / "run_summary.json"
@@ -78,14 +80,19 @@ OBSERVABLES_PLOT_PATH = RESULTS_DIR / "observables_vs_time.png"
 SEED = _env_int("QSP_SEED", 7)
 
 
-N_QUBITS = _env_int("QSP_N_QUBITS", 6)
+N_QUBITS = _env_int("QSP_N_QUBITS", 4)
 if N_QUBITS < 1:
     raise ValueError(f"N_QUBITS deve essere >= 1, ricevuto: {N_QUBITS}")
 
 DIM_2N = 2 ** N_QUBITS
 
+
+def _default_by_qubits(defaults: dict[int, int], fallback: int) -> int:
+    return int(defaults.get(int(N_QUBITS), fallback))
+
 # Numero totale di stati in ogni traiettoria, incluso psi(0).
-NUM_STATES = _env_int("QSP_NUM_STATES", 12)
+# Config "bassa" e stabile di default: 60 stati (59 predizioni).
+NUM_STATES = _env_int("QSP_NUM_STATES", 60)
 if NUM_STATES < 2:
     raise ValueError(f"NUM_STATES deve essere >= 2, ricevuto: {NUM_STATES}")
 
@@ -94,7 +101,7 @@ SEQ_LEN = NUM_STATES - 1
 
 
 TRAIN_SEQUENCES = _env_int("QSP_TRAIN_SEQUENCES", 1024)
-TEST_SEQUENCES = _env_int("QSP_TEST_SEQUENCES", 128)
+TEST_SEQUENCES = _env_int("QSP_TEST_SEQUENCES", 256)
 if TRAIN_SEQUENCES < 1 or TEST_SEQUENCES < 1:
     raise ValueError("TRAIN_SEQUENCES e TEST_SEQUENCES devono essere >= 1.")
 
@@ -148,10 +155,10 @@ if not (0.0 < BASIS_SUPPORT_FRACTION_LIMIT <= 1.0):
     )
 
 
-D_MODEL = _env_int("QSP_D_MODEL", 256)
-NUM_HEADS = _env_int("QSP_NUM_HEADS", 4)
-NUM_LAYERS = _env_int("QSP_NUM_LAYERS", 3)
-DIM_FEEDFORWARD = _env_int("QSP_DIM_FEEDFORWARD", 1024)
+D_MODEL = _env_int("QSP_D_MODEL", _default_by_qubits({4: 64, 6: 256}, 256))
+NUM_HEADS = _env_int("QSP_NUM_HEADS", _default_by_qubits({4: 4, 6: 4}, 4))
+NUM_LAYERS = _env_int("QSP_NUM_LAYERS", _default_by_qubits({4: 2, 6: 3}, 3))
+DIM_FEEDFORWARD = _env_int("QSP_DIM_FEEDFORWARD", _default_by_qubits({4: 256, 6: 1024}, 1024))
 DROPOUT = _env_float("QSP_DROPOUT", 0.0)
 if D_MODEL <= 0 or NUM_HEADS <= 0 or NUM_LAYERS <= 0 or DIM_FEEDFORWARD <= 0:
     raise ValueError("D_MODEL, NUM_HEADS, NUM_LAYERS e DIM_FEEDFORWARD devono essere > 0.")
@@ -159,16 +166,22 @@ if D_MODEL % NUM_HEADS != 0:
     raise ValueError("D_MODEL deve essere divisibile per NUM_HEADS.")
 
 
-BATCH_SIZE = _env_int("QSP_BATCH_SIZE", 24)
-EPOCHS = _env_int("QSP_EPOCHS", 100)
+BATCH_SIZE = _env_int("QSP_BATCH_SIZE", _default_by_qubits({4: 64, 6: 24}, 24))
+EPOCHS = _env_int("QSP_EPOCHS", _default_by_qubits({4: 120, 6: 100}, 120))
 LEARNING_RATE = _env_float("QSP_LEARNING_RATE", 1e-4)
 WEIGHT_DECAY = _env_float("QSP_WEIGHT_DECAY", 1e-4)
 GRAD_CLIP_MAX_NORM = _env_float("QSP_GRAD_CLIP_MAX_NORM", 1.0)
 LOG_FIDELITY_EPS = _env_float("QSP_LOG_FIDELITY_EPS", 1e-8)
-SCHEDULED_SAMPLING_MAX_PROB = _env_float("QSP_SCHEDULED_SAMPLING_MAX_PROB", 0.30)
-SCHEDULED_SAMPLING_RAMP_EPOCHS = _env_int("QSP_SCHEDULED_SAMPLING_RAMP_EPOCHS", 70)
-ROLLOUT_AUX_WEIGHT = _env_float("QSP_ROLLOUT_AUX_WEIGHT", 0.50)
-ROLLOUT_CURRICULUM_EPOCHS = _env_int("QSP_ROLLOUT_CURRICULUM_EPOCHS", 70)
+# Scheduled sampling più aggressivo per ridurre exposure bias nel rollout.
+SCHEDULED_SAMPLING_RAMP_EPOCHS = _env_int("QSP_SCHEDULED_SAMPLING_RAMP_EPOCHS", 30)
+SCHEDULED_SAMPLING_MAX_PROB = _env_float("QSP_SCHEDULED_SAMPLING_MAX_PROB", 0.60)
+
+# Rollout training più pesante e curriculum più rapido (arriva prima a rollout lunghi).
+ROLLOUT_AUX_WEIGHT = _env_float("QSP_ROLLOUT_AUX_WEIGHT", 1.00)
+ROLLOUT_CURRICULUM_EPOCHS = _env_int("QSP_ROLLOUT_CURRICULUM_EPOCHS", 20)
+
+# Warmup usato SOLO nel rollout-training: più contesto vero => rollout più stabile.
+ROLLOUT_WARMUP_STATES = _env_int("QSP_ROLLOUT_WARMUP_STATES", 4)
 if BATCH_SIZE < 1 or EPOCHS < 1:
     raise ValueError("BATCH_SIZE e EPOCHS devono essere >= 1.")
 if LEARNING_RATE <= 0.0:
@@ -203,7 +216,8 @@ PLOT_DPI = _env_int("QSP_PLOT_DPI", 160)
 NUM_WORKERS = _env_int("QSP_NUM_WORKERS", 0)
 PIN_MEMORY = _env_bool("QSP_PIN_MEMORY", False)
 SAVE_MODEL = _env_bool("QSP_SAVE_MODEL", True)
-AUTO_RESUME = _env_bool("QSP_AUTO_RESUME", True)
+# Disattivo resume per la run "paper-like" (ripartiamo puliti).
+AUTO_RESUME = _env_bool("QSP_AUTO_RESUME", False)
 CHECKPOINT_EVERY_EPOCH = _env_int("QSP_CHECKPOINT_EVERY_EPOCH", 1)
 if CHECKPOINT_EVERY_EPOCH < 1:
     raise ValueError(
@@ -219,3 +233,13 @@ EMPTY_CACHE_EVERY_EPOCH = _env_bool("QSP_EMPTY_CACHE_EVERY_EPOCH", True)
 
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Parametrizzazione dell'output:
+# - "direct_complex": la rete produce Re/Im direttamente, poi normalizziamo.
+# - "logamp_phase": la rete produce (log ampiezza, fase) e costruiamo psi = exp(log_amp + i*phase), poi normalizziamo.
+OUTPUT_PARAMETRIZATION = _env_str("QSP_OUTPUT_PARAMETRIZATION", "logamp_phase")
+if OUTPUT_PARAMETRIZATION not in {"direct_complex", "logamp_phase"}:
+    raise ValueError(
+        f"OUTPUT_PARAMETRIZATION={OUTPUT_PARAMETRIZATION!r} non valida. "
+        "Valori ammessi: direct_complex, logamp_phase."
+    )

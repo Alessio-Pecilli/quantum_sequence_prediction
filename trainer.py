@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 import config
 from input import QuantumSequenceDataset
 from observables import batch_observables_tfim, precompute_observables
-from predictor import ComplexMSELoss, QuantumSequencePredictor, quantum_fidelity
+from predictor import NegativeLogFidelityLoss, QuantumSequencePredictor, quantum_fidelity
 
 
 @dataclass
@@ -84,20 +84,27 @@ def _rollout_training_steps(seq_len: int, epoch: int) -> int:
 
 def _autoregressive_unroll_loss(
     model: QuantumSequencePredictor,
-    criterion: ComplexMSELoss,
+    criterion: NegativeLogFidelityLoss,
     inputs: torch.Tensor,
     targets: torch.Tensor,
     steps: int,
     scheduled_sampling_prob: float,
 ):
-    context = inputs[:, :1, :]
+    warmup_states = int(config.ROLLOUT_WARMUP_STATES)
+    warmup_states = max(1, min(warmup_states, int(inputs.shape[1])))
+    context = inputs[:, :warmup_states, :]
     per_step_losses: list[torch.Tensor] = []
     per_step_fidelities: list[torch.Tensor] = []
 
-    max_steps = min(int(steps), int(targets.shape[1]))
+    # Se warmup_states = w, la prima predizione supervisionata è targets[w-1] = state[w].
+    start_index = warmup_states - 1
+    remaining_targets = int(targets.shape[1]) - start_index
+    max_steps = min(int(steps), max(1, remaining_targets))
+
     for step in range(max_steps):
+        target_index = start_index + step
         predicted_next = model(context)[:, -1, :]
-        step_target = targets[:, step : step + 1, :]
+        step_target = targets[:, target_index : target_index + 1, :]
         step_loss, step_mean_fidelity, _ = criterion(predicted_next.unsqueeze(1), step_target)
         per_step_losses.append(step_loss)
         per_step_fidelities.append(step_mean_fidelity)
@@ -105,7 +112,7 @@ def _autoregressive_unroll_loss(
         if step + 1 >= max_steps:
             continue
 
-        gold_next_context = inputs[:, step + 1 : step + 2, :]
+        gold_next_context = inputs[:, target_index + 1 : target_index + 2, :]
         if scheduled_sampling_prob <= 0.0:
             next_context = gold_next_context
         else:
@@ -220,7 +227,7 @@ def train_model(
         pct_start=0.1,  # 10% warmup
         anneal_strategy="cos",
     )
-    criterion = ComplexMSELoss()
+    criterion = NegativeLogFidelityLoss()
 
     if optimizer_state_dict is not None:
         optimizer.load_state_dict(optimizer_state_dict)
@@ -369,7 +376,7 @@ def train_model(
 @torch.no_grad()
 def evaluate_teacher_forced(model: QuantumSequencePredictor, states: torch.Tensor) -> EvaluationResult:
     model.eval()
-    criterion = ComplexMSELoss()
+    criterion = NegativeLogFidelityLoss()
     loader = build_loader(states, shuffle=False)
 
     total_loss = 0.0
@@ -470,6 +477,21 @@ def compute_train_observable_curves(
     states: torch.Tensor,
     warmup_states: int = 1,
 ) -> TrainObservableCurves:
+    return compute_observable_curves(
+        model=model,
+        states=states,
+        warmup_states=warmup_states,
+        time_step=float(config.TIME_STEP),
+    )
+
+
+@torch.no_grad()
+def compute_observable_curves(
+    model: QuantumSequencePredictor,
+    states: torch.Tensor,
+    warmup_states: int = 1,
+    time_step: float = float(config.TIME_STEP),
+) -> TrainObservableCurves:
     """
     Per ogni sequenza del training set: stati esatti dalla Hamiltoniana e stati dal rollout LLM
     (stesso schema di `evaluate_autoregressive`). Medie di m^z, m^x, c^z sul dataset.
@@ -547,7 +569,7 @@ def compute_train_observable_curves(
 
     scale = float(max(1, total_sequences))
     time_indices = np.arange(num_states, dtype=np.float64)
-    physical_time = time_indices * float(config.TIME_STEP)
+    physical_time = time_indices * float(time_step)
 
     inv_scale = 1.0 / scale
     return TrainObservableCurves(
@@ -563,6 +585,23 @@ def compute_train_observable_curves(
 
 
 def plot_train_observables(curves: TrainObservableCurves, warmup_states: int):
+    plot_observable_curves(
+        curves=curves,
+        warmup_states=warmup_states,
+        output_path=config.OBSERVABLES_PLOT_PATH,
+        title=(
+            f"Osservabili | training set | "
+            f"{curves.time_indices.size} stati per traiettoria, warmup={warmup_states}"
+        ),
+    )
+
+
+def plot_observable_curves(
+    curves: TrainObservableCurves,
+    warmup_states: int,
+    output_path,
+    title: str,
+):
     config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     fig, axes = plt.subplots(1, 3, figsize=(16, 4.8), sharex=True)
 
@@ -592,13 +631,9 @@ def plot_train_observables(curves: TrainObservableCurves, warmup_states: int):
 
     axes[2].set_xlabel(r"Tempo $t = k\,\Delta t$ (indice stato $k$)")
 
-    fig.suptitle(
-        f"Osservabili | training set | "
-        f"{curves.time_indices.size} stati per traiettoria, warmup={warmup_states}",
-        fontsize=13,
-    )
+    fig.suptitle(title, fontsize=13)
     fig.tight_layout()
-    fig.savefig(config.OBSERVABLES_PLOT_PATH, dpi=config.PLOT_DPI, bbox_inches="tight")
+    fig.savefig(output_path, dpi=config.PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -650,7 +685,7 @@ def plot_training_curves(history: TrainingHistory):
     axes[0].plot(history.epochs, history.train_loss, color="#b03a2e", linewidth=2.0)
     axes[0].set_title("Training Loss")
     axes[0].set_xlabel("Epoca")
-    axes[0].set_ylabel("Complex MSE loss")
+    axes[0].set_ylabel("Neg. log fidelity loss")
     axes[0].grid(alpha=0.25)
 
     axes[1].plot(history.epochs, history.train_fidelity, color="#1f618d", linewidth=2.0)

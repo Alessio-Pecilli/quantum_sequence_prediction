@@ -17,8 +17,31 @@ import torch
 
 import config
 from input import QuantumSequenceDataset, generate_fixed_tfim_dataset
-from predictor import ComplexMSELoss, QuantumSequencePredictor, quantum_fidelity
+from predictor import ComplexMSELoss, QuantumSequencePredictor, clamp_global_phase, quantum_fidelity
 from trainer import evaluate_autoregressive, evaluate_teacher_forced, set_seed
+
+
+def _assert_phase_clamped(
+    states: torch.Tensor,
+    *,
+    eps: float = 1e-8,
+    atol_imag: float = 5e-5,
+):
+    """
+    Verifica che, dopo `clamp_global_phase`, la componente 0 sia:
+      - immaginaria ~ 0
+      - reale >= 0
+    per tutti gli elementi con |c0| > eps.
+    """
+    clamped = clamp_global_phase(states, eps=eps)
+    c0 = clamped[..., 0]
+    abs0 = torch.abs(c0)
+    valid = abs0 > eps
+    if valid.any():
+        imag_ok = torch.abs(c0.imag)[valid] <= atol_imag
+        real_ok = c0.real[valid] >= -atol_imag
+        assert bool(imag_ok.all().item()), "Phase clamp check failed: imag(c0) non ~0"
+        assert bool(real_ok.all().item()), "Phase clamp check failed: real(c0) < 0"
 
 
 set_seed(config.SEED)
@@ -33,6 +56,10 @@ test_norms = torch.linalg.vector_norm(bundle.test.states, dim=-1)
 assert torch.allclose(train_norms, torch.ones_like(train_norms), atol=1e-5)
 assert torch.allclose(test_norms, torch.ones_like(test_norms), atol=1e-5)
 
+# Check: clamping fase globale sui dati (gauge fixing coerente).
+_assert_phase_clamped(bundle.train.states)
+_assert_phase_clamped(bundle.test.states)
+
 dataset = QuantumSequenceDataset(bundle.train.states)
 inputs, targets = dataset[0]
 assert inputs.shape == (config.SEQ_LEN, config.DIM_2N)
@@ -41,6 +68,9 @@ assert targets.shape == (config.SEQ_LEN, config.DIM_2N)
 model = QuantumSequencePredictor()
 predictions = model(bundle.train.inputs[:2])
 assert predictions.shape == (2, config.SEQ_LEN, config.DIM_2N)
+
+# Check: output del modello già clamped.
+_assert_phase_clamped(predictions)
 
 criterion = ComplexMSELoss()
 loss, mean_fidelity, fidelity_matrix = criterion(predictions, bundle.train.targets[:2])

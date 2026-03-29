@@ -12,6 +12,33 @@ from embedding import ComplexEmbedding
 def normalize_state(states: torch.Tensor) -> torch.Tensor:
     return states / torch.linalg.vector_norm(states, dim=-1, keepdim=True).clamp(min=1e-8)
 
+def clamp_global_phase(
+    states: torch.Tensor,
+    *,
+    ref_index: int = 0,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    Fissa la fase globale dello stato complesso rendendo `states[..., ref_index]` reale e non-negativo.
+
+    Se la magnitudine della componente di riferimento è troppo piccola (|c_ref| < eps),
+    non applichiamo alcuna rotazione per evitare instabilità numeriche.
+    """
+    if not torch.is_complex(states):
+        raise ValueError(f"clamp_global_phase richiede tensori complessi, ricevuto dtype={states.dtype}")
+
+    ref = states[..., ref_index]  # [...,]
+    abs_ref = torch.abs(ref)  # [...,]
+    unit_phase = ref / abs_ref.clamp(min=eps)  # [...,] ~ e^{i phi}
+
+    # e^{-i phi} = conj(e^{i phi})
+    factor = torch.where(
+        abs_ref > eps,
+        unit_phase.conj(),
+        torch.ones_like(ref),
+    )
+    return states * factor.unsqueeze(-1)
+
 
 def quantum_fidelity(predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     pred_norm = normalize_state(predicted)
@@ -111,12 +138,24 @@ class QuantumSequencePredictor(nn.Module):
         )
 
     def forward(self, context_states: torch.Tensor) -> torch.Tensor:
+        # Ancora la rappresentazione eliminando la libertà di fase globale.
+        context_states = clamp_global_phase(context_states)
+
         hidden = self.embedding(context_states)
         hidden = self.position_encoding(hidden)
         seq_len = int(hidden.shape[1])
         hidden = self.transformer(hidden, mask=self.causal_mask[:seq_len, :seq_len])
         hidden = self.output_norm(hidden)
         raw = self.output_head(hidden)
-        real_part, imag_part = raw.chunk(2, dim=-1)
-        predicted = torch.complex(real_part, imag_part)
-        return normalize_state(predicted)
+        if config.OUTPUT_PARAMETRIZATION == "direct_complex":
+            real_part, imag_part = raw.chunk(2, dim=-1)
+            predicted = torch.complex(real_part, imag_part)
+        elif config.OUTPUT_PARAMETRIZATION == "logamp_phase":
+            log_amp, phase = raw.chunk(2, dim=-1)
+            amp = torch.exp(log_amp.to(torch.float32))
+            predicted = torch.polar(amp, phase.to(torch.float32)).to(torch.complex64)
+        else:
+            raise ValueError(f"OUTPUT_PARAMETRIZATION non supportata: {config.OUTPUT_PARAMETRIZATION!r}")
+        predicted = normalize_state(predicted)
+        predicted = clamp_global_phase(predicted)
+        return predicted
