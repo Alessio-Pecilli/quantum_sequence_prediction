@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import random
 from dataclasses import dataclass
 
@@ -14,17 +13,6 @@ I = torch.eye(2, dtype=torch.complex64)
 X = torch.tensor([[0, 1], [1, 0]], dtype=torch.complex64)
 Y = torch.tensor([[0, -1j], [1j, 0]], dtype=torch.complex64)
 Z = torch.tensor([[1, 0], [0, -1]], dtype=torch.complex64)
-
-SQRT2_INV = 1.0 / math.sqrt(2.0)
-LOCAL_CLIFFORD_STATES = (
-    ("0", torch.tensor([1.0, 0.0], dtype=torch.complex64)),
-    ("1", torch.tensor([0.0, 1.0], dtype=torch.complex64)),
-    ("+", torch.tensor([SQRT2_INV, SQRT2_INV], dtype=torch.complex64)),
-    ("-", torch.tensor([SQRT2_INV, -SQRT2_INV], dtype=torch.complex64)),
-    ("+i", torch.tensor([SQRT2_INV, 1j * SQRT2_INV], dtype=torch.complex64)),
-    ("-i", torch.tensor([SQRT2_INV, -1j * SQRT2_INV], dtype=torch.complex64)),
-)
-
 
 @dataclass
 class HamiltonianData:
@@ -121,39 +109,21 @@ def build_tfim_hamiltonian(
 
 def choose_initial_state_family(total_sequences: int, n_qubits: int) -> tuple[str, int, str]:
     basis_support = 2 ** n_qubits
-    support_fraction = total_sequences / basis_support
-
-    if config.INITIAL_STATE_FAMILY == "basis":
-        return "basis", basis_support, "forzato da config"
-
-    if config.INITIAL_STATE_FAMILY == "pauli_basis":
-        # Codifica per qubit: (bit valore b_j, scelta Pauli P_j in {I,X,Y,Z}) => 8 possibilità.
-        # Usiamo questa ampiezza come "supporto" per garantire campioni distinti finche' possibile.
-        support_size = 8**n_qubits
-        return "pauli_basis", support_size, "forzato da config"
-
-    if config.INITIAL_STATE_FAMILY == "local_clifford":
-        return (
-            "local_clifford",
-            6 ** n_qubits,
-            "forzato da config; prodotti di sole Pauli su bitstring non aumentano il supporto fisico",
+    if config.INITIAL_STATE_FAMILY != "x_basis":
+        raise ValueError(
+            f"INITIAL_STATE_FAMILY={config.INITIAL_STATE_FAMILY!r} non supportata: usare solo 'x_basis'."
         )
-
-    if total_sequences > basis_support:
-        return (
-            "pauli_basis",
-            8**n_qubits,
-            "supporto basis insufficiente; uso Pauli random per ottenere varianti anche quando 2K~2^n",
+    if total_sequences > basis_support and not config.X_BASIS_SAMPLE_WITH_REPLACEMENT:
+        raise ValueError(
+            f"Richiesti {total_sequences} stati ma il supporto x_basis e' {basis_support}. "
+            "Attiva QSP_X_BASIS_SAMPLE_WITH_REPLACEMENT=1 per campionare con rimpiazzo."
         )
-
-    if support_fraction > config.BASIS_SUPPORT_FRACTION_LIMIT:
-        return (
-            "pauli_basis",
-            8**n_qubits,
-            "2K non abbastanza piccolo rispetto a 2^n; uso Pauli random per aggiungere differenze di fase globali",
-        )
-
-    return "basis", basis_support, "supporto basis sufficiente"
+    reason = (
+        "stati iniziali solo in base X clampata; campionamento con rimpiazzo attivo"
+        if total_sequences > basis_support
+        else "stati iniziali solo in base X clampata; campionamento senza rimpiazzo"
+    )
+    return "x_basis", basis_support, reason
 
 
 def sample_couplings(n_qubits: int, seed: int) -> torch.Tensor:
@@ -194,100 +164,37 @@ def compute_evolution_operator(
     return evolution_operator.to(torch.complex64), backend
 
 
-def basis_state_from_code(code: int, n_qubits: int) -> torch.Tensor:
-    dim = 2 ** n_qubits
-    state = torch.zeros((dim,), dtype=torch.complex64)
-    state[int(code)] = 1.0 + 0.0j
-    return state
+def bits_from_code(code: int, n_qubits: int) -> list[int]:
+    code = int(code)
+    return [int((code >> shift) & 1) for shift in range(n_qubits - 1, -1, -1)]
 
 
-def local_clifford_state_from_code(code: int, n_qubits: int) -> torch.Tensor:
-    factors: list[torch.Tensor] = []
-    remaining = int(code)
-    for _ in range(n_qubits):
-        remaining, digit = divmod(remaining, len(LOCAL_CLIFFORD_STATES))
-        factors.append(LOCAL_CLIFFORD_STATES[digit][1])
-
-    state = factors[-1]
-    for factor in reversed(factors[:-1]):
-        state = torch.kron(state, factor)
+def x_basis_state_from_code(code: int, n_qubits: int) -> torch.Tensor:
+    bits = bits_from_code(code, n_qubits)
+    sqrt2_inv = 1.0 / (2.0 ** 0.5)
+    plus = torch.tensor([sqrt2_inv, sqrt2_inv], dtype=torch.complex64)
+    minus = torch.tensor([sqrt2_inv, -sqrt2_inv], dtype=torch.complex64)
+    state = plus if bits[0] == 0 else minus
+    for bit in bits[1:]:
+        state = torch.kron(state, plus if bit == 0 else minus)
     return state.to(torch.complex64)
 
 
-def pauli_basis_state_from_code(code: int, n_qubits: int) -> torch.Tensor:
-    """
-    Stato iniziale del tipo:
-      |psi(0)> = P_1 |b_1> x P_2 |b_2> x ... x P_n |b_n>
-    dove P_j in {I,X,Y,Z} scelto in modo deterministico dalla codifica `code`.
-
-    La codifica usa base 8 per qubit:
-      digit = 2-bit per Pauli (I=0,X=1,Y=2,Z=3) + 1-bit per b_j.
-    """
-
-    dim = 2**n_qubits
-    remaining = int(code)
-
-    # Estrai cifre in base 8 (LSB->MSB), poi inverti per avere qubit 0 come MSB.
-    digits: list[int] = []
-    for _ in range(n_qubits):
-        remaining, digit = divmod(remaining, 8)
-        digits.append(int(digit))
-    digits = list(reversed(digits))  # ora digits[0] -> qubit 0
-
-    final_bits: list[int] = [0] * n_qubits
-    phase_total: complex = 1.0 + 0.0j
-
-    for q in range(n_qubits):
-        digit = digits[q]
-        b = digit & 1
-        p = digit >> 1  # 0..3
-
-        if p == 0:  # I
-            new_b = b
-            phase_factor = 1.0 + 0.0j
-        elif p == 1:  # X
-            new_b = 1 - b
-            phase_factor = 1.0 + 0.0j
-        elif p == 2:  # Y
-            new_b = 1 - b
-            # Y|0> = i|1>, Y|1> = -i|0>
-            phase_factor = 1j if b == 0 else -1j
-        elif p == 3:  # Z
-            new_b = b
-            # Z|0> = |0>, Z|1> = -|1>
-            phase_factor = 1.0 + 0.0j if b == 0 else -1.0 + 0.0j
-        else:
-            raise ValueError(f"Codifica Pauli non valida (p={p})")
-
-        final_bits[q] = new_b
-        phase_total *= phase_factor
-
-    final_code = 0
-    for q in range(n_qubits):
-        final_code = (final_code << 1) | int(final_bits[q])
-
-    state = torch.zeros((dim,), dtype=torch.complex64)
-    state[final_code] = torch.tensor(phase_total, dtype=torch.complex64)
-    return state
-
-
 def initial_state_from_code(code: int, family: str, n_qubits: int) -> torch.Tensor:
-    if family == "basis":
-        return basis_state_from_code(code, n_qubits)
-    if family == "local_clifford":
-        return local_clifford_state_from_code(code, n_qubits)
-    if family == "pauli_basis":
-        return pauli_basis_state_from_code(code, n_qubits)
+    if family == "x_basis":
+        return x_basis_state_from_code(code, n_qubits)
     raise ValueError(f"Famiglia di stati iniziali non supportata: {family}")
 
 
 def sample_initial_state_codes(total_sequences: int, support_size: int, seed: int) -> list[int]:
-    if total_sequences > support_size:
+    if total_sequences > support_size and not config.X_BASIS_SAMPLE_WITH_REPLACEMENT:
         raise ValueError(
             f"Richiesti {total_sequences} stati iniziali distinti ma supporto disponibile={support_size}."
         )
     rng = random.Random(seed)
-    return rng.sample(range(support_size), total_sequences)
+    if total_sequences <= support_size:
+        return rng.sample(range(support_size), total_sequences)
+    return [rng.randrange(support_size) for _ in range(total_sequences)]
 
 
 def build_initial_states(
@@ -308,19 +215,70 @@ def evolve_sequences(
     current = initial_states.to(device)
     operator = evolution_operator.to(device)
 
+    def clamp_global_phase_first_amplitude_batch(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+        """
+        Clamping gauge per batch:
+        impone che x[:, 0] abbia fase zero (quindi x[:, 0] sia reale >= 0) per ogni traiettoria.
+        Se |x[:,0]| ~ 0 non clampa quella traiettoria per evitare instabilita' numeriche.
+        """
+        if x.ndim != 2:
+            raise ValueError(f"x deve essere 2D (batch, dim), ricevuto shape={tuple(x.shape)}")
+        a0 = x[:, 0]
+        mag = torch.abs(a0)
+        mask = mag > eps
+        # factor = exp(-i*angle(a0)) -> a0 * factor diventa reale e positivo.
+        factor = torch.ones_like(a0)
+        factor[mask] = torch.conj(a0[mask] / mag[mask])
+        return x * factor[:, None]
+
     trajectories = torch.empty(
         (initial_states.shape[0], num_states, initial_states.shape[1]),
         dtype=torch.complex64,
         device=device,
     )
+    current = clamp_global_phase_first_amplitude_batch(current)
     trajectories[:, 0] = current
 
     for step in range(1, num_states):
         current = torch.einsum("ij,bj->bi", operator, current)
         current = current / torch.linalg.vector_norm(current, dim=-1, keepdim=True).clamp(min=1e-8)
+        current = clamp_global_phase_first_amplitude_batch(current)
         trajectories[:, step] = current
 
     return trajectories.cpu()
+
+
+def _format_complex(z: complex, ndigits: int = 6) -> str:
+    return f"{z.real:+.{ndigits}f}{z.imag:+.{ndigits}f}j"
+
+
+def _print_clamped_dataset_audit(
+    split_name: str,
+    states: torch.Tensor,
+    codes: list[int],
+    n_qubits: int,
+) -> None:
+    if not config.CLAMP_AUDIT_PRINT:
+        return
+
+    max_sequences = min(int(config.CLAMP_AUDIT_MAX_SEQUENCES), int(states.shape[0]))
+    max_states = min(int(config.CLAMP_AUDIT_MAX_STATES), int(states.shape[1]))
+    print(f"\n[ClampAudit:{split_name}] showing {max_sequences} sequence(s), first {max_states} state(s)")
+    for seq_idx in range(max_sequences):
+        bits = bits_from_code(codes[seq_idx], n_qubits)
+        bitstring = "".join(str(bit) for bit in bits)
+        if config.CLAMP_AUDIT_PRINT_BITSTRINGS:
+            print(f"  seq={seq_idx:03d} code={codes[seq_idx]} bitstring={bitstring} (X basis)")
+        for t in range(max_states):
+            state = states[seq_idx, t]
+            a0 = state[0].item()
+            print(
+                f"    t={t:02d} psi[0]={_format_complex(a0)} "
+                f"| |psi[0]|={abs(a0):.6f} angle={float(torch.angle(state[0]).item()):+.6f} rad"
+            )
+            if config.CLAMP_AUDIT_PRINT_COEFFS:
+                for idx in range(state.numel()):
+                    print(f"      coeff[{idx:>2d}]={_format_complex(state[idx].item())}")
 
 
 def generate_fixed_tfim_dataset(
@@ -359,6 +317,9 @@ def generate_fixed_tfim_dataset(
         initial_state_family=family,
         support_size=support_size,
     )
+
+    _print_clamped_dataset_audit("train", train_split.states, train_split.initial_state_codes, n_qubits)
+    _print_clamped_dataset_audit("test", test_split.states, test_split.initial_state_codes, n_qubits)
 
     return QuantumDatasetBundle(
         train=train_split,

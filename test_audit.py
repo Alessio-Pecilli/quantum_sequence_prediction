@@ -10,7 +10,7 @@ os.environ["QSP_NUM_LAYERS"] = "2"
 os.environ["QSP_DIM_FEEDFORWARD"] = "64"
 os.environ["QSP_BATCH_SIZE"] = "4"
 os.environ["QSP_EPOCHS"] = "2"
-os.environ["QSP_INITIAL_STATE_FAMILY"] = "auto"
+os.environ["QSP_INITIAL_STATE_FAMILY"] = "x_basis"
 os.environ["QSP_NUM_WORKERS"] = "0"
 
 import torch
@@ -49,7 +49,10 @@ bundle = generate_fixed_tfim_dataset()
 
 assert bundle.train.states.shape == (config.TRAIN_SEQUENCES, config.NUM_STATES, config.DIM_2N)
 assert bundle.test.states.shape == (config.TEST_SEQUENCES, config.NUM_STATES, config.DIM_2N)
-assert set(bundle.train.initial_state_codes).isdisjoint(set(bundle.test.initial_state_codes))
+if not config.X_BASIS_SAMPLE_WITH_REPLACEMENT and (
+    config.TRAIN_SEQUENCES + config.TEST_SEQUENCES <= 2 ** config.N_QUBITS
+):
+    assert set(bundle.train.initial_state_codes).isdisjoint(set(bundle.test.initial_state_codes))
 
 train_norms = torch.linalg.vector_norm(bundle.train.states, dim=-1)
 test_norms = torch.linalg.vector_norm(bundle.test.states, dim=-1)

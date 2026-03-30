@@ -6,11 +6,12 @@ import torch
 import torch.nn as nn
 
 import config
-from embedding import ComplexEmbedding
+from embedding import ComplexEmbedding, unpack_clamped_state_features
 
 
 def normalize_state(states: torch.Tensor) -> torch.Tensor:
     return states / torch.linalg.vector_norm(states, dim=-1, keepdim=True).clamp(min=1e-8)
+
 
 def clamp_global_phase(
     states: torch.Tensor,
@@ -18,25 +19,13 @@ def clamp_global_phase(
     ref_index: int = 0,
     eps: float = 1e-8,
 ) -> torch.Tensor:
-    """
-    Fissa la fase globale dello stato complesso rendendo `states[..., ref_index]` reale e non-negativo.
-
-    Se la magnitudine della componente di riferimento è troppo piccola (|c_ref| < eps),
-    non applichiamo alcuna rotazione per evitare instabilità numeriche.
-    """
     if not torch.is_complex(states):
         raise ValueError(f"clamp_global_phase richiede tensori complessi, ricevuto dtype={states.dtype}")
 
-    ref = states[..., ref_index]  # [...,]
-    abs_ref = torch.abs(ref)  # [...,]
-    unit_phase = ref / abs_ref.clamp(min=eps)  # [...,] ~ e^{i phi}
-
-    # e^{-i phi} = conj(e^{i phi})
-    factor = torch.where(
-        abs_ref > eps,
-        unit_phase.conj(),
-        torch.ones_like(ref),
-    )
+    ref = states[..., ref_index]
+    abs_ref = torch.abs(ref)
+    unit_phase = ref / abs_ref.clamp(min=eps)
+    factor = torch.where(abs_ref > eps, unit_phase.conj(), torch.ones_like(ref))
     return states * factor.unsqueeze(-1)
 
 
@@ -60,26 +49,17 @@ class NegativeLogFidelityLoss(nn.Module):
 
 
 class ComplexMSELoss(nn.Module):
-    """
-    Allinea ampiezze e fase (non solo la fidelity) con MSE sulle componenti reali/immaginarie.
-    """
-
     def __init__(self):
         super().__init__()
-        # MSE su rappresentazione [real, imag] per forzare anche l'allineamento della fase globale.
         self.mse = nn.MSELoss()
 
     def forward(self, predicted: torch.Tensor, target: torch.Tensor):
-        # predicted/target: complessi normalizzati con shape [Batch, Seq, Dim] (dtype complex64/complex*).
-        pred_real = torch.view_as_real(predicted)  # -> [Batch, Seq, Dim, 2]
-        target_real = torch.view_as_real(target)  # -> [Batch, Seq, Dim, 2]
+        pred_real = torch.view_as_real(predicted)
+        target_real = torch.view_as_real(target)
         loss = self.mse(pred_real, target_real)
-
-        # Fidelity solo per reporting/plot: non influenza direttamente il gradiente.
         with torch.no_grad():
             fidelity = quantum_fidelity(predicted, target)
             mean_fidelity = fidelity.mean()
-
         return loss, mean_fidelity, fidelity
 
 
@@ -112,6 +92,7 @@ class QuantumSequencePredictor(nn.Module):
     ):
         super().__init__()
         self.dim_2n = int(dim_2n)
+        self.feature_dim = 2 * self.dim_2n - 1
         self.embedding = ComplexEmbedding(dim_2n=dim_2n, d_model=d_model)
         self.position_encoding = SinusoidalPositionalEncoding(d_model=d_model, max_len=max_seq_len)
 
@@ -129,7 +110,7 @@ class QuantumSequencePredictor(nn.Module):
         self.output_head = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.GELU(),
-            nn.Linear(d_model, 2 * self.dim_2n),
+            nn.Linear(d_model, self.feature_dim),
         )
         self.register_buffer(
             "causal_mask",
@@ -138,24 +119,14 @@ class QuantumSequencePredictor(nn.Module):
         )
 
     def forward(self, context_states: torch.Tensor) -> torch.Tensor:
-        # Ancora la rappresentazione eliminando la libertà di fase globale.
         context_states = clamp_global_phase(context_states)
-
         hidden = self.embedding(context_states)
         hidden = self.position_encoding(hidden)
         seq_len = int(hidden.shape[1])
         hidden = self.transformer(hidden, mask=self.causal_mask[:seq_len, :seq_len])
         hidden = self.output_norm(hidden)
-        raw = self.output_head(hidden)
-        if config.OUTPUT_PARAMETRIZATION == "direct_complex":
-            real_part, imag_part = raw.chunk(2, dim=-1)
-            predicted = torch.complex(real_part, imag_part)
-        elif config.OUTPUT_PARAMETRIZATION == "logamp_phase":
-            log_amp, phase = raw.chunk(2, dim=-1)
-            amp = torch.exp(log_amp.to(torch.float32))
-            predicted = torch.polar(amp, phase.to(torch.float32)).to(torch.complex64)
-        else:
-            raise ValueError(f"OUTPUT_PARAMETRIZATION non supportata: {config.OUTPUT_PARAMETRIZATION!r}")
+        raw_features = self.output_head(hidden)
+        predicted = unpack_clamped_state_features(raw_features, dim_2n=self.dim_2n)
         predicted = normalize_state(predicted)
         predicted = clamp_global_phase(predicted)
         return predicted

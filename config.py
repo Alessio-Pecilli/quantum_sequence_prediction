@@ -141,18 +141,13 @@ if EXACT_DIAG_MAX_DIM < 2:
     raise ValueError(f"EXACT_DIAG_MAX_DIM deve essere >= 2, ricevuto: {EXACT_DIAG_MAX_DIM}")
 
 
-INITIAL_STATE_FAMILY = _env_str("QSP_INITIAL_STATE_FAMILY", "local_clifford")
-if INITIAL_STATE_FAMILY not in {"auto", "basis", "pauli_basis", "local_clifford"}:
+INITIAL_STATE_FAMILY = _env_str("QSP_INITIAL_STATE_FAMILY", "x_basis")
+if INITIAL_STATE_FAMILY not in {"x_basis"}:
     raise ValueError(
         f"INITIAL_STATE_FAMILY={INITIAL_STATE_FAMILY!r} non valida. "
-        "Valori ammessi: auto, basis, pauli_basis, local_clifford."
+        "Valori ammessi: x_basis."
     )
-BASIS_SUPPORT_FRACTION_LIMIT = _env_float("QSP_BASIS_SUPPORT_FRACTION_LIMIT", 0.125)
-if not (0.0 < BASIS_SUPPORT_FRACTION_LIMIT <= 1.0):
-    raise ValueError(
-        "BASIS_SUPPORT_FRACTION_LIMIT deve stare in (0,1], "
-        f"ricevuto: {BASIS_SUPPORT_FRACTION_LIMIT}"
-    )
+X_BASIS_SAMPLE_WITH_REPLACEMENT = _env_bool("QSP_X_BASIS_SAMPLE_WITH_REPLACEMENT", True)
 
 
 D_MODEL = _env_int("QSP_D_MODEL", _default_by_qubits({4: 64, 6: 256}, 256))
@@ -211,6 +206,13 @@ EXPOSURE_BIAS_GAP_THRESHOLD = _env_float("QSP_EXPOSURE_BIAS_GAP_THRESHOLD", 0.10
 EXPOSURE_BIAS_DROP_THRESHOLD = _env_float("QSP_EXPOSURE_BIAS_DROP_THRESHOLD", 0.10)
 PARTIAL_WARMUP_STEPS = _env_str("QSP_PARTIAL_WARMUP_STEPS", "auto")
 PLOT_DPI = _env_int("QSP_PLOT_DPI", 160)
+CLAMP_AUDIT_PRINT = _env_bool("QSP_CLAMP_AUDIT_PRINT", True)
+CLAMP_AUDIT_MAX_SEQUENCES = _env_int("QSP_CLAMP_AUDIT_MAX_SEQUENCES", 3)
+CLAMP_AUDIT_MAX_STATES = _env_int("QSP_CLAMP_AUDIT_MAX_STATES", 4)
+CLAMP_AUDIT_PRINT_BITSTRINGS = _env_bool("QSP_CLAMP_AUDIT_PRINT_BITSTRINGS", True)
+CLAMP_AUDIT_PRINT_COEFFS = _env_bool("QSP_CLAMP_AUDIT_PRINT_COEFFS", False)
+if CLAMP_AUDIT_MAX_SEQUENCES < 0 or CLAMP_AUDIT_MAX_STATES < 0:
+    raise ValueError("CLAMP_AUDIT_MAX_SEQUENCES e CLAMP_AUDIT_MAX_STATES devono essere >= 0.")
 
 
 NUM_WORKERS = _env_int("QSP_NUM_WORKERS", 0)
