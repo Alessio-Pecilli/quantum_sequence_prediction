@@ -75,6 +75,8 @@ SUMMARY_PATH = RESULTS_DIR / "run_summary.json"
 FIDELITY_PLOT_PATH = RESULTS_DIR / "fidelity_vs_time.png"
 TRAINING_CURVES_PATH = RESULTS_DIR / "training_curves.png"
 OBSERVABLES_PLOT_PATH = RESULTS_DIR / "observables_vs_time.png"
+OBSERVABLES_TRAIN_PLOT_PATH = RESULTS_DIR / "observables_train_vs_rollout.png"
+OBSERVABLES_TEST_PLOT_PATH = RESULTS_DIR / "observables_test_vs_rollout.png"
 
 
 SEED = _env_int("QSP_SEED", 7)
@@ -92,7 +94,7 @@ def _default_by_qubits(defaults: dict[int, int], fallback: int) -> int:
 
 # Numero totale di stati in ogni traiettoria, incluso psi(0).
 # Config "bassa" e stabile di default: 60 stati (59 predizioni).
-NUM_STATES = _env_int("QSP_NUM_STATES", 60)
+NUM_STATES = _env_int("QSP_NUM_STATES", 12)
 if NUM_STATES < 2:
     raise ValueError(f"NUM_STATES deve essere >= 2, ricevuto: {NUM_STATES}")
 
@@ -218,6 +220,8 @@ if CLAMP_AUDIT_MAX_SEQUENCES < 0 or CLAMP_AUDIT_MAX_STATES < 0:
 NUM_WORKERS = _env_int("QSP_NUM_WORKERS", 0)
 PIN_MEMORY = _env_bool("QSP_PIN_MEMORY", False)
 SAVE_MODEL = _env_bool("QSP_SAVE_MODEL", True)
+# Se attivo, salta il training e ricalcola metriche/plot da best_model.pt.
+EVAL_ONLY = _env_bool("QSP_EVAL_ONLY", False)
 # Disattivo resume per la run "paper-like" (ripartiamo puliti).
 AUTO_RESUME = _env_bool("QSP_AUTO_RESUME", False)
 CHECKPOINT_EVERY_EPOCH = _env_int("QSP_CHECKPOINT_EVERY_EPOCH", 1)

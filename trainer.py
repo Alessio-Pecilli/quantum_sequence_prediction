@@ -48,6 +48,18 @@ class TrainObservableCurves:
     cz_pred: np.ndarray
 
 
+@dataclass
+class ResumeCheckpointState:
+    start_epoch: int
+    history: TrainingHistory
+    optimizer_state_dict: dict | None
+    scheduler_state_dict: dict | None
+    best_loss: float | None
+    best_state: dict | None
+    resumed: bool
+    reason: str
+
+
 def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -70,6 +82,107 @@ def build_loader(states: torch.Tensor, shuffle: bool) -> DataLoader:
 
 def build_model() -> QuantumSequencePredictor:
     return QuantumSequencePredictor().to(config.DEVICE)
+
+
+def _empty_resume_state(reason: str) -> ResumeCheckpointState:
+    return ResumeCheckpointState(
+        start_epoch=1,
+        history=TrainingHistory(epochs=[], train_loss=[], train_fidelity=[]),
+        optimizer_state_dict=None,
+        scheduler_state_dict=None,
+        best_loss=None,
+        best_state=None,
+        resumed=False,
+        reason=reason,
+    )
+
+
+def _checkpoint_config_snapshot() -> dict[str, object]:
+    return {
+        "N_QUBITS": int(config.N_QUBITS),
+        "DIM_2N": int(config.DIM_2N),
+        "NUM_STATES": int(config.NUM_STATES),
+        "TRAIN_SEQUENCES": int(config.TRAIN_SEQUENCES),
+        "BATCH_SIZE": int(config.BATCH_SIZE),
+        "EPOCHS": int(config.EPOCHS),
+        "LEARNING_RATE": float(config.LEARNING_RATE),
+        "WEIGHT_DECAY": float(config.WEIGHT_DECAY),
+        "D_MODEL": int(config.D_MODEL),
+        "NUM_HEADS": int(config.NUM_HEADS),
+        "NUM_LAYERS": int(config.NUM_LAYERS),
+        "DIM_FEEDFORWARD": int(config.DIM_FEEDFORWARD),
+        "OUTPUT_PARAMETRIZATION": str(config.OUTPUT_PARAMETRIZATION),
+    }
+
+
+def _checkpoint_config_mismatches(saved_config: dict[str, object]) -> list[str]:
+    current_config = _checkpoint_config_snapshot()
+    mismatches: list[str] = []
+    for key, current_value in current_config.items():
+        if key == "EPOCHS":
+            continue
+        if key not in saved_config:
+            continue
+        saved_value = saved_config[key]
+        if isinstance(current_value, float):
+            if not np.isclose(float(saved_value), current_value, rtol=0.0, atol=1e-12):
+                mismatches.append(f"{key}: checkpoint={saved_value} current={current_value}")
+        elif saved_value != current_value:
+            mismatches.append(f"{key}: checkpoint={saved_value} current={current_value}")
+    return mismatches
+
+
+def try_resume_from_last_checkpoint(model: QuantumSequencePredictor) -> ResumeCheckpointState:
+    if not config.AUTO_RESUME:
+        return _empty_resume_state("QSP_AUTO_RESUME=0")
+    if not config.LAST_CHECKPOINT_PATH.exists():
+        return _empty_resume_state(f"checkpoint assente: {config.LAST_CHECKPOINT_PATH}")
+
+    try:
+        payload = torch.load(config.LAST_CHECKPOINT_PATH, map_location=config.DEVICE)
+    except Exception as exc:
+        return _empty_resume_state(f"caricamento fallito: {exc}")
+
+    saved_config = payload.get("config", {})
+    if not isinstance(saved_config, dict):
+        return _empty_resume_state("config checkpoint mancante o non valida")
+
+    mismatches = _checkpoint_config_mismatches(saved_config)
+    if mismatches:
+        return _empty_resume_state("config incompatibile; " + "; ".join(mismatches))
+
+    model_state_dict = payload.get("model_state_dict")
+    if not isinstance(model_state_dict, dict):
+        return _empty_resume_state("model_state_dict mancante")
+
+    try:
+        model.load_state_dict(model_state_dict)
+    except Exception as exc:
+        return _empty_resume_state(f"state_dict incompatibile: {exc}")
+
+    history_payload = payload.get("history", {})
+    if not isinstance(history_payload, dict):
+        history_payload = {}
+    history = TrainingHistory(
+        epochs=[int(epoch) for epoch in history_payload.get("epochs", [])],
+        train_loss=[float(value) for value in history_payload.get("train_loss", [])],
+        train_fidelity=[float(value) for value in history_payload.get("train_fidelity", [])],
+    )
+    last_completed_epoch = int(payload.get("epoch", 0))
+    if history.epochs:
+        last_completed_epoch = max(last_completed_epoch, int(history.epochs[-1]))
+
+    best_loss = payload.get("best_loss")
+    return ResumeCheckpointState(
+        start_epoch=max(1, last_completed_epoch + 1),
+        history=history,
+        optimizer_state_dict=payload.get("optimizer_state_dict"),
+        scheduler_state_dict=payload.get("scheduler_state_dict"),
+        best_loss=None if best_loss is None else float(best_loss),
+        best_state=payload.get("best_state_dict"),
+        resumed=True,
+        reason=f"resume da {config.LAST_CHECKPOINT_PATH} (ultima epoca completa: {last_completed_epoch})",
+    )
 
 
 def _scheduled_sampling_probability(epoch: int) -> float:
@@ -182,16 +295,7 @@ def _save_last_checkpoint(
         "best_loss": float(best_loss),
         "best_state_dict": best_state,
         "config": {
-            "EPOCHS": int(config.EPOCHS),
-            "BATCH_SIZE": int(config.BATCH_SIZE),
-            "LEARNING_RATE": float(config.LEARNING_RATE),
-            "WEIGHT_DECAY": float(config.WEIGHT_DECAY),
-            "D_MODEL": int(config.D_MODEL),
-            "NUM_HEADS": int(config.NUM_HEADS),
-            "NUM_LAYERS": int(config.NUM_LAYERS),
-            "DIM_FEEDFORWARD": int(config.DIM_FEEDFORWARD),
-            "NUM_STATES": int(config.NUM_STATES),
-            "TRAIN_SEQUENCES": int(config.TRAIN_SEQUENCES),
+            **_checkpoint_config_snapshot(),
         },
     }
     _atomic_torch_save(checkpoint_payload, config.LAST_CHECKPOINT_PATH)

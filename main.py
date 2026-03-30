@@ -18,13 +18,17 @@ torch.set_num_threads(1)
 import config
 from input import generate_fixed_tfim_dataset
 from trainer import (
+    TrainingHistory,
     build_model,
+    compute_observable_curves,
     evaluate_autoregressive,
     evaluate_teacher_forced,
     exposure_bias_detected,
+    plot_observable_curves,
     plot_training_curves,
     resolve_partial_warmup_steps,
     set_seed,
+    try_resume_from_last_checkpoint,
     train_model,
 )
 
@@ -36,6 +40,52 @@ def _as_serializable(result) -> dict[str, object]:
         "fidelity_curve": [None if np.isnan(v) else float(v) for v in result.fidelity_curve],
         "coverage_curve": [float(v) for v in result.coverage_curve],
     }
+
+
+def _history_as_serializable(history: TrainingHistory) -> dict[str, object]:
+    return {
+        "epochs": [int(epoch) for epoch in history.epochs],
+        "train_loss": [float(value) for value in history.train_loss],
+        "train_fidelity": [float(value) for value in history.train_fidelity],
+    }
+
+
+def _observable_curves_as_serializable(curves) -> dict[str, object]:
+    return {
+        "time_indices": [int(v) for v in curves.time_indices.tolist()],
+        "physical_time": [float(v) for v in curves.physical_time.tolist()],
+        "mz_exact": [float(v) for v in curves.mz_exact.tolist()],
+        "mz_pred": [float(v) for v in curves.mz_pred.tolist()],
+        "mx_exact": [float(v) for v in curves.mx_exact.tolist()],
+        "mx_pred": [float(v) for v in curves.mx_pred.tolist()],
+        "cz_exact": [float(v) for v in curves.cz_exact.tolist()],
+        "cz_pred": [float(v) for v in curves.cz_pred.tolist()],
+    }
+
+
+def _load_history_from_last_checkpoint() -> TrainingHistory:
+    if not config.LAST_CHECKPOINT_PATH.exists():
+        return TrainingHistory(epochs=[], train_loss=[], train_fidelity=[])
+
+    payload = torch.load(config.LAST_CHECKPOINT_PATH, map_location="cpu")
+    history = payload.get("history", {})
+    return TrainingHistory(
+        epochs=[int(epoch) for epoch in history.get("epochs", [])],
+        train_loss=[float(value) for value in history.get("train_loss", [])],
+        train_fidelity=[float(value) for value in history.get("train_fidelity", [])],
+    )
+
+
+def _load_trained_model(model):
+    if not config.CHECKPOINT_PATH.exists():
+        raise FileNotFoundError(
+            f"Checkpoint non trovato: {config.CHECKPOINT_PATH}. "
+            "Disattiva QSP_EVAL_ONLY oppure genera prima best_model.pt."
+        )
+    state_dict = torch.load(config.CHECKPOINT_PATH, map_location=config.DEVICE)
+    model.load_state_dict(state_dict)
+    model.eval()
+    return _load_history_from_last_checkpoint()
 
 
 def _plot_split_curves(ax, title: str, teacher_forced, autoregressive, partial_results: dict[int, object]):
@@ -64,6 +114,11 @@ def main():
     set_seed(config.SEED)
     config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     dataset = generate_fixed_tfim_dataset()
+    resume_status = {
+        "enabled": bool(config.AUTO_RESUME),
+        "resumed": False,
+        "reason": "eval-only attivo" if config.EVAL_ONLY else "auto-resume disattivato",
+    }
 
     print("=" * 78)
     print("Quantum Sequence Prediction | X-basis clamped pipeline")
@@ -74,11 +129,45 @@ def main():
     print(f"Dataset:               train={dataset.train.num_sequences}, test={dataset.test.num_sequences}")
     print(f"Stati iniziali:        {dataset.train.initial_state_family}")
     print(f"Motivo famiglia:       {dataset.initial_state_family_reason}")
+    print(
+        f"Checkpoint best:       "
+        f"{'trovato' if config.CHECKPOINT_PATH.exists() else 'assente'} | {config.CHECKPOINT_PATH}"
+    )
+    print(
+        f"Checkpoint last:       "
+        f"{'trovato' if config.LAST_CHECKPOINT_PATH.exists() else 'assente'} | {config.LAST_CHECKPOINT_PATH}"
+    )
     print("=" * 78)
 
     model = build_model()
-    history = train_model(model, dataset.train.states)
-    plot_training_curves(history)
+    if config.EVAL_ONLY:
+        history = _load_trained_model(model)
+        if history.epochs:
+            plot_training_curves(history)
+        print(f"Modalita eval-only:    checkpoint caricato da {config.CHECKPOINT_PATH}")
+    else:
+        resume_state = try_resume_from_last_checkpoint(model)
+        if config.AUTO_RESUME:
+            resume_status = {
+                "enabled": True,
+                "resumed": bool(resume_state.resumed),
+                "reason": str(resume_state.reason),
+            }
+            if resume_state.resumed:
+                print(f"Auto-resume:           {resume_state.reason}")
+            else:
+                print(f"Auto-resume saltato:   {resume_state.reason}")
+        history = train_model(
+            model,
+            dataset.train.states,
+            start_epoch=resume_state.start_epoch,
+            history=resume_state.history,
+            optimizer_state_dict=resume_state.optimizer_state_dict,
+            scheduler_state_dict=resume_state.scheduler_state_dict,
+            best_loss=resume_state.best_loss,
+            best_state=resume_state.best_state,
+        )
+        plot_training_curves(history)
 
     train_teacher = evaluate_teacher_forced(model, dataset.train.states)
     test_teacher = evaluate_teacher_forced(model, dataset.test.states)
@@ -114,6 +203,28 @@ def main():
     fig.savefig(config.FIDELITY_PLOT_PATH, dpi=config.PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
 
+    train_observables = compute_observable_curves(model, dataset.train.states, warmup_states=rollout_warmup)
+    test_observables = compute_observable_curves(model, dataset.test.states, warmup_states=rollout_warmup)
+
+    plot_observable_curves(
+        curves=train_observables,
+        warmup_states=rollout_warmup,
+        output_path=config.OBSERVABLES_TRAIN_PLOT_PATH,
+        title=(
+            f"Osservabili | train set | "
+            f"{train_observables.time_indices.size} stati per traiettoria, warmup={rollout_warmup}"
+        ),
+    )
+    plot_observable_curves(
+        curves=test_observables,
+        warmup_states=rollout_warmup,
+        output_path=config.OBSERVABLES_TEST_PLOT_PATH,
+        title=(
+            f"Osservabili | test set | "
+            f"{test_observables.time_indices.size} stati per traiettoria, warmup={rollout_warmup}"
+        ),
+    )
+
     summary = {
         "seed": int(config.SEED),
         "device": config.DEVICE,
@@ -126,6 +237,8 @@ def main():
             "TEST_SEQUENCES": int(config.TEST_SEQUENCES),
             "INITIAL_STATE_FAMILY": config.INITIAL_STATE_FAMILY,
             "ROLLOUT_WARMUP_STATES": int(config.ROLLOUT_WARMUP_STATES),
+            "EVAL_ONLY": bool(config.EVAL_ONLY),
+            "AUTO_RESUME": bool(config.AUTO_RESUME),
             "PARTIAL_WARMUP_STEPS": config.PARTIAL_WARMUP_STEPS,
             "CLAMP_AUDIT_PRINT": bool(config.CLAMP_AUDIT_PRINT),
             "CLAMP_AUDIT_MAX_SEQUENCES": int(config.CLAMP_AUDIT_MAX_SEQUENCES),
@@ -138,16 +251,15 @@ def main():
             "train_initial_state_codes": dataset.train.initial_state_codes,
             "test_initial_state_codes": dataset.test.initial_state_codes,
         },
-        "training_history": {
-            "epochs": history.epochs,
-            "train_loss": history.train_loss,
-            "train_fidelity": history.train_fidelity,
-        },
+        "resume": resume_status,
+        "training_history": _history_as_serializable(history),
         "evaluation": {
             "train_teacher_forced": _as_serializable(train_teacher),
             "train_autoregressive": _as_serializable(train_rollout),
             "test_teacher_forced": _as_serializable(test_teacher),
             "test_autoregressive": _as_serializable(test_rollout),
+            "train_observables": _observable_curves_as_serializable(train_observables),
+            "test_observables": _observable_curves_as_serializable(test_observables),
             "partial_warmup_n1_values": warmup_n1_values,
             "train_partial_warmups": {str(k): _as_serializable(v) for k, v in partial_results_train.items()},
             "test_partial_warmups": {str(k): _as_serializable(v) for k, v in partial_results_test.items()},
@@ -155,6 +267,8 @@ def main():
         "artifacts": {
             "fidelity_plot": str(config.FIDELITY_PLOT_PATH),
             "training_curves_plot": str(config.TRAINING_CURVES_PATH),
+            "observables_train_plot": str(config.OBSERVABLES_TRAIN_PLOT_PATH),
+            "observables_test_plot": str(config.OBSERVABLES_TEST_PLOT_PATH),
             "summary_json": str(config.SUMMARY_PATH),
         },
     }
@@ -166,6 +280,8 @@ def main():
     print(f"  Test  | teacher={test_teacher.mean_fidelity:.6f} | rollout={test_rollout.mean_fidelity:.6f}")
     print(f"\nPlot fidelity:  {config.FIDELITY_PLOT_PATH}")
     print(f"Plot training:  {config.TRAINING_CURVES_PATH}")
+    print(f"Obs train plot: {config.OBSERVABLES_TRAIN_PLOT_PATH}")
+    print(f"Obs test plot:  {config.OBSERVABLES_TEST_PLOT_PATH}")
     print(f"Summary JSON:   {config.SUMMARY_PATH}")
 
 
