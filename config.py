@@ -93,13 +93,18 @@ def _default_by_qubits(defaults: dict[int, int], fallback: int) -> int:
     return int(defaults.get(int(N_QUBITS), fallback))
 
 # Numero totale di stati in ogni traiettoria, incluso psi(0).
-# Config "bassa" e stabile di default: 60 stati (59 predizioni).
-NUM_STATES = _env_int("QSP_NUM_STATES", 12)
+# Default target: 60 stati (59 predizioni).
+NUM_STATES = _env_int("QSP_NUM_STATES", 60)
 if NUM_STATES < 2:
     raise ValueError(f"NUM_STATES deve essere >= 2, ricevuto: {NUM_STATES}")
 
 # Alias retrocompatibile: numero di transizioni supervisionate.
 SEQ_LEN = NUM_STATES - 1
+
+
+def _is_long_horizon() -> bool:
+    # Run con rollout lungo: >=60 stati (59+ predizioni).
+    return int(NUM_STATES) >= 60
 
 
 TRAIN_SEQUENCES = _env_int("QSP_TRAIN_SEQUENCES", 1024)
@@ -163,22 +168,40 @@ if D_MODEL % NUM_HEADS != 0:
     raise ValueError("D_MODEL deve essere divisibile per NUM_HEADS.")
 
 
-BATCH_SIZE = _env_int("QSP_BATCH_SIZE", _default_by_qubits({4: 64, 6: 24}, 24))
-EPOCHS = _env_int("QSP_EPOCHS", _default_by_qubits({4: 120, 6: 100}, 120))
+BATCH_SIZE = _env_int(
+    "QSP_BATCH_SIZE",
+    _default_by_qubits({4: 48 if _is_long_horizon() else 64, 6: 24}, 24),
+)
+EPOCHS = _env_int(
+    "QSP_EPOCHS",
+    _default_by_qubits({4: 160 if _is_long_horizon() else 120, 6: 100}, 120),
+)
 LEARNING_RATE = _env_float("QSP_LEARNING_RATE", 1e-4)
 WEIGHT_DECAY = _env_float("QSP_WEIGHT_DECAY", 1e-4)
 GRAD_CLIP_MAX_NORM = _env_float("QSP_GRAD_CLIP_MAX_NORM", 1.0)
 LOG_FIDELITY_EPS = _env_float("QSP_LOG_FIDELITY_EPS", 1e-8)
 # Scheduled sampling più aggressivo per ridurre exposure bias nel rollout.
-SCHEDULED_SAMPLING_RAMP_EPOCHS = _env_int("QSP_SCHEDULED_SAMPLING_RAMP_EPOCHS", 30)
-SCHEDULED_SAMPLING_MAX_PROB = _env_float("QSP_SCHEDULED_SAMPLING_MAX_PROB", 0.60)
+SCHEDULED_SAMPLING_RAMP_EPOCHS = _env_int(
+    "QSP_SCHEDULED_SAMPLING_RAMP_EPOCHS",
+    45 if _is_long_horizon() else 30,
+)
+SCHEDULED_SAMPLING_MAX_PROB = _env_float(
+    "QSP_SCHEDULED_SAMPLING_MAX_PROB",
+    0.70 if _is_long_horizon() else 0.60,
+)
 
 # Rollout training più pesante e curriculum più rapido (arriva prima a rollout lunghi).
 ROLLOUT_AUX_WEIGHT = _env_float("QSP_ROLLOUT_AUX_WEIGHT", 1.00)
-ROLLOUT_CURRICULUM_EPOCHS = _env_int("QSP_ROLLOUT_CURRICULUM_EPOCHS", 20)
+ROLLOUT_CURRICULUM_EPOCHS = _env_int(
+    "QSP_ROLLOUT_CURRICULUM_EPOCHS",
+    35 if _is_long_horizon() else 20,
+)
 
 # Warmup usato SOLO nel rollout-training: più contesto vero => rollout più stabile.
-ROLLOUT_WARMUP_STATES = _env_int("QSP_ROLLOUT_WARMUP_STATES", 4)
+ROLLOUT_WARMUP_STATES = _env_int(
+    "QSP_ROLLOUT_WARMUP_STATES",
+    max(4, min(8, int(NUM_STATES) // 10)),
+)
 if BATCH_SIZE < 1 or EPOCHS < 1:
     raise ValueError("BATCH_SIZE e EPOCHS devono essere >= 1.")
 if LEARNING_RATE <= 0.0:
@@ -202,6 +225,11 @@ if ROLLOUT_CURRICULUM_EPOCHS < 1:
     raise ValueError(
         f"ROLLOUT_CURRICULUM_EPOCHS deve essere >= 1, ricevuto: {ROLLOUT_CURRICULUM_EPOCHS}"
     )
+if ROLLOUT_WARMUP_STATES < 1 or ROLLOUT_WARMUP_STATES >= NUM_STATES:
+    raise ValueError(
+        "ROLLOUT_WARMUP_STATES deve stare in [1, NUM_STATES-1], "
+        f"ricevuto: {ROLLOUT_WARMUP_STATES} con NUM_STATES={NUM_STATES}"
+    )
 
 
 EXPOSURE_BIAS_GAP_THRESHOLD = _env_float("QSP_EXPOSURE_BIAS_GAP_THRESHOLD", 0.10)
@@ -210,11 +238,16 @@ PARTIAL_WARMUP_STEPS = _env_str("QSP_PARTIAL_WARMUP_STEPS", "auto")
 PLOT_DPI = _env_int("QSP_PLOT_DPI", 160)
 CLAMP_AUDIT_PRINT = _env_bool("QSP_CLAMP_AUDIT_PRINT", True)
 CLAMP_AUDIT_MAX_SEQUENCES = _env_int("QSP_CLAMP_AUDIT_MAX_SEQUENCES", 3)
-CLAMP_AUDIT_MAX_STATES = _env_int("QSP_CLAMP_AUDIT_MAX_STATES", 4)
+CLAMP_AUDIT_MAX_STATES = _env_int("QSP_CLAMP_AUDIT_MAX_STATES", min(6, int(NUM_STATES)))
 CLAMP_AUDIT_PRINT_BITSTRINGS = _env_bool("QSP_CLAMP_AUDIT_PRINT_BITSTRINGS", True)
 CLAMP_AUDIT_PRINT_COEFFS = _env_bool("QSP_CLAMP_AUDIT_PRINT_COEFFS", False)
 if CLAMP_AUDIT_MAX_SEQUENCES < 0 or CLAMP_AUDIT_MAX_STATES < 0:
     raise ValueError("CLAMP_AUDIT_MAX_SEQUENCES e CLAMP_AUDIT_MAX_STATES devono essere >= 0.")
+if CLAMP_AUDIT_MAX_STATES > NUM_STATES:
+    raise ValueError(
+        f"CLAMP_AUDIT_MAX_STATES non puo' superare NUM_STATES={NUM_STATES}, "
+        f"ricevuto: {CLAMP_AUDIT_MAX_STATES}"
+    )
 
 
 NUM_WORKERS = _env_int("QSP_NUM_WORKERS", 0)
