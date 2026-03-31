@@ -203,24 +203,16 @@ def main():
     fig.savefig(config.FIDELITY_PLOT_PATH, dpi=config.PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
 
-    train_observables = compute_observable_curves(model, dataset.train.states, warmup_states=rollout_warmup)
-    test_observables = compute_observable_curves(model, dataset.test.states, warmup_states=rollout_warmup)
+    test_seq_idx = min(int(config.OBSERVABLES_TEST_SEQUENCE_INDEX), int(dataset.test.num_sequences) - 1)
+    test_single_sequence = dataset.test.states[test_seq_idx : test_seq_idx + 1]
+    test_observables = compute_observable_curves(model, test_single_sequence, warmup_states=rollout_warmup)
 
-    plot_observable_curves(
-        curves=train_observables,
-        warmup_states=rollout_warmup,
-        output_path=config.OBSERVABLES_TRAIN_PLOT_PATH,
-        title=(
-            f"Osservabili | train set | "
-            f"{train_observables.time_indices.size} stati per traiettoria, warmup={rollout_warmup}"
-        ),
-    )
     plot_observable_curves(
         curves=test_observables,
         warmup_states=rollout_warmup,
         output_path=config.OBSERVABLES_TEST_PLOT_PATH,
         title=(
-            f"Osservabili | test set | "
+            f"Osservabili | test sequence idx={test_seq_idx} | "
             f"{test_observables.time_indices.size} stati per traiettoria, warmup={rollout_warmup}"
         ),
     )
@@ -240,6 +232,7 @@ def main():
             "EVAL_ONLY": bool(config.EVAL_ONLY),
             "AUTO_RESUME": bool(config.AUTO_RESUME),
             "PARTIAL_WARMUP_STEPS": config.PARTIAL_WARMUP_STEPS,
+            "OBSERVABLES_TEST_SEQUENCE_INDEX": int(config.OBSERVABLES_TEST_SEQUENCE_INDEX),
             "CLAMP_AUDIT_PRINT": bool(config.CLAMP_AUDIT_PRINT),
             "CLAMP_AUDIT_MAX_SEQUENCES": int(config.CLAMP_AUDIT_MAX_SEQUENCES),
             "CLAMP_AUDIT_MAX_STATES": int(config.CLAMP_AUDIT_MAX_STATES),
@@ -258,7 +251,7 @@ def main():
             "train_autoregressive": _as_serializable(train_rollout),
             "test_teacher_forced": _as_serializable(test_teacher),
             "test_autoregressive": _as_serializable(test_rollout),
-            "train_observables": _observable_curves_as_serializable(train_observables),
+            "test_observables_sequence_index": int(test_seq_idx),
             "test_observables": _observable_curves_as_serializable(test_observables),
             "partial_warmup_n1_values": warmup_n1_values,
             "train_partial_warmups": {str(k): _as_serializable(v) for k, v in partial_results_train.items()},
@@ -280,7 +273,6 @@ def main():
     print(f"  Test  | teacher={test_teacher.mean_fidelity:.6f} | rollout={test_rollout.mean_fidelity:.6f}")
     print(f"\nPlot fidelity:  {config.FIDELITY_PLOT_PATH}")
     print(f"Plot training:  {config.TRAINING_CURVES_PATH}")
-    print(f"Obs train plot: {config.OBSERVABLES_TRAIN_PLOT_PATH}")
     print(f"Obs test plot:  {config.OBSERVABLES_TEST_PLOT_PATH}")
     print(f"Summary JSON:   {config.SUMMARY_PATH}")
 
