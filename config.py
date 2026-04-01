@@ -148,13 +148,14 @@ if EXACT_DIAG_MAX_DIM < 2:
     raise ValueError(f"EXACT_DIAG_MAX_DIM deve essere >= 2, ricevuto: {EXACT_DIAG_MAX_DIM}")
 
 
-INITIAL_STATE_FAMILY = _env_str("QSP_INITIAL_STATE_FAMILY", "x_basis")
-if INITIAL_STATE_FAMILY not in {"x_basis"}:
+INITIAL_STATE_FAMILY = _env_str("QSP_INITIAL_STATE_FAMILY", "xyz_basis")
+if INITIAL_STATE_FAMILY not in {"x_basis", "xyz_basis"}:
     raise ValueError(
         f"INITIAL_STATE_FAMILY={INITIAL_STATE_FAMILY!r} non valida. "
-        "Valori ammessi: x_basis."
+        "Valori ammessi: x_basis, xyz_basis."
     )
-X_BASIS_SAMPLE_WITH_REPLACEMENT = _env_bool("QSP_X_BASIS_SAMPLE_WITH_REPLACEMENT", True)
+INITIAL_STATE_SAMPLE_WITH_REPLACEMENT = _env_bool("QSP_INITIAL_STATE_SAMPLE_WITH_REPLACEMENT", True)
+X_BASIS_SAMPLE_WITH_REPLACEMENT = INITIAL_STATE_SAMPLE_WITH_REPLACEMENT
 
 
 D_MODEL = _env_int("QSP_D_MODEL", _default_by_qubits({4: 64, 6: 256}, 256))
@@ -180,7 +181,49 @@ LEARNING_RATE = _env_float("QSP_LEARNING_RATE", 1e-4)
 WEIGHT_DECAY = _env_float("QSP_WEIGHT_DECAY", 1e-4)
 GRAD_CLIP_MAX_NORM = _env_float("QSP_GRAD_CLIP_MAX_NORM", 1.0)
 LOG_FIDELITY_EPS = _env_float("QSP_LOG_FIDELITY_EPS", 1e-8)
-# Scheduled sampling più aggressivo per ridurre exposure bias nel rollout.
+
+# Orizzonte multi-step del nuovo training autoregressivo.
+# Default piu' stabile del curriculum adattivo aggressivo: manteniamo un
+# orizzonte intermedio fisso e teacher forcing basso.
+MULTISTEP_H = _env_int("QSP_MULTISTEP_H", min(6, int(SEQ_LEN)))
+if not (1 <= MULTISTEP_H <= SEQ_LEN):
+    raise ValueError(
+        f"MULTISTEP_H deve stare in [1, SEQ_LEN={SEQ_LEN}], ricevuto: {MULTISTEP_H}"
+    )
+
+# Numero di passi che continuano a usare il contesto corretto prima del passaggio
+# al contesto predetto. Default piu' aggressivo per esporre prima il modello
+# al regime autoregressivo.
+MULTISTEP_TEACHER_FORCING_STEPS = _env_int(
+    "QSP_MULTISTEP_TEACHER_FORCING_STEPS",
+    min(2, int(MULTISTEP_H)),
+)
+if MULTISTEP_TEACHER_FORCING_STEPS < 0:
+    raise ValueError(
+        "MULTISTEP_TEACHER_FORCING_STEPS deve essere >= 0, "
+        f"ricevuto: {MULTISTEP_TEACHER_FORCING_STEPS}"
+    )
+MULTISTEP_TRAIN_VERBOSE = _env_bool("QSP_MULTISTEP_TRAIN_VERBOSE", False)
+
+# Training multi-step adattivo:
+# resta disponibile via env, ma di default lo lasciamo spento per privilegiare
+# una baseline piu' stabile e interpretabile.
+ADAPTIVE_MULTISTEP_ENABLED = _env_bool("QSP_ADAPTIVE_MULTISTEP_ENABLED", False)
+ADAPTIVE_STATS_EMA = _env_float("QSP_ADAPTIVE_STATS_EMA", 0.70)
+ADAPTIVE_WEIGHT_ALPHA = _env_float("QSP_ADAPTIVE_WEIGHT_ALPHA", 0.80)
+ADAPTIVE_WEIGHT_MIN = _env_float("QSP_ADAPTIVE_WEIGHT_MIN", 1.0)
+ADAPTIVE_WEIGHT_MAX = _env_float("QSP_ADAPTIVE_WEIGHT_MAX", 2.0)
+ADAPTIVE_H_MIN = _env_int("QSP_ADAPTIVE_H_MIN", max(1, min(5, int(MULTISTEP_H))))
+ADAPTIVE_H_MAX = _env_int("QSP_ADAPTIVE_H_MAX", int(MULTISTEP_H))
+ADAPTIVE_TEACHER_MIN = _env_int("QSP_ADAPTIVE_TEACHER_MIN", 1)
+ADAPTIVE_TEACHER_MAX = _env_int("QSP_ADAPTIVE_TEACHER_MAX", min(6, int(MULTISTEP_H)))
+ADAPTIVE_H_LOSS_THRESHOLD = _env_float("QSP_ADAPTIVE_H_LOSS_THRESHOLD", 0.95)
+ADAPTIVE_H_FIDELITY_THRESHOLD = _env_float("QSP_ADAPTIVE_H_FIDELITY_THRESHOLD", 0.58)
+ADAPTIVE_TEACHER_LOSS_THRESHOLD = _env_float("QSP_ADAPTIVE_TEACHER_LOSS_THRESHOLD", 0.85)
+ADAPTIVE_TEACHER_FIDELITY_THRESHOLD = _env_float("QSP_ADAPTIVE_TEACHER_FIDELITY_THRESHOLD", 0.62)
+
+# Parametri legacy del vecchio rollout-aux training: mantenuti per retrocompatibilita'
+# di configurazione, ma non piu' usati dal nuovo training multi-step.
 SCHEDULED_SAMPLING_RAMP_EPOCHS = _env_int(
     "QSP_SCHEDULED_SAMPLING_RAMP_EPOCHS",
     45 if _is_long_horizon() else 30,
@@ -229,6 +272,41 @@ if ROLLOUT_WARMUP_STATES < 1 or ROLLOUT_WARMUP_STATES >= NUM_STATES:
     raise ValueError(
         "ROLLOUT_WARMUP_STATES deve stare in [1, NUM_STATES-1], "
         f"ricevuto: {ROLLOUT_WARMUP_STATES} con NUM_STATES={NUM_STATES}"
+    )
+if not (0.0 <= ADAPTIVE_STATS_EMA < 1.0):
+    raise ValueError(
+        f"ADAPTIVE_STATS_EMA deve stare in [0,1), ricevuto: {ADAPTIVE_STATS_EMA}"
+    )
+if ADAPTIVE_WEIGHT_ALPHA < 0.0:
+    raise ValueError(
+        f"ADAPTIVE_WEIGHT_ALPHA deve essere >= 0, ricevuto: {ADAPTIVE_WEIGHT_ALPHA}"
+    )
+if ADAPTIVE_WEIGHT_MIN <= 0.0 or ADAPTIVE_WEIGHT_MAX <= 0.0:
+    raise ValueError("ADAPTIVE_WEIGHT_MIN e ADAPTIVE_WEIGHT_MAX devono essere > 0.")
+if ADAPTIVE_WEIGHT_MIN > ADAPTIVE_WEIGHT_MAX:
+    raise ValueError("ADAPTIVE_WEIGHT_MIN non puo' superare ADAPTIVE_WEIGHT_MAX.")
+if not (1 <= ADAPTIVE_H_MIN <= ADAPTIVE_H_MAX <= SEQ_LEN):
+    raise ValueError(
+        "ADAPTIVE_H_MIN e ADAPTIVE_H_MAX devono stare in [1, SEQ_LEN] "
+        f"con ADAPTIVE_H_MIN={ADAPTIVE_H_MIN}, ADAPTIVE_H_MAX={ADAPTIVE_H_MAX}, SEQ_LEN={SEQ_LEN}"
+    )
+if not (0 <= ADAPTIVE_TEACHER_MIN <= ADAPTIVE_TEACHER_MAX <= ADAPTIVE_H_MAX):
+    raise ValueError(
+        "ADAPTIVE_TEACHER_MIN e ADAPTIVE_TEACHER_MAX devono stare in [0, ADAPTIVE_H_MAX] "
+        f"con ADAPTIVE_TEACHER_MIN={ADAPTIVE_TEACHER_MIN}, "
+        f"ADAPTIVE_TEACHER_MAX={ADAPTIVE_TEACHER_MAX}, ADAPTIVE_H_MAX={ADAPTIVE_H_MAX}"
+    )
+if ADAPTIVE_H_LOSS_THRESHOLD < 0.0 or ADAPTIVE_TEACHER_LOSS_THRESHOLD < 0.0:
+    raise ValueError("Le soglie di loss adattive devono essere >= 0.")
+if not (0.0 <= ADAPTIVE_H_FIDELITY_THRESHOLD <= 1.0):
+    raise ValueError(
+        "ADAPTIVE_H_FIDELITY_THRESHOLD deve stare in [0,1], "
+        f"ricevuto: {ADAPTIVE_H_FIDELITY_THRESHOLD}"
+    )
+if not (0.0 <= ADAPTIVE_TEACHER_FIDELITY_THRESHOLD <= 1.0):
+    raise ValueError(
+        "ADAPTIVE_TEACHER_FIDELITY_THRESHOLD deve stare in [0,1], "
+        f"ricevuto: {ADAPTIVE_TEACHER_FIDELITY_THRESHOLD}"
     )
 
 
