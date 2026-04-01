@@ -35,17 +35,20 @@ class EvaluationResult:
 
 
 @dataclass
-class TrainObservableCurves:
-    """Medie sul training set: traiettoria esatta vs rollout autoregressivo (stesso warmup dell'eval)."""
+class ObservableComparisonCurves:
+    """Confronto tra traiettorie esatte, multi-step e rollout libero."""
 
     time_indices: np.ndarray
     physical_time: np.ndarray
     mz_exact: np.ndarray
-    mz_pred: np.ndarray
+    mz_multistep: np.ndarray
+    mz_rollout: np.ndarray
     mx_exact: np.ndarray
-    mx_pred: np.ndarray
+    mx_multistep: np.ndarray
+    mx_rollout: np.ndarray
     cz_exact: np.ndarray
-    cz_pred: np.ndarray
+    cz_multistep: np.ndarray
+    cz_rollout: np.ndarray
 
 
 @dataclass
@@ -58,6 +61,49 @@ class ResumeCheckpointState:
     best_state: dict | None
     resumed: bool
     reason: str
+
+
+@dataclass
+class BatchAdaptiveStats:
+    horizon: int
+    teacher_steps: int
+    mean_offset_losses: list[float]
+    mean_offset_fidelities: list[float]
+    mean_offset_weights: list[float]
+
+
+@dataclass
+class AdaptiveEpochSummary:
+    epoch: int
+    horizon: int
+    teacher_steps: int
+    head_loss: float
+    tail_loss: float
+    head_fidelity: float
+    tail_fidelity: float
+    mean_offset_losses: list[float]
+    mean_offset_fidelities: list[float]
+    mean_offset_weights: list[float]
+
+
+@dataclass
+class AdaptiveTrainingTrace:
+    enabled: bool
+    initial_horizon: int
+    initial_teacher_steps: int
+    final_horizon: int
+    final_teacher_steps: int
+    epoch_summaries: list[AdaptiveEpochSummary]
+
+
+@dataclass
+class AdaptiveControllerState:
+    current_horizon: int
+    current_teacher_steps: int
+    ema_head_loss: float | None = None
+    ema_tail_loss: float | None = None
+    ema_head_fidelity: float | None = None
+    ema_tail_fidelity: float | None = None
 
 
 def set_seed(seed: int):
@@ -112,6 +158,17 @@ def _checkpoint_config_snapshot() -> dict[str, object]:
         "NUM_LAYERS": int(config.NUM_LAYERS),
         "DIM_FEEDFORWARD": int(config.DIM_FEEDFORWARD),
         "OUTPUT_PARAMETRIZATION": str(config.OUTPUT_PARAMETRIZATION),
+        "MULTISTEP_H": int(config.MULTISTEP_H),
+        "MULTISTEP_TEACHER_FORCING_STEPS": int(config.MULTISTEP_TEACHER_FORCING_STEPS),
+        "ADAPTIVE_MULTISTEP_ENABLED": bool(config.ADAPTIVE_MULTISTEP_ENABLED),
+        "ADAPTIVE_H_MIN": int(config.ADAPTIVE_H_MIN),
+        "ADAPTIVE_H_MAX": int(config.ADAPTIVE_H_MAX),
+        "ADAPTIVE_TEACHER_MIN": int(config.ADAPTIVE_TEACHER_MIN),
+        "ADAPTIVE_TEACHER_MAX": int(config.ADAPTIVE_TEACHER_MAX),
+        "ADAPTIVE_WEIGHT_ALPHA": float(config.ADAPTIVE_WEIGHT_ALPHA),
+        "ADAPTIVE_WEIGHT_MIN": float(config.ADAPTIVE_WEIGHT_MIN),
+        "ADAPTIVE_WEIGHT_MAX": float(config.ADAPTIVE_WEIGHT_MAX),
+        "ADAPTIVE_STATS_EMA": float(config.ADAPTIVE_STATS_EMA),
     }
 
 
@@ -185,63 +242,247 @@ def try_resume_from_last_checkpoint(model: QuantumSequencePredictor) -> ResumeCh
     )
 
 
-def _scheduled_sampling_probability(epoch: int) -> float:
-    progress = min(1.0, float(epoch) / float(config.SCHEDULED_SAMPLING_RAMP_EPOCHS))
-    return float(config.SCHEDULED_SAMPLING_MAX_PROB) * progress
+def _effective_multistep_teacher_steps(horizon: int, requested_steps: int | None = None) -> int:
+    if horizon < 1:
+        return 0
+    if requested_steps is None:
+        requested_steps = int(config.MULTISTEP_TEACHER_FORCING_STEPS)
+    return max(0, min(int(requested_steps), int(horizon)))
 
 
-def _rollout_training_steps(seq_len: int, epoch: int) -> int:
-    progress = min(1.0, float(epoch) / float(config.ROLLOUT_CURRICULUM_EPOCHS))
-    return max(1, min(seq_len, int(round(progress * seq_len))))
+def _describe_multistep_transition(start_index: int, target_index: int, use_teacher: bool) -> str:
+    target_state = target_index + 1
+    if target_index == start_index:
+        return f"uso il contesto vero fino a t{start_index} per predire t{target_state}"
+    source_label = "vero" if use_teacher else "predetto"
+    return (
+        f"uso il nuovo stato {source_label} t{target_index} insieme al contesto fino a t{target_index} "
+        f"per predire t{target_state}"
+    )
 
 
-def _autoregressive_unroll_loss(
+def _safe_mean(values: list[float]) -> float:
+    if not values:
+        return float("nan")
+    return float(sum(values) / len(values))
+
+
+def _ema_update(previous: float | None, value: float) -> float:
+    if previous is None or not np.isfinite(previous):
+        return float(value)
+    return float(config.ADAPTIVE_STATS_EMA * previous + (1.0 - config.ADAPTIVE_STATS_EMA) * value)
+
+
+def _make_adaptive_controller() -> AdaptiveControllerState:
+    if not config.ADAPTIVE_MULTISTEP_ENABLED:
+        horizon = int(config.MULTISTEP_H)
+        teacher_steps = _effective_multistep_teacher_steps(horizon, int(config.MULTISTEP_TEACHER_FORCING_STEPS))
+        return AdaptiveControllerState(
+            current_horizon=horizon,
+            current_teacher_steps=teacher_steps,
+        )
+
+    horizon = max(1, min(int(config.ADAPTIVE_H_MIN), int(config.ADAPTIVE_H_MAX), int(config.SEQ_LEN)))
+    teacher_upper = min(int(config.ADAPTIVE_TEACHER_MAX), horizon)
+    teacher_seed = min(int(config.MULTISTEP_TEACHER_FORCING_STEPS), teacher_upper)
+    teacher_steps = max(int(config.ADAPTIVE_TEACHER_MIN), teacher_seed)
+    return AdaptiveControllerState(
+        current_horizon=horizon,
+        current_teacher_steps=teacher_steps,
+    )
+
+
+def _build_step_weights(
+    mean_losses: torch.Tensor,
+    mean_fidelities: torch.Tensor,
+) -> torch.Tensor:
+    weights = torch.ones_like(mean_losses)
+    if not config.ADAPTIVE_MULTISTEP_ENABLED or mean_losses.numel() <= 1:
+        return weights
+
+    with torch.no_grad():
+        detached_losses = mean_losses.detach()
+        detached_fidelities = mean_fidelities.detach()
+        loss_jumps = torch.zeros_like(detached_losses)
+        fidelity_drops = torch.zeros_like(detached_fidelities)
+        loss_jumps[1:] = torch.relu(detached_losses[1:] - detached_losses[:-1])
+        fidelity_drops[1:] = torch.relu(detached_fidelities[:-1] - detached_fidelities[1:])
+        signal = loss_jumps + fidelity_drops
+        signal_mean = signal.mean().clamp(min=1e-8)
+        normalized_signal = signal / signal_mean
+        weights = 1.0 + float(config.ADAPTIVE_WEIGHT_ALPHA) * normalized_signal
+        weights = weights.clamp(
+            min=float(config.ADAPTIVE_WEIGHT_MIN),
+            max=float(config.ADAPTIVE_WEIGHT_MAX),
+        )
+    return weights.to(mean_losses.device, dtype=mean_losses.dtype)
+
+
+def _summarize_epoch_adaptive_stats(
+    *,
+    epoch: int,
+    horizon: int,
+    teacher_steps: int,
+    loss_sums: np.ndarray,
+    fidelity_sums: np.ndarray,
+    weight_sums: np.ndarray,
+    counts: np.ndarray,
+) -> AdaptiveEpochSummary:
+    mean_losses: list[float] = []
+    mean_fidelities: list[float] = []
+    mean_weights: list[float] = []
+    for offset in range(horizon):
+        if counts[offset] <= 0.0:
+            mean_losses.append(float("nan"))
+            mean_fidelities.append(float("nan"))
+            mean_weights.append(float("nan"))
+            continue
+        mean_losses.append(float(loss_sums[offset] / counts[offset]))
+        mean_fidelities.append(float(fidelity_sums[offset] / counts[offset]))
+        mean_weights.append(float(weight_sums[offset] / counts[offset]))
+
+    finite_losses = [value for value in mean_losses if np.isfinite(value)]
+    finite_fidelities = [value for value in mean_fidelities if np.isfinite(value)]
+    head_loss = mean_losses[0] if mean_losses else float("nan")
+    tail_loss = finite_losses[-1] if finite_losses else float("nan")
+    head_fidelity = mean_fidelities[0] if mean_fidelities else float("nan")
+    tail_fidelity = finite_fidelities[-1] if finite_fidelities else float("nan")
+    return AdaptiveEpochSummary(
+        epoch=epoch,
+        horizon=horizon,
+        teacher_steps=teacher_steps,
+        head_loss=head_loss,
+        tail_loss=tail_loss,
+        head_fidelity=head_fidelity,
+        tail_fidelity=tail_fidelity,
+        mean_offset_losses=mean_losses,
+        mean_offset_fidelities=mean_fidelities,
+        mean_offset_weights=mean_weights,
+    )
+
+
+def _update_adaptive_controller(
+    controller: AdaptiveControllerState,
+    summary: AdaptiveEpochSummary,
+):
+    controller.ema_head_loss = _ema_update(controller.ema_head_loss, summary.head_loss)
+    controller.ema_tail_loss = _ema_update(controller.ema_tail_loss, summary.tail_loss)
+    controller.ema_head_fidelity = _ema_update(controller.ema_head_fidelity, summary.head_fidelity)
+    controller.ema_tail_fidelity = _ema_update(controller.ema_tail_fidelity, summary.tail_fidelity)
+
+    if not config.ADAPTIVE_MULTISTEP_ENABLED:
+        return
+
+    tail_loss = float(controller.ema_tail_loss)
+    tail_fidelity = float(controller.ema_tail_fidelity)
+    head_loss = float(controller.ema_head_loss)
+    head_fidelity = float(controller.ema_head_fidelity)
+
+    if (
+        tail_loss <= float(config.ADAPTIVE_H_LOSS_THRESHOLD)
+        and tail_fidelity >= float(config.ADAPTIVE_H_FIDELITY_THRESHOLD)
+        and controller.current_horizon < int(config.ADAPTIVE_H_MAX)
+    ):
+        controller.current_horizon += 1
+    elif (
+        (
+            tail_loss > 1.25 * float(config.ADAPTIVE_H_LOSS_THRESHOLD)
+            or tail_fidelity < float(config.ADAPTIVE_H_FIDELITY_THRESHOLD) - 0.04
+        )
+        and controller.current_horizon > int(config.ADAPTIVE_H_MIN)
+    ):
+        controller.current_horizon -= 1
+
+    teacher_cap = min(int(config.ADAPTIVE_TEACHER_MAX), int(controller.current_horizon))
+    if (
+        (
+            head_loss > float(config.ADAPTIVE_TEACHER_LOSS_THRESHOLD)
+            or head_fidelity < float(config.ADAPTIVE_TEACHER_FIDELITY_THRESHOLD)
+        )
+        and controller.current_teacher_steps < teacher_cap
+    ):
+        controller.current_teacher_steps += 1
+    elif (
+        head_loss <= 0.90 * float(config.ADAPTIVE_TEACHER_LOSS_THRESHOLD)
+        and head_fidelity >= float(config.ADAPTIVE_TEACHER_FIDELITY_THRESHOLD)
+        and controller.current_teacher_steps > int(config.ADAPTIVE_TEACHER_MIN)
+    ):
+        controller.current_teacher_steps -= 1
+
+    controller.current_teacher_steps = max(
+        int(config.ADAPTIVE_TEACHER_MIN),
+        min(int(controller.current_teacher_steps), teacher_cap),
+    )
+
+
+def _multistep_training_loss(
     model: QuantumSequencePredictor,
     criterion: NegativeLogFidelityLoss,
     inputs: torch.Tensor,
     targets: torch.Tensor,
-    steps: int,
-    scheduled_sampling_prob: float,
+    horizon_limit: int,
+    teacher_steps_override: int,
+    epoch: int | None = None,
+    batch_idx: int | None = None,
 ):
-    warmup_states = int(config.ROLLOUT_WARMUP_STATES)
-    warmup_states = max(1, min(warmup_states, int(inputs.shape[1])))
-    context = inputs[:, :warmup_states, :]
-    per_step_losses: list[torch.Tensor] = []
-    per_step_fidelities: list[torch.Tensor] = []
+    per_offset_losses: list[list[torch.Tensor]] = [[] for _ in range(max(1, int(horizon_limit)))]
+    per_offset_fidelities: list[list[torch.Tensor]] = [[] for _ in range(max(1, int(horizon_limit)))]
+    seq_len = int(inputs.shape[1])
+    verbose = bool(config.MULTISTEP_TRAIN_VERBOSE)
 
-    # Se warmup_states = w, la prima predizione supervisionata è targets[w-1] = state[w].
-    start_index = warmup_states - 1
-    remaining_targets = int(targets.shape[1]) - start_index
-    max_steps = min(int(steps), max(1, remaining_targets))
+    if verbose and epoch is not None and batch_idx is not None:
+        print(
+            f"[train multistep] epoca={epoch} batch={batch_idx} | "
+            f"SEQ_LEN={seq_len} H={horizon_limit} teacher_steps={teacher_steps_override}"
+        )
 
-    for step in range(max_steps):
-        target_index = start_index + step
-        predicted_next = model(context)[:, -1, :]
-        step_target = targets[:, target_index : target_index + 1, :]
-        step_loss, step_mean_fidelity, _ = criterion(predicted_next.unsqueeze(1), step_target)
-        per_step_losses.append(step_loss)
-        per_step_fidelities.append(step_mean_fidelity)
+    for start_index in range(seq_len):
+        horizon = min(int(horizon_limit), seq_len - start_index)
+        teacher_steps = _effective_multistep_teacher_steps(horizon, teacher_steps_override)
+        context = inputs[:, : start_index + 1, :]
 
-        if step + 1 >= max_steps:
-            continue
-
-        gold_next_context = inputs[:, target_index + 1 : target_index + 2, :]
-        if scheduled_sampling_prob <= 0.0:
-            next_context = gold_next_context
-        else:
-            use_model_mask = (
-                torch.rand((inputs.shape[0], 1, 1), device=inputs.device) < scheduled_sampling_prob
+        if verbose:
+            print(
+                f"  [start t{start_index}] contesto iniziale: t0..t{start_index} | "
+                f"orizzonte effettivo={horizon} | teacher_steps={teacher_steps}"
             )
-            next_context = torch.where(
-                use_model_mask,
-                predicted_next.detach().unsqueeze(1),
-                gold_next_context,
-            )
-        context = torch.cat([context, next_context], dim=1)
 
-    rollout_loss = torch.stack(per_step_losses).mean()
-    rollout_fidelity = torch.stack(per_step_fidelities).mean()
-    return rollout_loss, rollout_fidelity
+        for step_offset in range(horizon):
+            target_index = start_index + step_offset
+            if verbose:
+                use_teacher = step_offset + 1 < teacher_steps
+                print(f"    - {_describe_multistep_transition(start_index, target_index, use_teacher)}")
+            predicted_next = model(context)[:, -1, :]
+            step_target = targets[:, target_index : target_index + 1, :]
+            step_loss, step_mean_fidelity, _ = criterion(predicted_next.unsqueeze(1), step_target)
+            per_offset_losses[step_offset].append(step_loss)
+            per_offset_fidelities[step_offset].append(step_mean_fidelity)
+
+            if step_offset + 1 >= horizon:
+                continue
+
+            if step_offset + 1 < teacher_steps:
+                next_context = step_target
+            else:
+                next_context = predicted_next.unsqueeze(1)
+            context = torch.cat([context, next_context], dim=1)
+
+        if verbose:
+            print(f"  [end t{start_index}] completati {horizon} step supervisonati")
+
+    mean_losses = torch.stack([torch.stack(offset_losses).mean() for offset_losses in per_offset_losses])
+    mean_fidelities = torch.stack([torch.stack(offset_fidelities).mean() for offset_fidelities in per_offset_fidelities])
+    offset_weights = _build_step_weights(mean_losses, mean_fidelities)
+    multistep_loss = (offset_weights * mean_losses).sum() / offset_weights.sum().clamp(min=1e-8)
+    multistep_fidelity = mean_fidelities.mean()
+    stats = BatchAdaptiveStats(
+        horizon=int(horizon_limit),
+        teacher_steps=int(_effective_multistep_teacher_steps(horizon_limit, teacher_steps_override)),
+        mean_offset_losses=[float(value) for value in mean_losses.detach().cpu().tolist()],
+        mean_offset_fidelities=[float(value) for value in mean_fidelities.detach().cpu().tolist()],
+        mean_offset_weights=[float(value) for value in offset_weights.detach().cpu().tolist()],
+    )
+    return multistep_loss, multistep_fidelity, stats
 
 
 def _atomic_torch_save(payload: dict, destination: os.PathLike):
@@ -310,7 +551,7 @@ def train_model(
     scheduler_state_dict: dict | None = None,
     best_loss: float | None = None,
     best_state: dict | None = None,
-) -> TrainingHistory:
+) -> tuple[TrainingHistory, AdaptiveTrainingTrace]:
     history = history or TrainingHistory(epochs=[], train_loss=[], train_fidelity=[])
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -344,6 +585,10 @@ def train_model(
         start_epoch = max(int(start_epoch), completed_epochs + 1)
 
     best_loss = float("inf") if best_loss is None else float(best_loss)
+    adaptive_controller = _make_adaptive_controller()
+    initial_horizon = int(adaptive_controller.current_horizon)
+    initial_teacher_steps = int(adaptive_controller.current_teacher_steps)
+    adaptive_epoch_summaries: list[AdaptiveEpochSummary] = []
 
     last_completed_epoch = history.epochs[-1] if history.epochs else max(0, start_epoch - 1)
     interrupted = False
@@ -353,8 +598,12 @@ def train_model(
             loss_sum = 0.0
             fidelity_sum = 0.0
             sample_count = 0
-            scheduled_sampling_prob = _scheduled_sampling_probability(epoch)
-            rollout_steps = _rollout_training_steps(config.SEQ_LEN, epoch)
+            epoch_horizon = int(adaptive_controller.current_horizon)
+            epoch_teacher_steps = int(adaptive_controller.current_teacher_steps)
+            offset_loss_sums = np.zeros(epoch_horizon, dtype=np.float64)
+            offset_fidelity_sums = np.zeros(epoch_horizon, dtype=np.float64)
+            offset_weight_sums = np.zeros(epoch_horizon, dtype=np.float64)
+            offset_counts = np.zeros(epoch_horizon, dtype=np.float64)
 
             for batch_idx, (inputs, targets) in enumerate(loader, start=1):
                 inputs = inputs.to(config.DEVICE)
@@ -366,22 +615,16 @@ def train_model(
                     dtype=torch.float16,
                     enabled=use_amp,
                 ):
-                    predicted = model(inputs)
-                    teacher_forced_loss, teacher_forced_fidelity, _ = criterion(predicted, targets)
-                    total_loss = teacher_forced_loss
-                    total_fidelity = teacher_forced_fidelity
-
-                    if config.ROLLOUT_AUX_WEIGHT > 0.0:
-                        rollout_loss, rollout_fidelity = _autoregressive_unroll_loss(
-                            model=model,
-                            criterion=criterion,
-                            inputs=inputs,
-                            targets=targets,
-                            steps=rollout_steps,
-                            scheduled_sampling_prob=scheduled_sampling_prob,
-                        )
-                        total_loss = teacher_forced_loss + config.ROLLOUT_AUX_WEIGHT * rollout_loss
-                        total_fidelity = 0.5 * (teacher_forced_fidelity + rollout_fidelity)
+                    total_loss, total_fidelity, batch_stats = _multistep_training_loss(
+                        model=model,
+                        criterion=criterion,
+                        inputs=inputs,
+                        targets=targets,
+                        horizon_limit=epoch_horizon,
+                        teacher_steps_override=epoch_teacher_steps,
+                        epoch=epoch,
+                        batch_idx=batch_idx,
+                    )
 
                 scaler.scale(total_loss).backward()
 
@@ -398,6 +641,10 @@ def train_model(
                 loss_sum += float(total_loss.item()) * batch_size
                 fidelity_sum += float(total_fidelity.item()) * batch_size
                 sample_count += batch_size
+                offset_loss_sums += np.asarray(batch_stats.mean_offset_losses, dtype=np.float64) * batch_size
+                offset_fidelity_sums += np.asarray(batch_stats.mean_offset_fidelities, dtype=np.float64) * batch_size
+                offset_weight_sums += np.asarray(batch_stats.mean_offset_weights, dtype=np.float64) * batch_size
+                offset_counts += float(batch_size)
 
                 if (
                     config.CHECKPOINT_EVERY_BATCH > 0
@@ -415,6 +662,17 @@ def train_model(
 
             epoch_loss = loss_sum / max(1, sample_count)
             epoch_fidelity = fidelity_sum / max(1, sample_count)
+            adaptive_summary = _summarize_epoch_adaptive_stats(
+                epoch=epoch,
+                horizon=epoch_horizon,
+                teacher_steps=epoch_teacher_steps,
+                loss_sums=offset_loss_sums,
+                fidelity_sums=offset_fidelity_sums,
+                weight_sums=offset_weight_sums,
+                counts=offset_counts,
+            )
+            adaptive_epoch_summaries.append(adaptive_summary)
+            _update_adaptive_controller(adaptive_controller, adaptive_summary)
             history.epochs.append(epoch)
             history.train_loss.append(epoch_loss)
             history.train_fidelity.append(epoch_fidelity)
@@ -428,7 +686,9 @@ def train_model(
                 print(
                     f"  Epoca {epoch:4d}/{config.EPOCHS} | "
                     f"loss={epoch_loss:.6f} | fidelity={epoch_fidelity:.6f} | "
-                    f"ss_p={scheduled_sampling_prob:.3f} | rollout_steps={rollout_steps:2d} | "
+                    f"H={epoch_horizon:2d} | teacher_steps={epoch_teacher_steps:2d} | "
+                    f"next_H={adaptive_controller.current_horizon:2d} | "
+                    f"next_teacher={adaptive_controller.current_teacher_steps:2d} | "
                     f"lr={optimizer.param_groups[0]['lr']:.2e}"
                 )
 
@@ -474,7 +734,15 @@ def train_model(
             best_state=best_state,
         )
 
-    return history
+    adaptive_trace = AdaptiveTrainingTrace(
+        enabled=bool(config.ADAPTIVE_MULTISTEP_ENABLED),
+        initial_horizon=initial_horizon,
+        initial_teacher_steps=initial_teacher_steps,
+        final_horizon=int(adaptive_controller.current_horizon),
+        final_teacher_steps=int(adaptive_controller.current_teacher_steps),
+        epoch_summaries=adaptive_epoch_summaries,
+    )
+    return history, adaptive_trace
 
 
 @torch.no_grad()
@@ -506,6 +774,82 @@ def evaluate_teacher_forced(model: QuantumSequencePredictor, states: torch.Tenso
         mean_fidelity=total_fidelity / max(1, total_sequences),
         fidelity_curve=curve,
         coverage_curve=[1.0 for _ in curve],
+    )
+
+
+@torch.no_grad()
+def evaluate_multistep(
+    model: QuantumSequencePredictor,
+    states: torch.Tensor,
+) -> EvaluationResult:
+    model.eval()
+    pred_steps = int(states.shape[1]) - 1
+    loader = DataLoader(
+        states,
+        batch_size=max(1, int(config.BATCH_SIZE) // 2),
+        shuffle=False,
+        num_workers=0,
+        pin_memory=False,
+    )
+
+    loss_sum = torch.zeros(pred_steps, dtype=torch.float64)
+    fidelity_sum = torch.zeros(pred_steps, dtype=torch.float64)
+    counts = torch.zeros(pred_steps, dtype=torch.float64)
+
+    for batch_states in loader:
+        true_states = batch_states.to(config.DEVICE)
+
+        for start_index in range(pred_steps):
+            horizon = min(int(config.MULTISTEP_H), pred_steps - start_index)
+            teacher_steps = _effective_multistep_teacher_steps(horizon)
+            context = true_states[:, : start_index + 1, :]
+
+            for step_offset in range(horizon):
+                target_state_index = start_index + step_offset + 1
+                curve_index = target_state_index - 1
+                predicted_next = model(context)[:, -1, :]
+                fidelity = quantum_fidelity(
+                    predicted_next,
+                    true_states[:, target_state_index, :],
+                ).cpu().double()
+                fidelity_sum[curve_index] += fidelity.sum()
+                loss_sum[curve_index] += (
+                    -torch.log(fidelity.clamp(min=config.LOG_FIDELITY_EPS))
+                ).sum()
+                counts[curve_index] += float(fidelity.shape[0])
+
+                if step_offset + 1 >= horizon:
+                    continue
+
+                if step_offset + 1 < teacher_steps:
+                    next_context = true_states[:, target_state_index : target_state_index + 1, :]
+                else:
+                    next_context = predicted_next.unsqueeze(1)
+                context = torch.cat([context, next_context], dim=1)
+
+    fidelity_curve: list[float] = []
+    coverage_curve: list[float] = []
+    for index in range(pred_steps):
+        if counts[index] == 0:
+            fidelity_curve.append(float("nan"))
+            coverage_curve.append(0.0)
+        else:
+            fidelity_curve.append(float(fidelity_sum[index] / counts[index]))
+            coverage_curve.append(1.0)
+
+    valid_mask = counts > 0
+    if valid_mask.any():
+        mean_loss = float(loss_sum[valid_mask].sum().item() / counts[valid_mask].sum().item())
+        mean_fidelity = float(fidelity_sum[valid_mask].sum().item() / counts[valid_mask].sum().item())
+    else:
+        mean_loss = float("nan")
+        mean_fidelity = float("nan")
+
+    return EvaluationResult(
+        loss=mean_loss,
+        mean_fidelity=mean_fidelity,
+        fidelity_curve=fidelity_curve,
+        coverage_curve=coverage_curve,
     )
 
 
@@ -580,7 +924,7 @@ def compute_train_observable_curves(
     model: QuantumSequencePredictor,
     states: torch.Tensor,
     warmup_states: int = 1,
-) -> TrainObservableCurves:
+) -> ObservableComparisonCurves:
     return compute_observable_curves(
         model=model,
         states=states,
@@ -589,16 +933,25 @@ def compute_train_observable_curves(
     )
 
 
+def _average_observable_curve(
+    totals: torch.Tensor,
+    counts: torch.Tensor,
+) -> np.ndarray:
+    averaged = torch.full_like(totals, float("nan"), dtype=torch.float64)
+    valid = counts > 0
+    averaged[valid] = totals[valid] / counts[valid]
+    return averaged.cpu().numpy()
+
+
 @torch.no_grad()
 def compute_observable_curves(
     model: QuantumSequencePredictor,
     states: torch.Tensor,
     warmup_states: int = 1,
     time_step: float = float(config.TIME_STEP),
-) -> TrainObservableCurves:
+) -> ObservableComparisonCurves:
     """
-    Per ogni sequenza del training set: stati esatti dalla Hamiltoniana e stati dal rollout LLM
-    (stesso schema di `evaluate_autoregressive`). Medie di m^z, m^x, c^z sul dataset.
+    Confronto tra traiettorie esatte, predizioni multi-step e rollout libero.
     """
     if warmup_states < 1:
         raise ValueError(f"warmup_states deve essere >= 1, ricevuto {warmup_states}")
@@ -616,13 +969,19 @@ def compute_observable_curves(
 
     num_states = int(states.shape[1])
     total_sequences = int(states.shape[0])
+    pred_steps = num_states - 1
 
     exact_mz = torch.zeros(num_states, dtype=torch.float64, device=device)
     exact_mx = torch.zeros(num_states, dtype=torch.float64, device=device)
     exact_cz = torch.zeros(num_states, dtype=torch.float64, device=device)
-    pred_mz = torch.zeros(num_states, dtype=torch.float64, device=device)
-    pred_mx = torch.zeros(num_states, dtype=torch.float64, device=device)
-    pred_cz = torch.zeros(num_states, dtype=torch.float64, device=device)
+    multistep_mz = torch.zeros(num_states, dtype=torch.float64, device=device)
+    multistep_mx = torch.zeros(num_states, dtype=torch.float64, device=device)
+    multistep_cz = torch.zeros(num_states, dtype=torch.float64, device=device)
+    multistep_counts = torch.zeros(num_states, dtype=torch.float64, device=device)
+    rollout_mz = torch.zeros(num_states, dtype=torch.float64, device=device)
+    rollout_mx = torch.zeros(num_states, dtype=torch.float64, device=device)
+    rollout_cz = torch.zeros(num_states, dtype=torch.float64, device=device)
+    rollout_counts = torch.zeros(num_states, dtype=torch.float64, device=device)
 
     loader = DataLoader(
         states,
@@ -646,6 +1005,45 @@ def compute_observable_curves(
             exact_mx[t] += mx.double().sum()
             exact_cz[t] += cz.double().sum()
 
+        mz0, mx0, cz0 = batch_observables_tfim(
+            true_states[:, 0, :],
+            z_eigs,
+            zz_nn_eigs,
+            x_flip_idx,
+        )
+        multistep_mz[0] += mz0.double().sum()
+        multistep_mx[0] += mx0.double().sum()
+        multistep_cz[0] += cz0.double().sum()
+        multistep_counts[0] += float(true_states.shape[0])
+
+        for start_index in range(pred_steps):
+            horizon = min(int(config.MULTISTEP_H), pred_steps - start_index)
+            teacher_steps = _effective_multistep_teacher_steps(horizon)
+            context = true_states[:, : start_index + 1, :]
+
+            for step_offset in range(horizon):
+                target_state_index = start_index + step_offset + 1
+                predicted_next = model(context)[:, -1, :]
+                mz, mx, cz = batch_observables_tfim(
+                    predicted_next,
+                    z_eigs,
+                    zz_nn_eigs,
+                    x_flip_idx,
+                )
+                multistep_mz[target_state_index] += mz.double().sum()
+                multistep_mx[target_state_index] += mx.double().sum()
+                multistep_cz[target_state_index] += cz.double().sum()
+                multistep_counts[target_state_index] += float(true_states.shape[0])
+
+                if step_offset + 1 >= horizon:
+                    continue
+
+                if step_offset + 1 < teacher_steps:
+                    next_context = true_states[:, target_state_index : target_state_index + 1, :]
+                else:
+                    next_context = predicted_next.unsqueeze(1)
+                context = torch.cat([context, next_context], dim=1)
+
         context = true_states[:, :warmup_states, :]
         for t in range(warmup_states):
             mz, mx, cz = batch_observables_tfim(
@@ -654,9 +1052,10 @@ def compute_observable_curves(
                 zz_nn_eigs,
                 x_flip_idx,
             )
-            pred_mz[t] += mz.double().sum()
-            pred_mx[t] += mx.double().sum()
-            pred_cz[t] += cz.double().sum()
+            rollout_mz[t] += mz.double().sum()
+            rollout_mx[t] += mx.double().sum()
+            rollout_cz[t] += cz.double().sum()
+            rollout_counts[t] += float(true_states.shape[0])
 
         for t in range(warmup_states, num_states):
             predicted_next = model(context)[:, -1, :]
@@ -666,9 +1065,10 @@ def compute_observable_curves(
                 zz_nn_eigs,
                 x_flip_idx,
             )
-            pred_mz[t] += mz.double().sum()
-            pred_mx[t] += mx.double().sum()
-            pred_cz[t] += cz.double().sum()
+            rollout_mz[t] += mz.double().sum()
+            rollout_mx[t] += mx.double().sum()
+            rollout_cz[t] += cz.double().sum()
+            rollout_counts[t] += float(true_states.shape[0])
             context = torch.cat([context, predicted_next.unsqueeze(1)], dim=1)
 
     scale = float(max(1, total_sequences))
@@ -676,32 +1076,35 @@ def compute_observable_curves(
     physical_time = time_indices * float(time_step)
 
     inv_scale = 1.0 / scale
-    return TrainObservableCurves(
+    return ObservableComparisonCurves(
         time_indices=time_indices,
         physical_time=physical_time,
         mz_exact=(exact_mz * inv_scale).cpu().numpy(),
-        mz_pred=(pred_mz * inv_scale).cpu().numpy(),
+        mz_multistep=_average_observable_curve(multistep_mz, multistep_counts),
+        mz_rollout=_average_observable_curve(rollout_mz, rollout_counts),
         mx_exact=(exact_mx * inv_scale).cpu().numpy(),
-        mx_pred=(pred_mx * inv_scale).cpu().numpy(),
+        mx_multistep=_average_observable_curve(multistep_mx, multistep_counts),
+        mx_rollout=_average_observable_curve(rollout_mx, rollout_counts),
         cz_exact=(exact_cz * inv_scale).cpu().numpy(),
-        cz_pred=(pred_cz * inv_scale).cpu().numpy(),
+        cz_multistep=_average_observable_curve(multistep_cz, multistep_counts),
+        cz_rollout=_average_observable_curve(rollout_cz, rollout_counts),
     )
 
 
-def plot_train_observables(curves: TrainObservableCurves, warmup_states: int):
+def plot_train_observables(curves: ObservableComparisonCurves, warmup_states: int):
     plot_observable_curves(
         curves=curves,
         warmup_states=warmup_states,
         output_path=config.OBSERVABLES_PLOT_PATH,
         title=(
             f"Osservabili | training set | "
-            f"{curves.time_indices.size} stati per traiettoria, warmup={warmup_states}"
+            f"{curves.time_indices.size} stati per traiettoria, warmup rollout={warmup_states}"
         ),
     )
 
 
 def plot_observable_curves(
-    curves: TrainObservableCurves,
+    curves: ObservableComparisonCurves,
     warmup_states: int,
     output_path,
     title: str,
@@ -711,21 +1114,24 @@ def plot_observable_curves(
 
     t = curves.physical_time
     axes[0].plot(t, curves.mz_exact, label="Esatto (Hamiltoniana)", color="#1f618d", linewidth=2.2)
-    axes[0].plot(t, curves.mz_pred, label="Predetto (LLM rollout)", color="#b03a2e", linewidth=2.2)
+    axes[0].plot(t, curves.mz_multistep, label="Predetto (multi-step)", color="#117a65", linewidth=2.2)
+    axes[0].plot(t, curves.mz_rollout, label="Predetto (rollout)", color="#b03a2e", linewidth=2.2)
     axes[0].set_title(r"Magnetizzazione $m^z = \frac{1}{N}\sum_i \langle Z_i \rangle$")
     axes[0].set_ylabel(r"$m^z$")
     axes[0].grid(alpha=0.25)
     axes[0].legend(frameon=False, fontsize=9)
 
     axes[1].plot(t, curves.mx_exact, label="Esatto (Hamiltoniana)", color="#1f618d", linewidth=2.2)
-    axes[1].plot(t, curves.mx_pred, label="Predetto (LLM rollout)", color="#b03a2e", linewidth=2.2)
+    axes[1].plot(t, curves.mx_multistep, label="Predetto (multi-step)", color="#117a65", linewidth=2.2)
+    axes[1].plot(t, curves.mx_rollout, label="Predetto (rollout)", color="#b03a2e", linewidth=2.2)
     axes[1].set_title(r"Magnetizzazione $m^x = \frac{1}{N}\sum_i \langle X_i \rangle$")
     axes[1].set_ylabel(r"$m^x$")
     axes[1].grid(alpha=0.25)
     axes[1].legend(frameon=False, fontsize=9)
 
     axes[2].plot(t, curves.cz_exact, label="Esatto (Hamiltoniana)", color="#1f618d", linewidth=2.2)
-    axes[2].plot(t, curves.cz_pred, label="Predetto (LLM rollout)", color="#b03a2e", linewidth=2.2)
+    axes[2].plot(t, curves.cz_multistep, label="Predetto (multi-step)", color="#117a65", linewidth=2.2)
+    axes[2].plot(t, curves.cz_rollout, label="Predetto (rollout)", color="#b03a2e", linewidth=2.2)
     axes[2].set_title(
         r"Correlazione NN $c^z = \frac{2}{N(N-1)}\sum_{\langle i,j\rangle}\langle Z_i Z_j\rangle$"
     )

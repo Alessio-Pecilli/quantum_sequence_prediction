@@ -108,22 +108,35 @@ def build_tfim_hamiltonian(
 
 
 def choose_initial_state_family(total_sequences: int, n_qubits: int) -> tuple[str, int, str]:
-    basis_support = 2 ** n_qubits
-    if config.INITIAL_STATE_FAMILY != "x_basis":
-        raise ValueError(
-            f"INITIAL_STATE_FAMILY={config.INITIAL_STATE_FAMILY!r} non supportata: usare solo 'x_basis'."
+    if config.INITIAL_STATE_FAMILY == "x_basis":
+        support_size = 2 ** n_qubits
+        reason = (
+            "stati iniziali solo in base X clampata; campionamento con rimpiazzo attivo"
+            if total_sequences > support_size
+            else "stati iniziali solo in base X clampata; campionamento senza rimpiazzo"
         )
-    if total_sequences > basis_support and not config.X_BASIS_SAMPLE_WITH_REPLACEMENT:
-        raise ValueError(
-            f"Richiesti {total_sequences} stati ma il supporto x_basis e' {basis_support}. "
-            "Attiva QSP_X_BASIS_SAMPLE_WITH_REPLACEMENT=1 per campionare con rimpiazzo."
+        family = "x_basis"
+    elif config.INITIAL_STATE_FAMILY == "xyz_basis":
+        support_size = 3 * (2 ** n_qubits)
+        reason = (
+            "bitstring binaria convertita in una base X/Y/Z scelta per traiettoria; "
+            "campionamento con rimpiazzo attivo"
+            if total_sequences > support_size
+            else "bitstring binaria convertita in una base X/Y/Z scelta per traiettoria; "
+            "campionamento senza rimpiazzo"
         )
-    reason = (
-        "stati iniziali solo in base X clampata; campionamento con rimpiazzo attivo"
-        if total_sequences > basis_support
-        else "stati iniziali solo in base X clampata; campionamento senza rimpiazzo"
-    )
-    return "x_basis", basis_support, reason
+        family = "xyz_basis"
+    else:
+        raise ValueError(
+            f"INITIAL_STATE_FAMILY={config.INITIAL_STATE_FAMILY!r} non supportata."
+        )
+
+    if total_sequences > support_size and not config.INITIAL_STATE_SAMPLE_WITH_REPLACEMENT:
+        raise ValueError(
+            f"Richiesti {total_sequences} stati ma il supporto {family} e' {support_size}. "
+            "Attiva QSP_INITIAL_STATE_SAMPLE_WITH_REPLACEMENT=1 per campionare con rimpiazzo."
+        )
+    return family, support_size, reason
 
 
 def sample_couplings(n_qubits: int, seed: int) -> torch.Tensor:
@@ -180,14 +193,57 @@ def x_basis_state_from_code(code: int, n_qubits: int) -> torch.Tensor:
     return state.to(torch.complex64)
 
 
+def _decode_xyz_basis_code(code: int, n_qubits: int) -> tuple[int, int]:
+    bitstring_support = 2 ** n_qubits
+    basis_index = int(code) // bitstring_support
+    bit_code = int(code) % bitstring_support
+    if basis_index not in {0, 1, 2}:
+        raise ValueError(f"Codice xyz_basis non valido: {code}")
+    return basis_index, bit_code
+
+
+def _basis_label_from_index(basis_index: int) -> str:
+    return ("X", "Y", "Z")[basis_index]
+
+
+def _local_basis_state(bit: int, basis_label: str) -> torch.Tensor:
+    if basis_label == "X":
+        sqrt2_inv = 1.0 / (2.0 ** 0.5)
+        return torch.tensor(
+            [sqrt2_inv, sqrt2_inv if bit == 0 else -sqrt2_inv],
+            dtype=torch.complex64,
+        )
+    if basis_label == "Y":
+        sqrt2_inv = 1.0 / (2.0 ** 0.5)
+        phase = 1j if bit == 0 else -1j
+        return torch.tensor([sqrt2_inv, sqrt2_inv * phase], dtype=torch.complex64)
+    if basis_label == "Z":
+        return torch.tensor([1.0, 0.0], dtype=torch.complex64) if bit == 0 else torch.tensor(
+            [0.0, 1.0], dtype=torch.complex64
+        )
+    raise ValueError(f"Base locale non supportata: {basis_label}")
+
+
+def xyz_basis_state_from_code(code: int, n_qubits: int) -> torch.Tensor:
+    basis_index, bit_code = _decode_xyz_basis_code(code, n_qubits)
+    basis_label = _basis_label_from_index(basis_index)
+    bits = bits_from_code(bit_code, n_qubits)
+    state = _local_basis_state(bits[0], basis_label)
+    for bit in bits[1:]:
+        state = torch.kron(state, _local_basis_state(bit, basis_label))
+    return state.to(torch.complex64)
+
+
 def initial_state_from_code(code: int, family: str, n_qubits: int) -> torch.Tensor:
     if family == "x_basis":
         return x_basis_state_from_code(code, n_qubits)
+    if family == "xyz_basis":
+        return xyz_basis_state_from_code(code, n_qubits)
     raise ValueError(f"Famiglia di stati iniziali non supportata: {family}")
 
 
 def sample_initial_state_codes(total_sequences: int, support_size: int, seed: int) -> list[int]:
-    if total_sequences > support_size and not config.X_BASIS_SAMPLE_WITH_REPLACEMENT:
+    if total_sequences > support_size and not config.INITIAL_STATE_SAMPLE_WITH_REPLACEMENT:
         raise ValueError(
             f"Richiesti {total_sequences} stati iniziali distinti ma supporto disponibile={support_size}."
         )
@@ -265,10 +321,19 @@ def _print_clamped_dataset_audit(
     max_states = min(int(config.CLAMP_AUDIT_MAX_STATES), int(states.shape[1]))
     print(f"\n[ClampAudit:{split_name}] showing {max_sequences} sequence(s), first {max_states} state(s)")
     for seq_idx in range(max_sequences):
-        bits = bits_from_code(codes[seq_idx], n_qubits)
+        code = int(codes[seq_idx])
+        basis_label = "X"
+        bit_code = code
+        if config.INITIAL_STATE_FAMILY == "xyz_basis":
+            basis_index, bit_code = _decode_xyz_basis_code(code, n_qubits)
+            basis_label = _basis_label_from_index(basis_index)
+        bits = bits_from_code(bit_code, n_qubits)
         bitstring = "".join(str(bit) for bit in bits)
         if config.CLAMP_AUDIT_PRINT_BITSTRINGS:
-            print(f"  seq={seq_idx:03d} code={codes[seq_idx]} bitstring={bitstring} (X basis)")
+            print(
+                f"  seq={seq_idx:03d} code={code} bitstring={bitstring} "
+                f"(base {basis_label})"
+            )
         for t in range(max_states):
             state = states[seq_idx, t]
             a0 = state[0].item()
@@ -290,8 +355,8 @@ def generate_fixed_tfim_dataset(
 ) -> QuantumDatasetBundle:
     total_sequences = int(train_sequences) + int(test_sequences)
     family, support_size, reason = choose_initial_state_family(total_sequences, n_qubits)
-    basis_support_size = 2 ** n_qubits
-    used_support_fraction = total_sequences / basis_support_size
+    basis_support_size = support_size
+    used_support_fraction = total_sequences / support_size
 
     couplings = sample_couplings(n_qubits, seed + 11)
     hamiltonian = build_tfim_hamiltonian(

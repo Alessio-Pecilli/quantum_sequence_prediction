@@ -18,11 +18,12 @@ torch.set_num_threads(1)
 import config
 from input import generate_fixed_tfim_dataset
 from trainer import (
+    AdaptiveTrainingTrace,
     TrainingHistory,
     build_model,
     compute_observable_curves,
     evaluate_autoregressive,
-    evaluate_teacher_forced,
+    evaluate_multistep,
     exposure_bias_detected,
     plot_observable_curves,
     plot_training_curves,
@@ -55,11 +56,39 @@ def _observable_curves_as_serializable(curves) -> dict[str, object]:
         "time_indices": [int(v) for v in curves.time_indices.tolist()],
         "physical_time": [float(v) for v in curves.physical_time.tolist()],
         "mz_exact": [float(v) for v in curves.mz_exact.tolist()],
-        "mz_pred": [float(v) for v in curves.mz_pred.tolist()],
+        "mz_multistep": [float(v) for v in curves.mz_multistep.tolist()],
+        "mz_rollout": [float(v) for v in curves.mz_rollout.tolist()],
         "mx_exact": [float(v) for v in curves.mx_exact.tolist()],
-        "mx_pred": [float(v) for v in curves.mx_pred.tolist()],
+        "mx_multistep": [float(v) for v in curves.mx_multistep.tolist()],
+        "mx_rollout": [float(v) for v in curves.mx_rollout.tolist()],
         "cz_exact": [float(v) for v in curves.cz_exact.tolist()],
-        "cz_pred": [float(v) for v in curves.cz_pred.tolist()],
+        "cz_multistep": [float(v) for v in curves.cz_multistep.tolist()],
+        "cz_rollout": [float(v) for v in curves.cz_rollout.tolist()],
+    }
+
+
+def _adaptive_training_as_serializable(trace: AdaptiveTrainingTrace) -> dict[str, object]:
+    return {
+        "enabled": bool(trace.enabled),
+        "initial_horizon": int(trace.initial_horizon),
+        "initial_teacher_steps": int(trace.initial_teacher_steps),
+        "final_horizon": int(trace.final_horizon),
+        "final_teacher_steps": int(trace.final_teacher_steps),
+        "epoch_summaries": [
+            {
+                "epoch": int(summary.epoch),
+                "horizon": int(summary.horizon),
+                "teacher_steps": int(summary.teacher_steps),
+                "head_loss": float(summary.head_loss),
+                "tail_loss": float(summary.tail_loss),
+                "head_fidelity": float(summary.head_fidelity),
+                "tail_fidelity": float(summary.tail_fidelity),
+                "mean_offset_losses": [float(v) for v in summary.mean_offset_losses],
+                "mean_offset_fidelities": [float(v) for v in summary.mean_offset_fidelities],
+                "mean_offset_weights": [float(v) for v in summary.mean_offset_weights],
+            }
+            for summary in trace.epoch_summaries
+        ],
     }
 
 
@@ -88,9 +117,9 @@ def _load_trained_model(model):
     return _load_history_from_last_checkpoint()
 
 
-def _plot_split_curves(ax, title: str, teacher_forced, autoregressive, partial_results: dict[int, object]):
-    x = np.arange(1, len(teacher_forced.fidelity_curve) + 1)
-    ax.plot(x, teacher_forced.fidelity_curve, label="Metodo 1: teacher forced", linewidth=2.3, color="#1f618d")
+def _plot_split_curves(ax, title: str, multistep, autoregressive, partial_results: dict[int, object]):
+    x = np.arange(1, len(multistep.fidelity_curve) + 1)
+    ax.plot(x, multistep.fidelity_curve, label="Metodo 1: multi-step", linewidth=2.3, color="#117a65")
     ax.plot(x, autoregressive.fidelity_curve, label="Metodo 2: rollout libero", linewidth=2.3, color="#b03a2e")
     palette = ["#117a65", "#7d6608", "#6c3483", "#566573"]
     for color, (warmup_n1, result) in zip(palette, sorted(partial_results.items())):
@@ -142,6 +171,19 @@ def main():
     model = build_model()
     if config.EVAL_ONLY:
         history = _load_trained_model(model)
+        adaptive_trace = AdaptiveTrainingTrace(
+            enabled=bool(config.ADAPTIVE_MULTISTEP_ENABLED),
+            initial_horizon=int(config.ADAPTIVE_H_MIN if config.ADAPTIVE_MULTISTEP_ENABLED else config.MULTISTEP_H),
+            initial_teacher_steps=int(
+                min(
+                    config.ADAPTIVE_TEACHER_MAX if config.ADAPTIVE_MULTISTEP_ENABLED else config.MULTISTEP_H,
+                    config.MULTISTEP_TEACHER_FORCING_STEPS,
+                )
+            ),
+            final_horizon=int(config.MULTISTEP_H),
+            final_teacher_steps=int(config.MULTISTEP_TEACHER_FORCING_STEPS),
+            epoch_summaries=[],
+        )
         if history.epochs:
             plot_training_curves(history)
         print(f"Modalita eval-only:    checkpoint caricato da {config.CHECKPOINT_PATH}")
@@ -157,7 +199,7 @@ def main():
                 print(f"Auto-resume:           {resume_state.reason}")
             else:
                 print(f"Auto-resume saltato:   {resume_state.reason}")
-        history = train_model(
+        history, adaptive_trace = train_model(
             model,
             dataset.train.states,
             start_epoch=resume_state.start_epoch,
@@ -169,14 +211,14 @@ def main():
         )
         plot_training_curves(history)
 
-    train_teacher = evaluate_teacher_forced(model, dataset.train.states)
-    test_teacher = evaluate_teacher_forced(model, dataset.test.states)
+    train_multistep = evaluate_multistep(model, dataset.train.states)
+    test_multistep = evaluate_multistep(model, dataset.test.states)
     rollout_warmup = int(config.ROLLOUT_WARMUP_STATES)
     train_rollout = evaluate_autoregressive(model, dataset.train.states, warmup_states=rollout_warmup)
     test_rollout = evaluate_autoregressive(model, dataset.test.states, warmup_states=rollout_warmup)
 
-    add_partial_curves = exposure_bias_detected(train_teacher.fidelity_curve, train_rollout.fidelity_curve) or (
-        exposure_bias_detected(test_teacher.fidelity_curve, test_rollout.fidelity_curve)
+    add_partial_curves = exposure_bias_detected(train_multistep.fidelity_curve, train_rollout.fidelity_curve) or (
+        exposure_bias_detected(test_multistep.fidelity_curve, test_rollout.fidelity_curve)
     )
     partial_results_train: dict[int, object] = {}
     partial_results_test: dict[int, object] = {}
@@ -196,9 +238,9 @@ def main():
         print("\nNessun exposure bias marcato: mantengo solo metodo 1 e 2.")
 
     fig, axes = plt.subplots(1, 2, figsize=(15.5, 5.3), sharey=True)
-    _plot_split_curves(axes[0], "Train Set", train_teacher, train_rollout, partial_results_train)
-    _plot_split_curves(axes[1], "Test Set", test_teacher, test_rollout, partial_results_test)
-    fig.suptitle("Fidelity vero vs predetto nel tempo", fontsize=14)
+    _plot_split_curves(axes[0], "Train Set", train_multistep, train_rollout, partial_results_train)
+    _plot_split_curves(axes[1], "Test Set", test_multistep, test_rollout, partial_results_test)
+    fig.suptitle("Fidelity multi-step vs rollout nel tempo", fontsize=14)
     fig.tight_layout()
     fig.savefig(config.FIDELITY_PLOT_PATH, dpi=config.PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
@@ -225,6 +267,21 @@ def main():
             "DIM_2N": int(config.DIM_2N),
             "NUM_STATES": int(config.NUM_STATES),
             "SEQ_LEN": int(config.SEQ_LEN),
+            "MULTISTEP_H": int(config.MULTISTEP_H),
+            "MULTISTEP_TEACHER_FORCING_STEPS": int(config.MULTISTEP_TEACHER_FORCING_STEPS),
+            "ADAPTIVE_MULTISTEP_ENABLED": bool(config.ADAPTIVE_MULTISTEP_ENABLED),
+            "ADAPTIVE_STATS_EMA": float(config.ADAPTIVE_STATS_EMA),
+            "ADAPTIVE_WEIGHT_ALPHA": float(config.ADAPTIVE_WEIGHT_ALPHA),
+            "ADAPTIVE_WEIGHT_MIN": float(config.ADAPTIVE_WEIGHT_MIN),
+            "ADAPTIVE_WEIGHT_MAX": float(config.ADAPTIVE_WEIGHT_MAX),
+            "ADAPTIVE_H_MIN": int(config.ADAPTIVE_H_MIN),
+            "ADAPTIVE_H_MAX": int(config.ADAPTIVE_H_MAX),
+            "ADAPTIVE_TEACHER_MIN": int(config.ADAPTIVE_TEACHER_MIN),
+            "ADAPTIVE_TEACHER_MAX": int(config.ADAPTIVE_TEACHER_MAX),
+            "ADAPTIVE_H_LOSS_THRESHOLD": float(config.ADAPTIVE_H_LOSS_THRESHOLD),
+            "ADAPTIVE_H_FIDELITY_THRESHOLD": float(config.ADAPTIVE_H_FIDELITY_THRESHOLD),
+            "ADAPTIVE_TEACHER_LOSS_THRESHOLD": float(config.ADAPTIVE_TEACHER_LOSS_THRESHOLD),
+            "ADAPTIVE_TEACHER_FIDELITY_THRESHOLD": float(config.ADAPTIVE_TEACHER_FIDELITY_THRESHOLD),
             "TRAIN_SEQUENCES": int(config.TRAIN_SEQUENCES),
             "TEST_SEQUENCES": int(config.TEST_SEQUENCES),
             "INITIAL_STATE_FAMILY": config.INITIAL_STATE_FAMILY,
@@ -246,10 +303,11 @@ def main():
         },
         "resume": resume_status,
         "training_history": _history_as_serializable(history),
+        "adaptive_training": _adaptive_training_as_serializable(adaptive_trace),
         "evaluation": {
-            "train_teacher_forced": _as_serializable(train_teacher),
+            "train_multistep": _as_serializable(train_multistep),
             "train_autoregressive": _as_serializable(train_rollout),
-            "test_teacher_forced": _as_serializable(test_teacher),
+            "test_multistep": _as_serializable(test_multistep),
             "test_autoregressive": _as_serializable(test_rollout),
             "test_observables_sequence_index": int(test_seq_idx),
             "test_observables": _observable_curves_as_serializable(test_observables),
@@ -269,8 +327,8 @@ def main():
         json.dump(summary, handle, indent=2)
 
     print("\nMetriche aggregate")
-    print(f"  Train | teacher={train_teacher.mean_fidelity:.6f} | rollout={train_rollout.mean_fidelity:.6f}")
-    print(f"  Test  | teacher={test_teacher.mean_fidelity:.6f} | rollout={test_rollout.mean_fidelity:.6f}")
+    print(f"  Train | multistep={train_multistep.mean_fidelity:.6f} | rollout={train_rollout.mean_fidelity:.6f}")
+    print(f"  Test  | multistep={test_multistep.mean_fidelity:.6f} | rollout={test_rollout.mean_fidelity:.6f}")
     print(f"\nPlot fidelity:  {config.FIDELITY_PLOT_PATH}")
     print(f"Plot training:  {config.TRAINING_CURVES_PATH}")
     print(f"Obs test plot:  {config.OBSERVABLES_TEST_PLOT_PATH}")
