@@ -682,7 +682,8 @@ def train_model(
                 best_loss = epoch_loss
                 best_state = copy.deepcopy(model.state_dict())
 
-            if epoch == 1 or epoch == config.EPOCHS or epoch % max(1, config.EPOCHS // 10) == 0:
+            log_every = max(1, min(10, config.EPOCHS // 20 if config.EPOCHS > 20 else 1))
+            if epoch <= 3 or epoch == config.EPOCHS or epoch % log_every == 0:
                 print(
                     f"  Epoca {epoch:4d}/{config.EPOCHS} | "
                     f"loss={epoch_loss:.6f} | fidelity={epoch_fidelity:.6f} | "

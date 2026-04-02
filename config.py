@@ -93,9 +93,8 @@ def _default_by_qubits(defaults: dict[int, int], fallback: int) -> int:
     return int(defaults.get(int(N_QUBITS), fallback))
 
 # Numero totale di stati in ogni traiettoria, incluso psi(0).
-# Default spinto per esplorare rollout piu' lunghi e verificare se, dopo il
-# transiente iniziale, fidelity e osservabili tendono a riassestarsi.
-NUM_STATES = _env_int("QSP_NUM_STATES", 64)
+# Default piu' lungo del baseline, ma ancora gestibile in memoria/tempo.
+NUM_STATES = _env_int("QSP_NUM_STATES", 32)
 if NUM_STATES < 2:
     raise ValueError(f"NUM_STATES deve essere >= 2, ricevuto: {NUM_STATES}")
 
@@ -172,11 +171,11 @@ if D_MODEL % NUM_HEADS != 0:
 
 BATCH_SIZE = _env_int(
     "QSP_BATCH_SIZE",
-    _default_by_qubits({4: 48 if _is_long_horizon() else 64, 6: 24}, 24),
+    _default_by_qubits({4: 16 if _is_long_horizon() else 48, 6: 8}, 16),
 )
 EPOCHS = _env_int(
     "QSP_EPOCHS",
-    _default_by_qubits({4: 420 if _is_long_horizon() else 180, 6: 220}, 220),
+    _default_by_qubits({4: 220 if _is_long_horizon() else 140, 6: 140}, 180),
 )
 LEARNING_RATE = _env_float("QSP_LEARNING_RATE", 1e-4)
 WEIGHT_DECAY = _env_float("QSP_WEIGHT_DECAY", 1e-4)
@@ -184,20 +183,20 @@ GRAD_CLIP_MAX_NORM = _env_float("QSP_GRAD_CLIP_MAX_NORM", 1.0)
 LOG_FIDELITY_EPS = _env_float("QSP_LOG_FIDELITY_EPS", 1e-8)
 
 # Orizzonte multi-step del nuovo training autoregressivo.
-# Lo alziamo in modo netto per allenare il modello su dipendenze temporali piu'
-# lunghe prima di valutare rollout estesi.
-MULTISTEP_H = _env_int("QSP_MULTISTEP_H", min(20, int(SEQ_LEN)))
+# Lo alziamo rispetto al baseline, ma evitiamo valori che facciano esplodere il
+# costo del training sui rollout lunghi.
+MULTISTEP_H = _env_int("QSP_MULTISTEP_H", min(12, int(SEQ_LEN)))
 if not (1 <= MULTISTEP_H <= SEQ_LEN):
     raise ValueError(
         f"MULTISTEP_H deve stare in [1, SEQ_LEN={SEQ_LEN}], ricevuto: {MULTISTEP_H}"
     )
 
 # Numero di passi che continuano a usare il contesto corretto prima del passaggio
-# al contesto predetto. Lo aumentiamo per rendere meno fragile l'innesco del
-# rollout quando si passa a orizzonti piu' lunghi.
+# al contesto predetto. Teniamo un warm start moderato per non stressare troppo
+# i primi passi autoregressivi.
 MULTISTEP_TEACHER_FORCING_STEPS = _env_int(
     "QSP_MULTISTEP_TEACHER_FORCING_STEPS",
-    min(6, int(MULTISTEP_H)),
+    min(4, int(MULTISTEP_H)),
 )
 if MULTISTEP_TEACHER_FORCING_STEPS < 0:
     raise ValueError(
@@ -214,10 +213,10 @@ ADAPTIVE_STATS_EMA = _env_float("QSP_ADAPTIVE_STATS_EMA", 0.70)
 ADAPTIVE_WEIGHT_ALPHA = _env_float("QSP_ADAPTIVE_WEIGHT_ALPHA", 0.80)
 ADAPTIVE_WEIGHT_MIN = _env_float("QSP_ADAPTIVE_WEIGHT_MIN", 1.0)
 ADAPTIVE_WEIGHT_MAX = _env_float("QSP_ADAPTIVE_WEIGHT_MAX", 2.0)
-ADAPTIVE_H_MIN = _env_int("QSP_ADAPTIVE_H_MIN", max(1, min(8, int(MULTISTEP_H))))
+ADAPTIVE_H_MIN = _env_int("QSP_ADAPTIVE_H_MIN", max(1, min(6, int(MULTISTEP_H))))
 ADAPTIVE_H_MAX = _env_int("QSP_ADAPTIVE_H_MAX", int(MULTISTEP_H))
-ADAPTIVE_TEACHER_MIN = _env_int("QSP_ADAPTIVE_TEACHER_MIN", 2)
-ADAPTIVE_TEACHER_MAX = _env_int("QSP_ADAPTIVE_TEACHER_MAX", min(8, int(MULTISTEP_H)))
+ADAPTIVE_TEACHER_MIN = _env_int("QSP_ADAPTIVE_TEACHER_MIN", 1)
+ADAPTIVE_TEACHER_MAX = _env_int("QSP_ADAPTIVE_TEACHER_MAX", min(6, int(MULTISTEP_H)))
 ADAPTIVE_H_LOSS_THRESHOLD = _env_float("QSP_ADAPTIVE_H_LOSS_THRESHOLD", 0.95)
 ADAPTIVE_H_FIDELITY_THRESHOLD = _env_float("QSP_ADAPTIVE_H_FIDELITY_THRESHOLD", 0.58)
 ADAPTIVE_TEACHER_LOSS_THRESHOLD = _env_float("QSP_ADAPTIVE_TEACHER_LOSS_THRESHOLD", 0.85)
@@ -227,25 +226,26 @@ ADAPTIVE_TEACHER_FIDELITY_THRESHOLD = _env_float("QSP_ADAPTIVE_TEACHER_FIDELITY_
 # di configurazione, ma non piu' usati dal nuovo training multi-step.
 SCHEDULED_SAMPLING_RAMP_EPOCHS = _env_int(
     "QSP_SCHEDULED_SAMPLING_RAMP_EPOCHS",
-    80 if _is_long_horizon() else 40,
+    60 if _is_long_horizon() else 35,
 )
 SCHEDULED_SAMPLING_MAX_PROB = _env_float(
     "QSP_SCHEDULED_SAMPLING_MAX_PROB",
-    0.80 if _is_long_horizon() else 0.65,
+    0.75 if _is_long_horizon() else 0.60,
 )
 
 # Rollout training più pesante e curriculum più rapido (arriva prima a rollout lunghi).
 ROLLOUT_AUX_WEIGHT = _env_float("QSP_ROLLOUT_AUX_WEIGHT", 1.00)
 ROLLOUT_CURRICULUM_EPOCHS = _env_int(
     "QSP_ROLLOUT_CURRICULUM_EPOCHS",
-    90 if _is_long_horizon() else 30,
+    50 if _is_long_horizon() else 25,
 )
 
-# Warmup usato SOLO nel rollout-training: piu' contesto vero per rendere meno
-# traumatici i primissimi passi del rollout libero.
+# Warmup usato SOLO nel rollout-training: abbastanza contesto vero da rendere
+# meno traumatici i primissimi passi del rollout libero, senza nascondere troppo
+# la parte autoregressiva.
 ROLLOUT_WARMUP_STATES = _env_int(
     "QSP_ROLLOUT_WARMUP_STATES",
-    max(8, min(16, int(NUM_STATES) // 6)),
+    max(6, min(10, int(NUM_STATES) // 5)),
 )
 if BATCH_SIZE < 1 or EPOCHS < 1:
     raise ValueError("BATCH_SIZE e EPOCHS devono essere >= 1.")
