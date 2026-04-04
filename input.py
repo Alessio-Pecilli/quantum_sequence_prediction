@@ -70,6 +70,33 @@ class QuantumSequenceDataset(Dataset):
         return self.inputs[index], self.targets[index]
 
 
+def build_uniform_couplings(
+    n_qubits: int,
+    coupling_strength: float = config.COUPLING_MEAN,
+) -> torch.Tensor:
+    if n_qubits < 1:
+        raise ValueError(f"n_qubits deve essere >= 1, ricevuto {n_qubits}")
+    if n_qubits == 1:
+        return torch.empty((0,), dtype=torch.float32)
+    return torch.full((n_qubits - 1,), float(coupling_strength), dtype=torch.float32)
+
+
+def sample_haar_random_states(
+    num_states: int,
+    dim: int,
+    seed: int,
+    dtype: torch.dtype = torch.complex64,
+) -> torch.Tensor:
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed)
+    real = torch.randn((num_states, dim), generator=generator, dtype=torch.float32)
+    imag = torch.randn((num_states, dim), generator=generator, dtype=torch.float32)
+    states = torch.complex(real, imag)
+    # Gaussiani complessi iid + normalizzazione L2 batch-wise -> campionamento Haar.
+    norms = torch.linalg.vector_norm(states, dim=-1, keepdim=True).clamp(min=1e-8)
+    return (states / norms).to(dtype)
+
+
 def get_pauli_string(operator_list: list[torch.Tensor]) -> torch.Tensor:
     result = operator_list[0]
     for op in operator_list[1:]:
@@ -108,15 +135,20 @@ def build_tfim_hamiltonian(
 
 
 def choose_initial_state_family(total_sequences: int, n_qubits: int) -> tuple[str, int, str]:
-    if config.INITIAL_STATE_FAMILY == "x_basis":
+    forced_x_basis = bool(config.FORCE_X_BASIS_ONLY)
+    requested_family = "x_basis" if forced_x_basis else config.INITIAL_STATE_FAMILY
+
+    if requested_family == "x_basis":
         support_size = 2 ** n_qubits
         reason = (
             "stati iniziali solo in base X clampata; campionamento con rimpiazzo attivo"
             if total_sequences > support_size
             else "stati iniziali solo in base X clampata; campionamento senza rimpiazzo"
         )
+        if forced_x_basis and config.INITIAL_STATE_FAMILY != "x_basis":
+            reason = "override FORCE_X_BASIS_ONLY attivo; " + reason
         family = "x_basis"
-    elif config.INITIAL_STATE_FAMILY == "xyz_basis":
+    elif requested_family == "xyz_basis":
         support_size = 3 * (2 ** n_qubits)
         reason = (
             "bitstring binaria convertita in una base X/Y/Z scelta per traiettoria; "
@@ -134,6 +166,7 @@ def choose_initial_state_family(total_sequences: int, n_qubits: int) -> tuple[st
     if total_sequences > support_size and not config.INITIAL_STATE_SAMPLE_WITH_REPLACEMENT:
         raise ValueError(
             f"Richiesti {total_sequences} stati ma il supporto {family} e' {support_size}. "
+            "Per xyz_basis contano come distinti le coppie (bitstring, base globale X/Y/Z). "
             "Attiva QSP_INITIAL_STATE_SAMPLE_WITH_REPLACEMENT=1 per campionare con rimpiazzo."
         )
     return family, support_size, reason
@@ -313,6 +346,7 @@ def _print_clamped_dataset_audit(
     states: torch.Tensor,
     codes: list[int],
     n_qubits: int,
+    family: str,
 ) -> None:
     if not config.CLAMP_AUDIT_PRINT:
         return
@@ -324,7 +358,7 @@ def _print_clamped_dataset_audit(
         code = int(codes[seq_idx])
         basis_label = "X"
         bit_code = code
-        if config.INITIAL_STATE_FAMILY == "xyz_basis":
+        if family == "xyz_basis":
             basis_index, bit_code = _decode_xyz_basis_code(code, n_qubits)
             basis_label = _basis_label_from_index(basis_index)
         bits = bits_from_code(bit_code, n_qubits)
@@ -353,6 +387,15 @@ def generate_fixed_tfim_dataset(
     num_states: int = config.NUM_STATES,
     seed: int = config.SEED,
 ) -> QuantumDatasetBundle:
+    if config.DATASET_SOURCE == "haar_tfim":
+        return generate_haar_tfim_dataset(
+            train_sequences=train_sequences,
+            test_sequences=test_sequences,
+            n_qubits=n_qubits,
+            num_states=num_states,
+            seed=seed,
+        )
+
     total_sequences = int(train_sequences) + int(test_sequences)
     family, support_size, reason = choose_initial_state_family(total_sequences, n_qubits)
     basis_support_size = support_size
@@ -383,8 +426,20 @@ def generate_fixed_tfim_dataset(
         support_size=support_size,
     )
 
-    _print_clamped_dataset_audit("train", train_split.states, train_split.initial_state_codes, n_qubits)
-    _print_clamped_dataset_audit("test", test_split.states, test_split.initial_state_codes, n_qubits)
+    _print_clamped_dataset_audit(
+        "train",
+        train_split.states,
+        train_split.initial_state_codes,
+        n_qubits,
+        family,
+    )
+    _print_clamped_dataset_audit(
+        "test",
+        test_split.states,
+        test_split.initial_state_codes,
+        n_qubits,
+        family,
+    )
 
     return QuantumDatasetBundle(
         train=train_split,
@@ -398,5 +453,65 @@ def generate_fixed_tfim_dataset(
         ),
         basis_support_size=basis_support_size,
         used_support_fraction=float(used_support_fraction),
+        initial_state_family_reason=reason,
+    )
+
+
+def generate_haar_tfim_dataset(
+    train_sequences: int = config.TRAIN_SEQUENCES,
+    test_sequences: int = config.TEST_SEQUENCES,
+    n_qubits: int = config.N_QUBITS,
+    num_states: int = config.NUM_STATES,
+    seed: int = config.SEED,
+) -> QuantumDatasetBundle:
+    total_sequences = int(train_sequences) + int(test_sequences)
+    dim = 2 ** int(n_qubits)
+    couplings = build_uniform_couplings(n_qubits, coupling_strength=float(config.COUPLING_MEAN))
+    hamiltonian = build_tfim_hamiltonian(
+        n_qubits=n_qubits,
+        couplings=couplings,
+        field_strength=float(config.FIELD_STRENGTH),
+    )
+    evolution_operator, backend = compute_evolution_operator(hamiltonian, config.TIME_STEP)
+
+    initial_states = sample_haar_random_states(
+        num_states=total_sequences,
+        dim=dim,
+        seed=seed + 23,
+        dtype=torch.complex64,
+    )
+    all_states = evolve_sequences(initial_states, evolution_operator, num_states)
+    initial_state_codes = list(range(total_sequences))
+    reason = (
+        "stati iniziali Haar random da gaussiane complesse normalizzate; "
+        f"TFIM uniforme con J={float(config.COUPLING_MEAN):.6g}, "
+        f"h={float(config.FIELD_STRENGTH):.6g}, dt={float(config.TIME_STEP):.6g}"
+    )
+
+    train_split = DatasetSplit(
+        states=all_states[:train_sequences],
+        initial_state_codes=initial_state_codes[:train_sequences],
+        initial_state_family="haar_random",
+        support_size=total_sequences,
+    )
+    test_split = DatasetSplit(
+        states=all_states[train_sequences:],
+        initial_state_codes=initial_state_codes[train_sequences:],
+        initial_state_family="haar_random",
+        support_size=total_sequences,
+    )
+
+    return QuantumDatasetBundle(
+        train=train_split,
+        test=test_split,
+        hamiltonian=HamiltonianData(
+            couplings=[float(value) for value in couplings.tolist()],
+            field_strength=float(config.FIELD_STRENGTH),
+            backend=backend,
+            hamiltonian=hamiltonian.cpu(),
+            evolution_operator=evolution_operator.cpu(),
+        ),
+        basis_support_size=total_sequences,
+        used_support_fraction=1.0,
         initial_state_family_reason=reason,
     )

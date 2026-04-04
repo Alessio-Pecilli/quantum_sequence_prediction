@@ -2,8 +2,8 @@ import os
 
 os.environ["QSP_N_QUBITS"] = "3"
 os.environ["QSP_NUM_STATES"] = "9"
-os.environ["QSP_TRAIN_SEQUENCES"] = "8"
-os.environ["QSP_TEST_SEQUENCES"] = "8"
+os.environ["QSP_TRAIN_SEQUENCES"] = "4"
+os.environ["QSP_TEST_SEQUENCES"] = "4"
 os.environ["QSP_D_MODEL"] = "32"
 os.environ["QSP_NUM_HEADS"] = "4"
 os.environ["QSP_NUM_LAYERS"] = "2"

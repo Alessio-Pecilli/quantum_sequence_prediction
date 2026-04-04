@@ -118,12 +118,20 @@ class QuantumSequencePredictor(nn.Module):
             persistent=False,
         )
 
-    def forward(self, context_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        context_states: torch.Tensor,
+        padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         context_states = clamp_global_phase(context_states)
         hidden = self.embedding(context_states)
         hidden = self.position_encoding(hidden)
         seq_len = int(hidden.shape[1])
-        hidden = self.transformer(hidden, mask=self.causal_mask[:seq_len, :seq_len])
+        hidden = self.transformer(
+            hidden,
+            mask=self.causal_mask[:seq_len, :seq_len],
+            src_key_padding_mask=padding_mask,
+        )
         hidden = self.output_norm(hidden)
         raw_features = self.output_head(hidden)
         predicted = unpack_clamped_state_features(raw_features, dim_2n=self.dim_2n)

@@ -19,11 +19,13 @@ import config
 from input import generate_fixed_tfim_dataset
 from trainer import (
     AdaptiveTrainingTrace,
+    ModelSelectionTrace,
     TrainingHistory,
     build_model,
     compute_observable_curves,
     evaluate_autoregressive,
     evaluate_multistep,
+    evaluate_teacher_forced,
     exposure_bias_detected,
     plot_observable_curves,
     plot_training_curves,
@@ -92,6 +94,20 @@ def _adaptive_training_as_serializable(trace: AdaptiveTrainingTrace) -> dict[str
     }
 
 
+def _model_selection_as_serializable(trace: ModelSelectionTrace) -> dict[str, object]:
+    return {
+        "criterion": str(trace.criterion),
+        "best_epoch": int(trace.best_epoch),
+        "best_objective": float(trace.best_objective),
+        "best_teacher_forced_fidelity": float(trace.best_teacher_forced_fidelity),
+        "best_multistep_fidelity": float(trace.best_multistep_fidelity),
+        "best_rollout_fidelity": float(trace.best_rollout_fidelity),
+        "rollout_weight": float(trace.rollout_weight),
+        "multistep_weight": float(trace.multistep_weight),
+        "teacher_forced_weight": float(trace.teacher_forced_weight),
+    }
+
+
 def _load_history_from_last_checkpoint() -> TrainingHistory:
     if not config.LAST_CHECKPOINT_PATH.exists():
         return TrainingHistory(epochs=[], train_loss=[], train_fidelity=[])
@@ -150,7 +166,7 @@ def main():
     }
 
     print("=" * 78)
-    print("Quantum Sequence Prediction | X-basis clamped pipeline")
+    print("Quantum Sequence Prediction | hybrid teacher-forced + multistep pipeline")
     print("=" * 78)
     print(f"Device:                {config.DEVICE}")
     print(f"Qubits:                {config.N_QUBITS} (dim={config.DIM_2N})")
@@ -158,6 +174,7 @@ def main():
     print(f"Dataset:               train={dataset.train.num_sequences}, test={dataset.test.num_sequences}")
     print(f"Stati iniziali:        {dataset.train.initial_state_family}")
     print(f"Motivo famiglia:       {dataset.initial_state_family_reason}")
+    print(f"Force X basis only:    {config.FORCE_X_BASIS_ONLY}")
     print(
         f"Checkpoint best:       "
         f"{'trovato' if config.CHECKPOINT_PATH.exists() else 'assente'} | {config.CHECKPOINT_PATH}"
@@ -172,17 +189,23 @@ def main():
     if config.EVAL_ONLY:
         history = _load_trained_model(model)
         adaptive_trace = AdaptiveTrainingTrace(
-            enabled=bool(config.ADAPTIVE_MULTISTEP_ENABLED),
-            initial_horizon=int(config.ADAPTIVE_H_MIN if config.ADAPTIVE_MULTISTEP_ENABLED else config.MULTISTEP_H),
-            initial_teacher_steps=int(
-                min(
-                    config.ADAPTIVE_TEACHER_MAX if config.ADAPTIVE_MULTISTEP_ENABLED else config.MULTISTEP_H,
-                    config.MULTISTEP_TEACHER_FORCING_STEPS,
-                )
-            ),
+            enabled=False,
+            initial_horizon=int(config.MULTISTEP_H),
+            initial_teacher_steps=int(config.MULTISTEP_EFFECTIVE_TEACHER_FORCING_STEPS),
             final_horizon=int(config.MULTISTEP_H),
-            final_teacher_steps=int(config.MULTISTEP_TEACHER_FORCING_STEPS),
+            final_teacher_steps=int(config.MULTISTEP_EFFECTIVE_TEACHER_FORCING_STEPS),
             epoch_summaries=[],
+        )
+        selection_trace = ModelSelectionTrace(
+            criterion="existing_checkpoint",
+            best_epoch=int(history.epochs[-1]) if history.epochs else 0,
+            best_objective=float("nan"),
+            best_teacher_forced_fidelity=float("nan"),
+            best_multistep_fidelity=float("nan"),
+            best_rollout_fidelity=float("nan"),
+            rollout_weight=0.0,
+            multistep_weight=1.0,
+            teacher_forced_weight=0.0,
         )
         if history.epochs:
             plot_training_curves(history)
@@ -199,23 +222,26 @@ def main():
                 print(f"Auto-resume:           {resume_state.reason}")
             else:
                 print(f"Auto-resume saltato:   {resume_state.reason}")
-        history, adaptive_trace = train_model(
+        history, adaptive_trace, selection_trace = train_model(
             model,
             dataset.train.states,
+            validation_states=dataset.test.states,
             start_epoch=resume_state.start_epoch,
             history=resume_state.history,
             optimizer_state_dict=resume_state.optimizer_state_dict,
             scheduler_state_dict=resume_state.scheduler_state_dict,
-            best_loss=resume_state.best_loss,
+            best_objective=resume_state.best_objective,
             best_state=resume_state.best_state,
         )
         plot_training_curves(history)
 
+    train_teacher = evaluate_teacher_forced(model, dataset.train.states)
+    test_teacher = evaluate_teacher_forced(model, dataset.test.states)
     train_multistep = evaluate_multistep(model, dataset.train.states)
     test_multistep = evaluate_multistep(model, dataset.test.states)
     rollout_warmup = int(config.ROLLOUT_WARMUP_STATES)
     train_rollout = evaluate_autoregressive(model, dataset.train.states, warmup_states=rollout_warmup)
-    test_rollout = evaluate_autoregressive(model, dataset.test.states, warmup_states=rollout_warmup)
+    test_rollout = evaluate_autoregressive(model, dataset.train.states, warmup_states=rollout_warmup)
 
     add_partial_curves = exposure_bias_detected(train_multistep.fidelity_curve, train_rollout.fidelity_curve) or (
         exposure_bias_detected(test_multistep.fidelity_curve, test_rollout.fidelity_curve)
@@ -263,12 +289,21 @@ def main():
         "seed": int(config.SEED),
         "device": config.DEVICE,
         "config": {
+            "DATASET_SOURCE": config.DATASET_SOURCE,
             "N_QUBITS": int(config.N_QUBITS),
             "DIM_2N": int(config.DIM_2N),
             "NUM_STATES": int(config.NUM_STATES),
             "SEQ_LEN": int(config.SEQ_LEN),
             "MULTISTEP_H": int(config.MULTISTEP_H),
+            "MULTISTEP_H_START": int(config.MULTISTEP_H_START),
+            "MULTISTEP_H_MAX": int(config.MULTISTEP_H_MAX),
+            "MULTISTEP_EFFECTIVE_TEACHER_FORCING_STEPS": int(config.MULTISTEP_EFFECTIVE_TEACHER_FORCING_STEPS),
             "MULTISTEP_TEACHER_FORCING_STEPS": int(config.MULTISTEP_TEACHER_FORCING_STEPS),
+            "HYBRID_TEACHER_FORCING_EPOCHS": int(config.HYBRID_TEACHER_FORCING_EPOCHS),
+            "MULTISTEP_H_PLATEAU_PATIENCE": int(config.MULTISTEP_H_PLATEAU_PATIENCE),
+            "MULTISTEP_H_PLATEAU_MIN_DELTA": float(config.MULTISTEP_H_PLATEAU_MIN_DELTA),
+            "EARLY_STOPPING_PATIENCE": int(config.EARLY_STOPPING_PATIENCE),
+            "EARLY_STOPPING_MIN_EPOCHS": int(config.EARLY_STOPPING_MIN_EPOCHS),
             "ADAPTIVE_MULTISTEP_ENABLED": bool(config.ADAPTIVE_MULTISTEP_ENABLED),
             "ADAPTIVE_STATS_EMA": float(config.ADAPTIVE_STATS_EMA),
             "ADAPTIVE_WEIGHT_ALPHA": float(config.ADAPTIVE_WEIGHT_ALPHA),
@@ -285,6 +320,8 @@ def main():
             "TRAIN_SEQUENCES": int(config.TRAIN_SEQUENCES),
             "TEST_SEQUENCES": int(config.TEST_SEQUENCES),
             "INITIAL_STATE_FAMILY": config.INITIAL_STATE_FAMILY,
+            "FORCE_X_BASIS_ONLY": bool(config.FORCE_X_BASIS_ONLY),
+            "DROPOUT": float(config.DROPOUT),
             "ROLLOUT_WARMUP_STATES": int(config.ROLLOUT_WARMUP_STATES),
             "EVAL_ONLY": bool(config.EVAL_ONLY),
             "AUTO_RESUME": bool(config.AUTO_RESUME),
@@ -296,17 +333,34 @@ def main():
             "active_env_overrides": config.get_active_env_overrides(),
         },
         "dataset": {
+            "source": config.DATASET_SOURCE,
             "initial_state_family": dataset.train.initial_state_family,
             "initial_state_family_reason": dataset.initial_state_family_reason,
             "train_initial_state_codes": dataset.train.initial_state_codes,
             "test_initial_state_codes": dataset.test.initial_state_codes,
         },
         "resume": resume_status,
+        "training_scheme": {
+            "mode": "teacher_forced_then_hybrid_50_50_vectorized_multistep",
+            "teacher_forcing_epochs": int(config.HYBRID_TEACHER_FORCING_EPOCHS),
+            "multistep_epochs": max(0, int(config.EPOCHS) - int(config.HYBRID_TEACHER_FORCING_EPOCHS)),
+            "multistep_horizon_start": int(config.MULTISTEP_H_START),
+            "multistep_horizon_max": int(config.MULTISTEP_H_MAX),
+            "multistep_horizon_eval": int(config.MULTISTEP_H),
+            "multistep_teacher_steps": int(config.MULTISTEP_EFFECTIVE_TEACHER_FORCING_STEPS),
+            "hybrid_teacher_forced_weight": 0.5,
+            "hybrid_multistep_weight": 0.5,
+            "multistep_step_weighting": "descending_linear_mean_normalized",
+            "rollout_evaluation_warmup_states": int(config.ROLLOUT_WARMUP_STATES),
+        },
         "training_history": _history_as_serializable(history),
         "adaptive_training": _adaptive_training_as_serializable(adaptive_trace),
+        "model_selection": _model_selection_as_serializable(selection_trace),
         "evaluation": {
+            "train_teacher_forced": _as_serializable(train_teacher),
             "train_multistep": _as_serializable(train_multistep),
             "train_autoregressive": _as_serializable(train_rollout),
+            "test_teacher_forced": _as_serializable(test_teacher),
             "test_multistep": _as_serializable(test_multistep),
             "test_autoregressive": _as_serializable(test_rollout),
             "test_observables_sequence_index": int(test_seq_idx),
@@ -327,8 +381,14 @@ def main():
         json.dump(summary, handle, indent=2)
 
     print("\nMetriche aggregate")
-    print(f"  Train | multistep={train_multistep.mean_fidelity:.6f} | rollout={train_rollout.mean_fidelity:.6f}")
-    print(f"  Test  | multistep={test_multistep.mean_fidelity:.6f} | rollout={test_rollout.mean_fidelity:.6f}")
+    print(f"  Train | teacher={train_teacher.mean_fidelity:.6f} | multistep={train_multistep.mean_fidelity:.6f} | rollout={train_rollout.mean_fidelity:.6f}")
+    print(f"  Test  | teacher={test_teacher.mean_fidelity:.6f} | multistep={test_multistep.mean_fidelity:.6f} | rollout={test_rollout.mean_fidelity:.6f}")
+    print(
+        f"  Best  | epoch={selection_trace.best_epoch} | "
+        f"score={selection_trace.best_objective:.6f} | "
+        f"tf/ms=({selection_trace.best_teacher_forced_fidelity:.6f}/"
+        f"{selection_trace.best_multistep_fidelity:.6f})"
+    )
     print(f"\nPlot fidelity:  {config.FIDELITY_PLOT_PATH}")
     print(f"Plot training:  {config.TRAINING_CURVES_PATH}")
     print(f"Obs test plot:  {config.OBSERVABLES_TEST_PLOT_PATH}")

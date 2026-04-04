@@ -93,8 +93,8 @@ def _default_by_qubits(defaults: dict[int, int], fallback: int) -> int:
     return int(defaults.get(int(N_QUBITS), fallback))
 
 # Numero totale di stati in ogni traiettoria, incluso psi(0).
-# Default piu' lungo del baseline, ma ancora gestibile in memoria/tempo.
-NUM_STATES = _env_int("QSP_NUM_STATES", 32)
+# Nel progetto SEQ_LEN = NUM_STATES - 1, quindi 12 stati totali -> 11 predizioni.
+NUM_STATES = _env_int("QSP_NUM_STATES", 12)
 if NUM_STATES < 2:
     raise ValueError(f"NUM_STATES deve essere >= 2, ricevuto: {NUM_STATES}")
 
@@ -103,12 +103,13 @@ SEQ_LEN = NUM_STATES - 1
 
 
 def _is_long_horizon() -> bool:
+    return False
     # Run con rollout lungo: >=60 stati (59+ predizioni).
-    return int(NUM_STATES) >= 60
+    return int(NUM_STATES) >= 12
 
 
-TRAIN_SEQUENCES = _env_int("QSP_TRAIN_SEQUENCES", 1024)
-TEST_SEQUENCES = _env_int("QSP_TEST_SEQUENCES", 256)
+TRAIN_SEQUENCES = _env_int("QSP_TRAIN_SEQUENCES", 800)
+TEST_SEQUENCES = _env_int("QSP_TEST_SEQUENCES", 200)
 if TRAIN_SEQUENCES < 1 or TEST_SEQUENCES < 1:
     raise ValueError("TRAIN_SEQUENCES e TEST_SEQUENCES devono essere >= 1.")
 
@@ -148,66 +149,110 @@ if EXACT_DIAG_MAX_DIM < 2:
     raise ValueError(f"EXACT_DIAG_MAX_DIM deve essere >= 2, ricevuto: {EXACT_DIAG_MAX_DIM}")
 
 
+DATASET_SOURCE = _env_str("QSP_DATASET_SOURCE", "haar_tfim")
+if DATASET_SOURCE not in {"fixed_tfim_basis", "haar_tfim"}:
+    raise ValueError(
+        f"DATASET_SOURCE={DATASET_SOURCE!r} non valido. "
+        "Valori ammessi: fixed_tfim_basis, haar_tfim."
+    )
+
+
 INITIAL_STATE_FAMILY = _env_str("QSP_INITIAL_STATE_FAMILY", "xyz_basis")
-if INITIAL_STATE_FAMILY not in {"x_basis", "xyz_basis"}:
+if DATASET_SOURCE == "fixed_tfim_basis" and INITIAL_STATE_FAMILY not in {"x_basis", "xyz_basis"}:
     raise ValueError(
         f"INITIAL_STATE_FAMILY={INITIAL_STATE_FAMILY!r} non valida. "
         "Valori ammessi: x_basis, xyz_basis."
     )
-INITIAL_STATE_SAMPLE_WITH_REPLACEMENT = _env_bool("QSP_INITIAL_STATE_SAMPLE_WITH_REPLACEMENT", True)
+FORCE_X_BASIS_ONLY = _env_bool("QSP_FORCE_X_BASIS_ONLY", True)
+INITIAL_STATE_SAMPLE_WITH_REPLACEMENT = _env_bool("QSP_INITIAL_STATE_SAMPLE_WITH_REPLACEMENT", False)
 X_BASIS_SAMPLE_WITH_REPLACEMENT = INITIAL_STATE_SAMPLE_WITH_REPLACEMENT
 
 
-D_MODEL = _env_int("QSP_D_MODEL", _default_by_qubits({4: 64, 6: 256}, 256))
+D_MODEL = _env_int("QSP_D_MODEL", _default_by_qubits({4: 64, 6: 128}, 128))
 NUM_HEADS = _env_int("QSP_NUM_HEADS", _default_by_qubits({4: 4, 6: 4}, 4))
-NUM_LAYERS = _env_int("QSP_NUM_LAYERS", _default_by_qubits({4: 2, 6: 3}, 3))
-DIM_FEEDFORWARD = _env_int("QSP_DIM_FEEDFORWARD", _default_by_qubits({4: 256, 6: 1024}, 1024))
-DROPOUT = _env_float("QSP_DROPOUT", 0.0)
+NUM_LAYERS = _env_int("QSP_NUM_LAYERS", _default_by_qubits({4: 2, 6: 2}, 2))
+DIM_FEEDFORWARD = _env_int("QSP_DIM_FEEDFORWARD", _default_by_qubits({4: 192, 6: 512}, 512))
+DROPOUT = _env_float("QSP_DROPOUT", 0.12)
 if D_MODEL <= 0 or NUM_HEADS <= 0 or NUM_LAYERS <= 0 or DIM_FEEDFORWARD <= 0:
     raise ValueError("D_MODEL, NUM_HEADS, NUM_LAYERS e DIM_FEEDFORWARD devono essere > 0.")
 if D_MODEL % NUM_HEADS != 0:
     raise ValueError("D_MODEL deve essere divisibile per NUM_HEADS.")
+if not (0.0 <= DROPOUT < 1.0):
+    raise ValueError(f"DROPOUT deve stare in [0,1), ricevuto: {DROPOUT}")
 
 
 BATCH_SIZE = _env_int(
     "QSP_BATCH_SIZE",
-    _default_by_qubits({4: 16 if _is_long_horizon() else 48, 6: 8}, 16),
+    _default_by_qubits({4: 8, 6: 16}, 16),
 )
 EPOCHS = _env_int(
     "QSP_EPOCHS",
-    _default_by_qubits({4: 220 if _is_long_horizon() else 140, 6: 140}, 180),
+    _default_by_qubits({4: 10000, 6: 100}, 120),
 )
-LEARNING_RATE = _env_float("QSP_LEARNING_RATE", 1e-4)
+LEARNING_RATE = _env_float("QSP_LEARNING_RATE", 5e-5)
 WEIGHT_DECAY = _env_float("QSP_WEIGHT_DECAY", 1e-4)
 GRAD_CLIP_MAX_NORM = _env_float("QSP_GRAD_CLIP_MAX_NORM", 1.0)
 LOG_FIDELITY_EPS = _env_float("QSP_LOG_FIDELITY_EPS", 1e-8)
 
-# Orizzonte multi-step del nuovo training autoregressivo.
-# Lo alziamo rispetto al baseline, ma evitiamo valori che facciano esplodere il
-# costo del training sui rollout lunghi.
-MULTISTEP_H = _env_int("QSP_MULTISTEP_H", min(12, int(SEQ_LEN)))
-if not (1 <= MULTISTEP_H <= SEQ_LEN):
+# Curriculum dell'orizzonte multi-step:
+# partiamo prudenti e cresciamo solo dopo plateau sul validation teacher-forced.
+MULTISTEP_H_START = _env_int("QSP_MULTISTEP_H_START", min(2, int(SEQ_LEN)))
+MULTISTEP_H_MAX = _env_int("QSP_MULTISTEP_H_MAX", min(6, int(SEQ_LEN)))
+# Alias retrocompatibile: rappresenta l'orizzonte massimo/evaluation horizon.
+MULTISTEP_H = _env_int("QSP_MULTISTEP_H", int(MULTISTEP_H_MAX))
+if not (1 <= MULTISTEP_H_START <= SEQ_LEN):
     raise ValueError(
-        f"MULTISTEP_H deve stare in [1, SEQ_LEN={SEQ_LEN}], ricevuto: {MULTISTEP_H}"
+        f"MULTISTEP_H_START deve stare in [1, SEQ_LEN={SEQ_LEN}], ricevuto: {MULTISTEP_H_START}"
+    )
+if not (MULTISTEP_H_START <= MULTISTEP_H_MAX <= SEQ_LEN):
+    raise ValueError(
+        "MULTISTEP_H_MAX deve stare in [MULTISTEP_H_START, SEQ_LEN] "
+        f"con MULTISTEP_H_START={MULTISTEP_H_START}, MULTISTEP_H_MAX={MULTISTEP_H_MAX}, SEQ_LEN={SEQ_LEN}"
+    )
+if not (MULTISTEP_H_START <= MULTISTEP_H <= MULTISTEP_H_MAX):
+    raise ValueError(
+        "MULTISTEP_H deve stare in [MULTISTEP_H_START, MULTISTEP_H_MAX] "
+        f"con MULTISTEP_H={MULTISTEP_H}, MULTISTEP_H_START={MULTISTEP_H_START}, MULTISTEP_H_MAX={MULTISTEP_H_MAX}"
     )
 
-# Numero di passi che continuano a usare il contesto corretto prima del passaggio
-# al contesto predetto. Teniamo un warm start moderato per non stressare troppo
-# i primi passi autoregressivi.
+# Numero legacy mantenuto per retrocompatibilita' di config/checkpoint. Il nuovo
+# training ibrido ricava internamente i teacher steps effettivi come H/2.
 MULTISTEP_TEACHER_FORCING_STEPS = _env_int(
     "QSP_MULTISTEP_TEACHER_FORCING_STEPS",
-    min(4, int(MULTISTEP_H)),
+    max(1, int(MULTISTEP_H) // 2),
 )
 if MULTISTEP_TEACHER_FORCING_STEPS < 0:
     raise ValueError(
         "MULTISTEP_TEACHER_FORCING_STEPS deve essere >= 0, "
         f"ricevuto: {MULTISTEP_TEACHER_FORCING_STEPS}"
     )
+MULTISTEP_EFFECTIVE_TEACHER_FORCING_STEPS = max(1, min(int(MULTISTEP_H), int(MULTISTEP_H) // 2))
+HYBRID_TEACHER_FORCING_EPOCHS = max(1, int(EPOCHS) // 2)
 MULTISTEP_TRAIN_VERBOSE = _env_bool("QSP_MULTISTEP_TRAIN_VERBOSE", False)
+MULTISTEP_H_PLATEAU_PATIENCE = _env_int("QSP_MULTISTEP_H_PLATEAU_PATIENCE", 250)
+MULTISTEP_H_PLATEAU_MIN_DELTA = _env_float("QSP_MULTISTEP_H_PLATEAU_MIN_DELTA", 1e-4)
+EARLY_STOPPING_PATIENCE = _env_int("QSP_EARLY_STOPPING_PATIENCE", 1000)
+EARLY_STOPPING_MIN_EPOCHS = _env_int("QSP_EARLY_STOPPING_MIN_EPOCHS", HYBRID_TEACHER_FORCING_EPOCHS)
+if MULTISTEP_H_PLATEAU_PATIENCE < 1:
+    raise ValueError(
+        f"MULTISTEP_H_PLATEAU_PATIENCE deve essere >= 1, ricevuto: {MULTISTEP_H_PLATEAU_PATIENCE}"
+    )
+if MULTISTEP_H_PLATEAU_MIN_DELTA < 0.0:
+    raise ValueError(
+        f"MULTISTEP_H_PLATEAU_MIN_DELTA deve essere >= 0, ricevuto: {MULTISTEP_H_PLATEAU_MIN_DELTA}"
+    )
+if EARLY_STOPPING_PATIENCE < 1:
+    raise ValueError(
+        f"EARLY_STOPPING_PATIENCE deve essere >= 1, ricevuto: {EARLY_STOPPING_PATIENCE}"
+    )
+if EARLY_STOPPING_MIN_EPOCHS < 1 or EARLY_STOPPING_MIN_EPOCHS > EPOCHS:
+    raise ValueError(
+        f"EARLY_STOPPING_MIN_EPOCHS deve stare in [1, EPOCHS={EPOCHS}], ricevuto: {EARLY_STOPPING_MIN_EPOCHS}"
+    )
 
-# Training multi-step adattivo:
-# resta disponibile via env, ma di default lo lasciamo spento per privilegiare
-# una baseline piu' stabile e interpretabile.
+# Blocchi legacy del vecchio training multi-step adattivo: restano configurabili
+# per compatibilita' con checkpoint e summary, ma il training ibrido corrente non
+# li usa per modificare H o teacher steps durante le epoche.
 ADAPTIVE_MULTISTEP_ENABLED = _env_bool("QSP_ADAPTIVE_MULTISTEP_ENABLED", False)
 ADAPTIVE_STATS_EMA = _env_float("QSP_ADAPTIVE_STATS_EMA", 0.70)
 ADAPTIVE_WEIGHT_ALPHA = _env_float("QSP_ADAPTIVE_WEIGHT_ALPHA", 0.80)
@@ -245,7 +290,7 @@ ROLLOUT_CURRICULUM_EPOCHS = _env_int(
 # la parte autoregressiva.
 ROLLOUT_WARMUP_STATES = _env_int(
     "QSP_ROLLOUT_WARMUP_STATES",
-    max(6, min(10, int(NUM_STATES) // 5)),
+    min(2, int(NUM_STATES) - 1),
 )
 if BATCH_SIZE < 1 or EPOCHS < 1:
     raise ValueError("BATCH_SIZE e EPOCHS devono essere >= 1.")
@@ -341,8 +386,8 @@ PIN_MEMORY = _env_bool("QSP_PIN_MEMORY", False)
 SAVE_MODEL = _env_bool("QSP_SAVE_MODEL", True)
 # Se attivo, salta il training e ricalcola metriche/plot da best_model.pt.
 EVAL_ONLY = _env_bool("QSP_EVAL_ONLY", False)
-# Disattivo resume per la run "paper-like" (ripartiamo puliti).
-AUTO_RESUME = _env_bool("QSP_AUTO_RESUME", False)
+# Resume automatico: riparte dall'ultimo checkpoint compatibile se presente.
+AUTO_RESUME = _env_bool("QSP_AUTO_RESUME", True)
 CHECKPOINT_EVERY_EPOCH = _env_int("QSP_CHECKPOINT_EVERY_EPOCH", 1)
 if CHECKPOINT_EVERY_EPOCH < 1:
     raise ValueError(
