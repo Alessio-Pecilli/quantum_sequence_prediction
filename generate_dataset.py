@@ -55,9 +55,22 @@ def sample_haar_random_states(
     return (states / norms).to(dtype)
 
 
-def evolve_batched(
+def sample_tfim_params(
+    num_samples: int,
+    seed: int,
+    low: float = 0.2,
+    high: float = 2.0,
+) -> torch.Tensor:
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed)
+    params = torch.empty((num_samples, 2), dtype=torch.float32)
+    params.uniform_(float(low), float(high), generator=generator)
+    return params
+
+
+def evolve_batched_per_trajectory(
     initial_states: torch.Tensor,
-    unitary: torch.Tensor,
+    unitaries: torch.Tensor,
     num_states: int,
 ) -> torch.Tensor:
     num_samples, dim = initial_states.shape
@@ -65,10 +78,10 @@ def evolve_batched(
     current = initial_states
     trajectories[:, 0, :] = current
 
-    # Stati memorizzati come righe: psi_{t+1} = psi_t @ U^T, batched su tutte le traiettorie.
-    right_operator = unitary.transpose(0, 1).contiguous()
+    # Stati memorizzati come righe: psi_{t+1} = psi_t @ U^T, con una U diversa per traiettoria.
+    right_operators = unitaries.transpose(1, 2).contiguous()
     for t in range(1, num_states):
-        current = current @ right_operator
+        current = torch.bmm(current.unsqueeze(1), right_operators).squeeze(1)
         current = current / torch.linalg.vector_norm(current, dim=-1, keepdim=True).clamp(min=1e-8)
         trajectories[:, t, :] = current
 
@@ -88,9 +101,9 @@ def parse_args() -> argparse.Namespace:
         default_dt = 1.0
 
     parser = argparse.ArgumentParser(description="Genera un dataset Haar+TFIM per 4 qubit.")
-    parser.add_argument("--num-trajectories", type=int, default=1000)
-    parser.add_argument("--train-size", type=int, default=800)
-    parser.add_argument("--test-size", type=int, default=200)
+    parser.add_argument("--num-trajectories", type=int, default=5000)
+    parser.add_argument("--train-size", type=int, default=4000)
+    parser.add_argument("--test-size", type=int, default=1000)
     parser.add_argument("--num-states", type=int, default=12)
     parser.add_argument("--n-qubits", type=int, default=4)
     parser.add_argument("--seed", type=int, default=7)
@@ -124,18 +137,19 @@ def main() -> None:
         seed=args.seed,
         dtype=dtype,
     )
-
-    hamiltonian = build_tfim_hamiltonian(
-        n_qubits=args.n_qubits,
-        coupling_j=args.j,
-        field_h=args.h,
-    ).to(dtype)
-
-    # Unitaria esatta del singolo time-step: U = exp(-i H dt).
-    unitary = torch.matrix_exp((-1j * float(args.dt)) * hamiltonian)
-    trajectories = evolve_batched(
+    all_params = sample_tfim_params(args.num_trajectories, seed=args.seed + 1)
+    unitaries = []
+    for coupling_j, field_h in all_params.tolist():
+        hamiltonian = build_tfim_hamiltonian(
+            n_qubits=args.n_qubits,
+            coupling_j=float(coupling_j),
+            field_h=float(field_h),
+        ).to(dtype)
+        unitaries.append(torch.matrix_exp((-1j * float(args.dt)) * hamiltonian))
+    unitary_tensor = torch.stack(unitaries, dim=0)
+    trajectories = evolve_batched_per_trajectory(
         initial_states=initial_states,
-        unitary=unitary,
+        unitaries=unitary_tensor,
         num_states=args.num_states,
     )
 
@@ -144,20 +158,28 @@ def main() -> None:
 
     train_states = trajectories[: args.train_size].contiguous()
     test_states = trajectories[args.train_size :].contiguous()
+    train_params = all_params[: args.train_size].contiguous().to(torch.float32)
+    test_params = all_params[args.train_size :].contiguous().to(torch.float32)
 
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     train_path = output_dir / "train_states.pt"
     test_path = output_dir / "test_states.pt"
+    train_params_path = output_dir / "train_params.pt"
+    test_params_path = output_dir / "test_params.pt"
     torch.save(train_states, train_path)
     torch.save(test_states, test_path)
+    torch.save(train_params, train_params_path)
+    torch.save(test_params, test_params_path)
 
     print("Dataset generato correttamente")
     print(f"  Hamiltonian: TFIM open chain | n_qubits={args.n_qubits} | dim={dim}")
-    print(f"  Params: J={args.j}, h={args.h}, dt={args.dt}")
+    print(f"  Params: J,h ~ U(0.2, 2.0) per traiettoria | dt={args.dt}")
     print(f"  Tensor shape totale: {tuple(trajectories.shape)} | dtype={trajectories.dtype}")
     print(f"  Train: {tuple(train_states.shape)} -> {train_path}")
     print(f"  Test:  {tuple(test_states.shape)} -> {test_path}")
+    print(f"  Train params: {tuple(train_params.shape)} -> {train_params_path}")
+    print(f"  Test params:  {tuple(test_params.shape)} -> {test_params_path}")
 
 
 if __name__ == "__main__":

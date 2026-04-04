@@ -63,13 +63,14 @@ assert torch.allclose(test_norms, torch.ones_like(test_norms), atol=1e-5)
 _assert_phase_clamped(bundle.train.states)
 _assert_phase_clamped(bundle.test.states)
 
-dataset = QuantumSequenceDataset(bundle.train.states)
-inputs, targets = dataset[0]
+dataset = QuantumSequenceDataset(bundle.train.states, bundle.train.params)
+inputs, targets, params = dataset[0]
 assert inputs.shape == (config.SEQ_LEN, config.DIM_2N)
 assert targets.shape == (config.SEQ_LEN, config.DIM_2N)
+assert params.shape == (2,)
 
 model = QuantumSequencePredictor()
-predictions = model(bundle.train.inputs[:2])
+predictions = model(bundle.train.inputs[:2], bundle.train.params[:2])
 assert predictions.shape == (2, config.SEQ_LEN, config.DIM_2N)
 
 # Check: output del modello già clamped.
@@ -81,8 +82,8 @@ assert loss.ndim == 0
 assert mean_fidelity.ndim == 0
 assert fidelity_matrix.shape == (2, config.SEQ_LEN)
 
-teacher = evaluate_teacher_forced(model, bundle.train.states)
-rollout = evaluate_autoregressive(model, bundle.train.states, warmup_states=1)
+teacher = evaluate_teacher_forced(model, bundle.train.states, bundle.train.params)
+rollout = evaluate_autoregressive(model, bundle.train.states, bundle.train.params, warmup_states=1)
 assert len(teacher.fidelity_curve) == config.SEQ_LEN
 assert len(rollout.fidelity_curve) == config.SEQ_LEN
 

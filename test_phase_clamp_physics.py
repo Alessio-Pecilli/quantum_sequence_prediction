@@ -168,7 +168,8 @@ def main():
     model.eval()
 
     x = bundle.train.inputs[:8].to(config.DEVICE)
-    pred = model(x).cpu()
+    params = bundle.train.params[:8].to(config.DEVICE)
+    pred = model(x, params).cpu()
     assert_phase_clamp_physics(pred, verbose=verbose, label="model pred (train.inputs[:8])")
 
     # Invarianza della fidelity tra pred e target sotto clamping (dovrebbe valere sempre).

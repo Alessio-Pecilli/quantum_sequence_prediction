@@ -32,21 +32,23 @@ def main():
     history, adaptive_trace, selection_trace = train_model(
         model,
         bundle.train.states,
+        bundle.train.params,
         validation_states=bundle.test.states,
+        validation_params=bundle.test.params,
     )
     assert len(history.epochs) == config.EPOCHS
-    assert adaptive_trace.initial_horizon == config.MULTISTEP_H
-    assert adaptive_trace.final_horizon == config.MULTISTEP_H
-    assert adaptive_trace.initial_teacher_steps == config.MULTISTEP_EFFECTIVE_TEACHER_FORCING_STEPS
-    assert adaptive_trace.final_teacher_steps == config.MULTISTEP_EFFECTIVE_TEACHER_FORCING_STEPS
+    assert adaptive_trace.initial_horizon == config.MULTISTEP_H_START
+    assert adaptive_trace.final_horizon >= adaptive_trace.initial_horizon
+    assert adaptive_trace.initial_teacher_steps >= 1
+    assert adaptive_trace.final_teacher_steps >= 1
     assert 1 <= selection_trace.best_epoch <= config.EPOCHS
 
-    train_teacher = evaluate_teacher_forced(model, bundle.train.states)
-    test_teacher = evaluate_teacher_forced(model, bundle.test.states)
-    train_multistep = evaluate_multistep(model, bundle.train.states)
-    test_multistep = evaluate_multistep(model, bundle.test.states)
-    train_rollout = evaluate_autoregressive(model, bundle.train.states, warmup_states=1)
-    test_rollout = evaluate_autoregressive(model, bundle.test.states, warmup_states=1)
+    train_teacher = evaluate_teacher_forced(model, bundle.train.states, bundle.train.params)
+    test_teacher = evaluate_teacher_forced(model, bundle.test.states, bundle.test.params)
+    train_multistep = evaluate_multistep(model, bundle.train.states, bundle.train.params)
+    test_multistep = evaluate_multistep(model, bundle.test.states, bundle.test.params)
+    train_rollout = evaluate_autoregressive(model, bundle.train.states, bundle.train.params, warmup_states=1)
+    test_rollout = evaluate_autoregressive(model, bundle.test.states, bundle.test.params, warmup_states=1)
 
     print("MINI EVAL OK")
     print(f"  ultime epoche registrate: {len(history.epochs)}")

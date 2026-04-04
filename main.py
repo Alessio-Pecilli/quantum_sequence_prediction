@@ -172,6 +172,15 @@ def main():
     print(f"Qubits:                {config.N_QUBITS} (dim={config.DIM_2N})")
     print(f"Stati per traiettoria: {config.NUM_STATES} (predizioni={config.SEQ_LEN})")
     print(f"Dataset:               train={dataset.train.num_sequences}, test={dataset.test.num_sequences}")
+    print(
+        f"Transformer:           d_model={config.D_MODEL}, layers={config.NUM_LAYERS}, "
+        f"heads={config.NUM_HEADS}, ff={config.DIM_FEEDFORWARD}, dropout={config.DROPOUT}"
+    )
+    print(
+        f"Training:              batch_size={config.BATCH_SIZE}, lr={config.LEARNING_RATE:.2e}, "
+        f"epochs={config.EPOCHS}, tf_only={config.HYBRID_TEACHER_FORCING_EPOCHS}, "
+        f"early_stop_patience={config.EARLY_STOPPING_PATIENCE}"
+    )
     print(f"Stati iniziali:        {dataset.train.initial_state_family}")
     print(f"Motivo famiglia:       {dataset.initial_state_family_reason}")
     print(f"Force X basis only:    {config.FORCE_X_BASIS_ONLY}")
@@ -225,7 +234,9 @@ def main():
         history, adaptive_trace, selection_trace = train_model(
             model,
             dataset.train.states,
+            dataset.train.params,
             validation_states=dataset.test.states,
+            validation_params=dataset.test.params,
             start_epoch=resume_state.start_epoch,
             history=resume_state.history,
             optimizer_state_dict=resume_state.optimizer_state_dict,
@@ -235,13 +246,23 @@ def main():
         )
         plot_training_curves(history)
 
-    train_teacher = evaluate_teacher_forced(model, dataset.train.states)
-    test_teacher = evaluate_teacher_forced(model, dataset.test.states)
-    train_multistep = evaluate_multistep(model, dataset.train.states)
-    test_multistep = evaluate_multistep(model, dataset.test.states)
+    train_teacher = evaluate_teacher_forced(model, dataset.train.states, dataset.train.params)
+    test_teacher = evaluate_teacher_forced(model, dataset.test.states, dataset.test.params)
+    train_multistep = evaluate_multistep(model, dataset.train.states, dataset.train.params)
+    test_multistep = evaluate_multistep(model, dataset.test.states, dataset.test.params)
     rollout_warmup = int(config.ROLLOUT_WARMUP_STATES)
-    train_rollout = evaluate_autoregressive(model, dataset.train.states, warmup_states=rollout_warmup)
-    test_rollout = evaluate_autoregressive(model, dataset.train.states, warmup_states=rollout_warmup)
+    train_rollout = evaluate_autoregressive(
+        model,
+        dataset.train.states,
+        dataset.train.params,
+        warmup_states=rollout_warmup,
+    )
+    test_rollout = evaluate_autoregressive(
+        model,
+        dataset.train.states,
+        dataset.train.params,
+        warmup_states=rollout_warmup,
+    )
 
     add_partial_curves = exposure_bias_detected(train_multistep.fidelity_curve, train_rollout.fidelity_curve) or (
         exposure_bias_detected(test_multistep.fidelity_curve, test_rollout.fidelity_curve)
@@ -255,10 +276,10 @@ def main():
         for warmup_n1 in warmup_n1_values:
             warmup_states = warmup_n1 + 1
             partial_results_train[warmup_n1] = evaluate_autoregressive(
-                model, dataset.train.states, warmup_states=warmup_states
+                model, dataset.train.states, dataset.train.params, warmup_states=warmup_states
             )
             partial_results_test[warmup_n1] = evaluate_autoregressive(
-                model, dataset.test.states, warmup_states=warmup_states
+                model, dataset.test.states, dataset.test.params, warmup_states=warmup_states
             )
     else:
         print("\nNessun exposure bias marcato: mantengo solo metodo 1 e 2.")
@@ -273,7 +294,13 @@ def main():
 
     test_seq_idx = min(int(config.OBSERVABLES_TEST_SEQUENCE_INDEX), int(dataset.test.num_sequences) - 1)
     test_single_sequence = dataset.test.states[test_seq_idx : test_seq_idx + 1]
-    test_observables = compute_observable_curves(model, test_single_sequence, warmup_states=rollout_warmup)
+    test_single_params = dataset.test.params[test_seq_idx : test_seq_idx + 1]
+    test_observables = compute_observable_curves(
+        model,
+        test_single_sequence,
+        test_single_params,
+        warmup_states=rollout_warmup,
+    )
 
     plot_observable_curves(
         curves=test_observables,

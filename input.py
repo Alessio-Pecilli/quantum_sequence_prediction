@@ -26,6 +26,7 @@ class HamiltonianData:
 @dataclass
 class DatasetSplit:
     states: torch.Tensor
+    params: torch.Tensor
     initial_state_codes: list[int]
     initial_state_family: str
     support_size: int
@@ -54,12 +55,20 @@ class QuantumDatasetBundle:
 
 
 class QuantumSequenceDataset(Dataset):
-    def __init__(self, states: torch.Tensor):
+    def __init__(self, states: torch.Tensor, params: torch.Tensor):
         if states.ndim != 3:
             raise ValueError(f"states deve avere shape (batch, num_states, dim), ricevuto {tuple(states.shape)}")
         if states.shape[1] < 2:
             raise ValueError("Ogni traiettoria deve contenere almeno 2 stati.")
+        if params.ndim != 2 or params.shape[1] != 2:
+            raise ValueError(f"params deve avere shape (batch, 2), ricevuto {tuple(params.shape)}")
+        if params.shape[0] != states.shape[0]:
+            raise ValueError(
+                "states e params devono avere lo stesso numero di traiettorie: "
+                f"{states.shape[0]} vs {params.shape[0]}"
+            )
         self.states = states
+        self.params = params.to(torch.float32)
         self.inputs = states[:, :-1]
         self.targets = states[:, 1:]
 
@@ -67,7 +76,7 @@ class QuantumSequenceDataset(Dataset):
         return int(self.states.shape[0])
 
     def __getitem__(self, index: int):
-        return self.inputs[index], self.targets[index]
+        return self.inputs[index], self.targets[index], self.params[index]
 
 
 def build_uniform_couplings(
@@ -183,6 +192,19 @@ def sample_couplings(n_qubits: int, seed: int) -> torch.Tensor:
         size=(n_qubits - 1,),
         generator=generator,
     ).to(torch.float32)
+
+
+def sample_tfim_params(
+    num_samples: int,
+    seed: int,
+    low: float = 0.2,
+    high: float = 2.0,
+) -> torch.Tensor:
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed)
+    params = torch.empty((num_samples, 2), dtype=torch.float32)
+    params.uniform_(float(low), float(high), generator=generator)
+    return params
 
 
 def compute_evolution_operator(
@@ -337,6 +359,45 @@ def evolve_sequences(
     return trajectories.cpu()
 
 
+def evolve_haar_tfim_sequences_with_params(
+    initial_states: torch.Tensor,
+    params: torch.Tensor,
+    num_states: int,
+    n_qubits: int,
+    time_step: float = config.TIME_STEP,
+    device: str | torch.device = config.DEVICE,
+) -> tuple[torch.Tensor, str]:
+    if params.ndim != 2 or params.shape[1] != 2:
+        raise ValueError(f"params deve avere shape (batch, 2), ricevuto {tuple(params.shape)}")
+    if initial_states.shape[0] != params.shape[0]:
+        raise ValueError(
+            "initial_states e params devono avere lo stesso batch size: "
+            f"{initial_states.shape[0]} vs {params.shape[0]}"
+        )
+
+    trajectories = []
+    backend_name = "per_trajectory_exact_diag"
+    for initial_state, trajectory_params in zip(initial_states, params):
+        coupling_j = float(trajectory_params[0].item())
+        field_h = float(trajectory_params[1].item())
+        couplings = build_uniform_couplings(n_qubits, coupling_strength=coupling_j)
+        hamiltonian = build_tfim_hamiltonian(
+            n_qubits=n_qubits,
+            couplings=couplings,
+            field_strength=field_h,
+        )
+        evolution_operator, backend = compute_evolution_operator(hamiltonian, time_step)
+        backend_name = f"per_trajectory_{backend}"
+        trajectory = evolve_sequences(
+            initial_states=initial_state.unsqueeze(0),
+            evolution_operator=evolution_operator,
+            num_states=num_states,
+            device=device,
+        )
+        trajectories.append(trajectory[0])
+    return torch.stack(trajectories, dim=0), backend_name
+
+
 def _format_complex(z: complex, ndigits: int = 6) -> str:
     return f"{z.real:+.{ndigits}f}{z.imag:+.{ndigits}f}j"
 
@@ -415,12 +476,20 @@ def generate_fixed_tfim_dataset(
 
     train_split = DatasetSplit(
         states=all_states[:train_sequences],
+        params=torch.tensor(
+            [float(config.COUPLING_MEAN), float(config.FIELD_STRENGTH)],
+            dtype=torch.float32,
+        ).repeat(train_sequences, 1),
         initial_state_codes=initial_state_codes[:train_sequences],
         initial_state_family=family,
         support_size=support_size,
     )
     test_split = DatasetSplit(
         states=all_states[train_sequences:],
+        params=torch.tensor(
+            [float(config.COUPLING_MEAN), float(config.FIELD_STRENGTH)],
+            dtype=torch.float32,
+        ).repeat(test_sequences, 1),
         initial_state_codes=initial_state_codes[train_sequences:],
         initial_state_family=family,
         support_size=support_size,
@@ -466,13 +535,7 @@ def generate_haar_tfim_dataset(
 ) -> QuantumDatasetBundle:
     total_sequences = int(train_sequences) + int(test_sequences)
     dim = 2 ** int(n_qubits)
-    couplings = build_uniform_couplings(n_qubits, coupling_strength=float(config.COUPLING_MEAN))
-    hamiltonian = build_tfim_hamiltonian(
-        n_qubits=n_qubits,
-        couplings=couplings,
-        field_strength=float(config.FIELD_STRENGTH),
-    )
-    evolution_operator, backend = compute_evolution_operator(hamiltonian, config.TIME_STEP)
+    params = sample_tfim_params(total_sequences, seed + 31)
 
     initial_states = sample_haar_random_states(
         num_states=total_sequences,
@@ -480,22 +543,30 @@ def generate_haar_tfim_dataset(
         seed=seed + 23,
         dtype=torch.complex64,
     )
-    all_states = evolve_sequences(initial_states, evolution_operator, num_states)
+    all_states, backend = evolve_haar_tfim_sequences_with_params(
+        initial_states=initial_states,
+        params=params,
+        num_states=num_states,
+        n_qubits=n_qubits,
+        time_step=config.TIME_STEP,
+    )
     initial_state_codes = list(range(total_sequences))
     reason = (
         "stati iniziali Haar random da gaussiane complesse normalizzate; "
-        f"TFIM uniforme con J={float(config.COUPLING_MEAN):.6g}, "
-        f"h={float(config.FIELD_STRENGTH):.6g}, dt={float(config.TIME_STEP):.6g}"
+        "TFIM condizionato con parametri per-traiettoria campionati uniformemente "
+        f"in [0.2, 2.0] per J e h; dt={float(config.TIME_STEP):.6g}"
     )
 
     train_split = DatasetSplit(
         states=all_states[:train_sequences],
+        params=params[:train_sequences].contiguous(),
         initial_state_codes=initial_state_codes[:train_sequences],
         initial_state_family="haar_random",
         support_size=total_sequences,
     )
     test_split = DatasetSplit(
         states=all_states[train_sequences:],
+        params=params[train_sequences:].contiguous(),
         initial_state_codes=initial_state_codes[train_sequences:],
         initial_state_family="haar_random",
         support_size=total_sequences,
@@ -505,11 +576,11 @@ def generate_haar_tfim_dataset(
         train=train_split,
         test=test_split,
         hamiltonian=HamiltonianData(
-            couplings=[float(value) for value in couplings.tolist()],
-            field_strength=float(config.FIELD_STRENGTH),
+            couplings=[],
+            field_strength=float("nan"),
             backend=backend,
-            hamiltonian=hamiltonian.cpu(),
-            evolution_operator=evolution_operator.cpu(),
+            hamiltonian=torch.empty((0, 0), dtype=torch.complex64),
+            evolution_operator=torch.empty((0, 0), dtype=torch.complex64),
         ),
         basis_support_size=total_sequences,
         used_support_fraction=1.0,

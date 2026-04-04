@@ -128,8 +128,8 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
-def build_loader(states: torch.Tensor, shuffle: bool) -> DataLoader:
-    dataset = QuantumSequenceDataset(states)
+def build_loader(states: torch.Tensor, params: torch.Tensor, shuffle: bool) -> DataLoader:
+    dataset = QuantumSequenceDataset(states, params)
     safe_batch_size = max(1, int(config.BATCH_SIZE) // 2)
     return DataLoader(
         dataset,
@@ -447,8 +447,9 @@ def _teacher_forced_training_loss(
     criterion: NegativeLogFidelityLoss,
     inputs: torch.Tensor,
     targets: torch.Tensor,
+    params: torch.Tensor,
 ):
-    predicted = model(inputs)
+    predicted = model(inputs, params)
     loss, mean_fidelity, fidelity_matrix = criterion(predicted, targets)
     per_step_losses = -torch.log(fidelity_matrix.clamp(min=config.LOG_FIDELITY_EPS))
     mean_losses = per_step_losses.mean(dim=0)
@@ -468,6 +469,7 @@ def compute_multistep_loss(
     model: QuantumSequencePredictor,
     x: torch.Tensor,
     y: torch.Tensor,
+    params: torch.Tensor,
     current_h: int,
     loss_fn: NegativeLogFidelityLoss,
     teacher_steps_override: int | None = None,
@@ -495,7 +497,7 @@ def compute_multistep_loss(
     targets = y[:, target_start : target_start + current_h, :]
 
     for step_idx in range(current_h):
-        out = model(current_context)
+        out = model(current_context, params)
         next_pred = out[:, -1:, :]
         predictions.append(next_pred)
 
@@ -526,6 +528,7 @@ def _multistep_training_loss(
     criterion: NegativeLogFidelityLoss,
     inputs: torch.Tensor,
     targets: torch.Tensor,
+    params: torch.Tensor,
     horizon_limit: int,
     teacher_steps_override: int,
     epoch: int | None = None,
@@ -545,6 +548,7 @@ def _multistep_training_loss(
         model=model,
         x=inputs,
         y=targets,
+        params=params,
         current_h=horizon,
         loss_fn=criterion,
         teacher_steps_override=teacher_steps_override,
@@ -640,7 +644,9 @@ def _save_last_checkpoint(
 def train_model(
     model: QuantumSequencePredictor,
     train_states: torch.Tensor,
+    train_params: torch.Tensor,
     validation_states: torch.Tensor | None = None,
+    validation_params: torch.Tensor | None = None,
     start_epoch: int = 1,
     history: TrainingHistory | None = None,
     optimizer_state_dict: dict | None = None,
@@ -654,7 +660,7 @@ def train_model(
         lr=config.LEARNING_RATE,
         weight_decay=config.WEIGHT_DECAY,
     )
-    loader = build_loader(train_states, shuffle=True)
+    loader = build_loader(train_states, train_params, shuffle=True)
     steps_per_epoch = len(loader)
     use_amp = config.DEVICE == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -719,9 +725,10 @@ def train_model(
             offset_weight_sums = np.zeros(epoch_horizon, dtype=np.float64)
             offset_counts = np.zeros(epoch_horizon, dtype=np.float64)
 
-            for batch_idx, (inputs, targets) in enumerate(loader, start=1):
+            for batch_idx, (inputs, targets, params) in enumerate(loader, start=1):
                 inputs = inputs.to(config.DEVICE)
                 targets = targets.to(config.DEVICE)
+                params = params.to(config.DEVICE)
 
                 batch_size = int(inputs.shape[0])
                 optimizer.zero_grad(set_to_none=True)
@@ -735,6 +742,7 @@ def train_model(
                         criterion=criterion,
                         inputs=inputs,
                         targets=targets,
+                        params=params,
                     )
                     if phase == "teacher_forced":
                         multistep_loss = torch.zeros_like(teacher_loss)
@@ -746,6 +754,7 @@ def train_model(
                             criterion=criterion,
                             inputs=inputs,
                             targets=targets,
+                            params=params,
                             horizon_limit=epoch_horizon,
                             teacher_steps_override=epoch_teacher_steps,
                             epoch=epoch,
@@ -813,10 +822,13 @@ def train_model(
             teacher_metric = None
             multistep_metric = None
             if validation_states is not None:
-                teacher_metric = evaluate_teacher_forced(model, validation_states)
+                if validation_params is None:
+                    raise ValueError("validation_params e' richiesto quando validation_states non e' None.")
+                teacher_metric = evaluate_teacher_forced(model, validation_states, validation_params)
                 multistep_metric = evaluate_multistep(
                     model,
                     validation_states,
+                    validation_params,
                     horizon_limit=eval_horizon,
                     teacher_steps_override=_effective_multistep_teacher_steps(eval_horizon),
                 )
@@ -964,20 +976,25 @@ def train_model(
 
 
 @torch.no_grad()
-def evaluate_teacher_forced(model: QuantumSequencePredictor, states: torch.Tensor) -> EvaluationResult:
+def evaluate_teacher_forced(
+    model: QuantumSequencePredictor,
+    states: torch.Tensor,
+    params: torch.Tensor,
+) -> EvaluationResult:
     model.eval()
     criterion = NegativeLogFidelityLoss()
-    loader = build_loader(states, shuffle=False)
+    loader = build_loader(states, params, shuffle=False)
 
     total_loss = 0.0
     total_fidelity = 0.0
     total_sequences = 0
     per_step_sum = torch.zeros(states.shape[1] - 1, dtype=torch.float64)
 
-    for inputs, targets in loader:
+    for inputs, targets, batch_params in loader:
         inputs = inputs.to(config.DEVICE)
         targets = targets.to(config.DEVICE)
-        predicted = model(inputs)
+        batch_params = batch_params.to(config.DEVICE)
+        predicted = model(inputs, batch_params)
         loss, mean_fidelity, fidelity_matrix = criterion(predicted, targets)
 
         batch_size = int(inputs.shape[0])
@@ -999,28 +1016,23 @@ def evaluate_teacher_forced(model: QuantumSequencePredictor, states: torch.Tenso
 def evaluate_multistep(
     model: QuantumSequencePredictor,
     states: torch.Tensor,
+    params: torch.Tensor,
     horizon_limit: int | None = None,
     teacher_steps_override: int | None = None,
 ) -> EvaluationResult:
     model.eval()
     pred_steps = int(states.shape[1]) - 1
     horizon = max(1, min(int(config.MULTISTEP_H if horizon_limit is None else horizon_limit), pred_steps))
-    loader = DataLoader(
-        states,
-        batch_size=max(1, int(config.BATCH_SIZE) // 2),
-        shuffle=False,
-        num_workers=0,
-        pin_memory=False,
-    )
+    loader = build_loader(states, params, shuffle=False)
 
     loss_sum = torch.zeros(pred_steps, dtype=torch.float64)
     fidelity_sum = torch.zeros(pred_steps, dtype=torch.float64)
     counts = torch.zeros(pred_steps, dtype=torch.float64)
 
-    for batch_states in loader:
-        true_states = batch_states.to(config.DEVICE)
-        inputs = true_states[:, :-1, :]
-        targets = true_states[:, 1:, :]
+    for inputs, targets, batch_params in loader:
+        inputs = inputs.to(config.DEVICE)
+        targets = targets.to(config.DEVICE)
+        batch_params = batch_params.to(config.DEVICE)
 
         for t_start in range(1, pred_steps + 1):
             current_h = min(horizon, pred_steps - (t_start - 1))
@@ -1028,7 +1040,7 @@ def evaluate_multistep(
             target_start = t_start - 1
 
             for step_idx in range(current_h):
-                out = model(current_context)
+                out = model(current_context, batch_params)
                 next_pred = out[:, -1:, :]
                 step_target = targets[:, target_start + step_idx : target_start + step_idx + 1, :]
                 step_fidelity = quantum_fidelity(next_pred[:, 0, :], step_target[:, 0, :]).cpu().double()
@@ -1074,6 +1086,7 @@ def evaluate_multistep(
 def evaluate_autoregressive(
     model: QuantumSequencePredictor,
     states: torch.Tensor,
+    params: torch.Tensor,
     warmup_states: int = 1,
 ) -> EvaluationResult:
     if warmup_states < 1:
@@ -1085,24 +1098,19 @@ def evaluate_autoregressive(
 
     model.eval()
     pred_steps = states.shape[1] - 1
-    loader = DataLoader(
-        states,
-        batch_size=max(1, int(config.BATCH_SIZE) // 2),
-        shuffle=False,
-        num_workers=0,
-        pin_memory=False,
-    )
+    loader = build_loader(states, params, shuffle=False)
 
     loss_sum = torch.zeros(pred_steps, dtype=torch.float64)
     fidelity_sum = torch.zeros(pred_steps, dtype=torch.float64)
     counts = torch.zeros(pred_steps, dtype=torch.float64)
 
-    for batch_states in loader:
-        true_states = batch_states.to(config.DEVICE)
+    for inputs, targets, batch_params in loader:
+        true_states = torch.cat([inputs[:, :1, :], targets], dim=1).to(config.DEVICE)
+        batch_params = batch_params.to(config.DEVICE)
         context = true_states[:, :warmup_states, :]
 
         for target_index in range(warmup_states, true_states.shape[1]):
-            predicted_next = model(context)[:, -1, :]
+            predicted_next = model(context, batch_params)[:, -1, :]
             fidelity = quantum_fidelity(predicted_next, true_states[:, target_index, :]).cpu().double()
             curve_index = target_index - 1
             fidelity_sum[curve_index] += fidelity.sum()
@@ -1140,11 +1148,13 @@ def evaluate_autoregressive(
 def compute_train_observable_curves(
     model: QuantumSequencePredictor,
     states: torch.Tensor,
+    params: torch.Tensor,
     warmup_states: int = 1,
 ) -> ObservableComparisonCurves:
     return compute_observable_curves(
         model=model,
         states=states,
+        params=params,
         warmup_states=warmup_states,
         time_step=float(config.TIME_STEP),
     )
@@ -1164,6 +1174,7 @@ def _average_observable_curve(
 def compute_observable_curves(
     model: QuantumSequencePredictor,
     states: torch.Tensor,
+    params: torch.Tensor,
     warmup_states: int = 1,
     time_step: float = float(config.TIME_STEP),
 ) -> ObservableComparisonCurves:
@@ -1200,16 +1211,11 @@ def compute_observable_curves(
     rollout_cz = torch.zeros(num_states, dtype=torch.float64, device=device)
     rollout_counts = torch.zeros(num_states, dtype=torch.float64, device=device)
 
-    loader = DataLoader(
-        states,
-        batch_size=max(1, int(config.BATCH_SIZE) // 2),
-        shuffle=False,
-        num_workers=0,
-        pin_memory=False,
-    )
+    loader = build_loader(states, params, shuffle=False)
 
-    for batch_states in loader:
-        true_states = batch_states.to(device)
+    for inputs, targets, batch_params in loader:
+        true_states = torch.cat([inputs[:, :1, :], targets], dim=1).to(device)
+        batch_params = batch_params.to(device)
 
         for t in range(num_states):
             mz, mx, cz = batch_observables_tfim(
@@ -1240,7 +1246,7 @@ def compute_observable_curves(
 
             for step_offset in range(horizon):
                 target_state_index = start_index + step_offset + 1
-                predicted_next = model(context)[:, -1, :]
+                predicted_next = model(context, batch_params)[:, -1, :]
                 mz, mx, cz = batch_observables_tfim(
                     predicted_next,
                     z_eigs,
@@ -1275,7 +1281,7 @@ def compute_observable_curves(
             rollout_counts[t] += float(true_states.shape[0])
 
         for t in range(warmup_states, num_states):
-            predicted_next = model(context)[:, -1, :]
+            predicted_next = model(context, batch_params)[:, -1, :]
             mz, mx, cz = batch_observables_tfim(
                 predicted_next,
                 z_eigs,

@@ -108,8 +108,8 @@ def _is_long_horizon() -> bool:
     return int(NUM_STATES) >= 12
 
 
-TRAIN_SEQUENCES = _env_int("QSP_TRAIN_SEQUENCES", 800)
-TEST_SEQUENCES = _env_int("QSP_TEST_SEQUENCES", 200)
+TRAIN_SEQUENCES = _env_int("QSP_TRAIN_SEQUENCES", 4000)
+TEST_SEQUENCES = _env_int("QSP_TEST_SEQUENCES", 1000)
 if TRAIN_SEQUENCES < 1 or TEST_SEQUENCES < 1:
     raise ValueError("TRAIN_SEQUENCES e TEST_SEQUENCES devono essere >= 1.")
 
@@ -168,11 +168,11 @@ INITIAL_STATE_SAMPLE_WITH_REPLACEMENT = _env_bool("QSP_INITIAL_STATE_SAMPLE_WITH
 X_BASIS_SAMPLE_WITH_REPLACEMENT = INITIAL_STATE_SAMPLE_WITH_REPLACEMENT
 
 
-D_MODEL = _env_int("QSP_D_MODEL", _default_by_qubits({4: 64, 6: 128}, 128))
-NUM_HEADS = _env_int("QSP_NUM_HEADS", _default_by_qubits({4: 4, 6: 4}, 4))
-NUM_LAYERS = _env_int("QSP_NUM_LAYERS", _default_by_qubits({4: 2, 6: 2}, 2))
-DIM_FEEDFORWARD = _env_int("QSP_DIM_FEEDFORWARD", _default_by_qubits({4: 192, 6: 512}, 512))
-DROPOUT = _env_float("QSP_DROPOUT", 0.12)
+D_MODEL = _env_int("QSP_D_MODEL", 128)
+NUM_HEADS = _env_int("QSP_NUM_HEADS", 8)
+NUM_LAYERS = _env_int("QSP_NUM_LAYERS", 6)
+DIM_FEEDFORWARD = _env_int("QSP_DIM_FEEDFORWARD", 512)
+DROPOUT = _env_float("QSP_DROPOUT", 0.1)
 if D_MODEL <= 0 or NUM_HEADS <= 0 or NUM_LAYERS <= 0 or DIM_FEEDFORWARD <= 0:
     raise ValueError("D_MODEL, NUM_HEADS, NUM_LAYERS e DIM_FEEDFORWARD devono essere > 0.")
 if D_MODEL % NUM_HEADS != 0:
@@ -181,15 +181,22 @@ if not (0.0 <= DROPOUT < 1.0):
     raise ValueError(f"DROPOUT deve stare in [0,1), ricevuto: {DROPOUT}")
 
 
-BATCH_SIZE = _env_int(
-    "QSP_BATCH_SIZE",
-    _default_by_qubits({4: 8, 6: 16}, 16),
-)
+def _default_power_batch_size() -> int:
+    if not torch.cuda.is_available():
+        return 128
+    try:
+        total_memory_gib = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+    except Exception:
+        return 64
+    return 128 if total_memory_gib >= 8.0 else 64
+
+
+BATCH_SIZE = _env_int("QSP_BATCH_SIZE", _default_power_batch_size())
 EPOCHS = _env_int(
     "QSP_EPOCHS",
     _default_by_qubits({4: 10000, 6: 100}, 120),
 )
-LEARNING_RATE = _env_float("QSP_LEARNING_RATE", 5e-5)
+LEARNING_RATE = _env_float("QSP_LEARNING_RATE", 5e-4)
 WEIGHT_DECAY = _env_float("QSP_WEIGHT_DECAY", 1e-4)
 GRAD_CLIP_MAX_NORM = _env_float("QSP_GRAD_CLIP_MAX_NORM", 1.0)
 LOG_FIDELITY_EPS = _env_float("QSP_LOG_FIDELITY_EPS", 1e-8)
@@ -227,11 +234,11 @@ if MULTISTEP_TEACHER_FORCING_STEPS < 0:
         f"ricevuto: {MULTISTEP_TEACHER_FORCING_STEPS}"
     )
 MULTISTEP_EFFECTIVE_TEACHER_FORCING_STEPS = max(1, min(int(MULTISTEP_H), int(MULTISTEP_H) // 2))
-HYBRID_TEACHER_FORCING_EPOCHS = max(1, int(EPOCHS) // 2)
+HYBRID_TEACHER_FORCING_EPOCHS = _env_int("QSP_HYBRID_TEACHER_FORCING_EPOCHS", min(int(EPOCHS), 3500))
 MULTISTEP_TRAIN_VERBOSE = _env_bool("QSP_MULTISTEP_TRAIN_VERBOSE", False)
 MULTISTEP_H_PLATEAU_PATIENCE = _env_int("QSP_MULTISTEP_H_PLATEAU_PATIENCE", 250)
 MULTISTEP_H_PLATEAU_MIN_DELTA = _env_float("QSP_MULTISTEP_H_PLATEAU_MIN_DELTA", 1e-4)
-EARLY_STOPPING_PATIENCE = _env_int("QSP_EARLY_STOPPING_PATIENCE", 1000)
+EARLY_STOPPING_PATIENCE = _env_int("QSP_EARLY_STOPPING_PATIENCE", 1500)
 EARLY_STOPPING_MIN_EPOCHS = _env_int("QSP_EARLY_STOPPING_MIN_EPOCHS", HYBRID_TEACHER_FORCING_EPOCHS)
 if MULTISTEP_H_PLATEAU_PATIENCE < 1:
     raise ValueError(

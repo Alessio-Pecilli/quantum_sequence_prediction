@@ -94,6 +94,11 @@ class QuantumSequencePredictor(nn.Module):
         self.dim_2n = int(dim_2n)
         self.feature_dim = 2 * self.dim_2n - 1
         self.embedding = ComplexEmbedding(dim_2n=dim_2n, d_model=d_model)
+        self.param_embedding = nn.Sequential(
+            nn.Linear(2, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
         self.position_encoding = SinusoidalPositionalEncoding(d_model=d_model, max_len=max_seq_len)
 
         encoder_layer = nn.TransformerEncoderLayer(
@@ -121,11 +126,14 @@ class QuantumSequencePredictor(nn.Module):
     def forward(
         self,
         context_states: torch.Tensor,
+        phys_params: torch.Tensor,
         padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         context_states = clamp_global_phase(context_states)
         hidden = self.embedding(context_states)
+        param_emb = self.param_embedding(phys_params.to(hidden.dtype))
         hidden = self.position_encoding(hidden)
+        hidden = hidden + param_emb.unsqueeze(1)
         seq_len = int(hidden.shape[1])
         hidden = self.transformer(
             hidden,
