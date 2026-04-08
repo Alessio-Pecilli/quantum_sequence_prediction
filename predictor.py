@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 
 import config
-from embedding import ComplexEmbedding, unpack_clamped_state_features
+from embedding import ComplexEmbedding, QuantumStateAutoencoder, unpack_clamped_state_features
 
 
 def normalize_state(states: torch.Tensor) -> torch.Tensor:
@@ -146,3 +146,133 @@ class QuantumSequencePredictor(nn.Module):
         predicted = normalize_state(predicted)
         predicted = clamp_global_phase(predicted)
         return predicted
+
+
+class LatentSequencePredictor(nn.Module):
+    def __init__(
+        self,
+        embedding_dim: int = config.EMBEDDING_DIM,
+        d_model: int = config.D_MODEL,
+        num_heads: int = config.NUM_HEADS,
+        num_layers: int = config.NUM_LAYERS,
+        dim_feedforward: int = config.DIM_FEEDFORWARD,
+        dropout: float = config.DROPOUT,
+        max_seq_len: int = config.SEQ_LEN,
+    ):
+        super().__init__()
+        self.embedding_dim = int(embedding_dim)
+        self.input_projection = nn.Sequential(
+            nn.Linear(self.embedding_dim, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+        self.param_embedding = nn.Sequential(
+            nn.Linear(2, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+        self.position_encoding = SinusoidalPositionalEncoding(d_model=d_model, max_len=max_seq_len)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=num_heads,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=False,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.output_norm = nn.LayerNorm(d_model)
+        self.output_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, self.embedding_dim),
+        )
+        self.register_buffer(
+            "causal_mask",
+            torch.triu(torch.ones(max_seq_len, max_seq_len, dtype=torch.bool), diagonal=1),
+            persistent=False,
+        )
+
+    def forward(
+        self,
+        latent_context: torch.Tensor,
+        phys_params: torch.Tensor,
+        padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if latent_context.dtype != torch.float32:
+            latent_context = latent_context.to(torch.float32)
+        hidden = self.input_projection(latent_context)
+        param_emb = self.param_embedding(phys_params.to(hidden.dtype))
+        hidden = self.position_encoding(hidden)
+        hidden = hidden + param_emb.unsqueeze(1)
+        seq_len = int(hidden.shape[1])
+        hidden = self.transformer(
+            hidden,
+            mask=self.causal_mask[:seq_len, :seq_len],
+            src_key_padding_mask=padding_mask,
+        )
+        hidden = self.output_norm(hidden)
+        return self.output_head(hidden)
+
+
+class QuantumLatentSequenceModel(nn.Module):
+    def __init__(
+        self,
+        dim_2n: int = config.DIM_2N,
+        embedding_dim: int = config.EMBEDDING_DIM,
+        autoencoder_hidden_dim: int = config.AUTOENCODER_HIDDEN_DIM,
+        d_model: int = config.D_MODEL,
+        num_heads: int = config.NUM_HEADS,
+        num_layers: int = config.NUM_LAYERS,
+        dim_feedforward: int = config.DIM_FEEDFORWARD,
+        dropout: float = config.DROPOUT,
+        max_seq_len: int = config.SEQ_LEN,
+    ):
+        super().__init__()
+        self.dim_2n = int(dim_2n)
+        self.embedding_dim = int(embedding_dim)
+        self.autoencoder = QuantumStateAutoencoder(
+            dim_2n=dim_2n,
+            embedding_dim=embedding_dim,
+            hidden_dim=autoencoder_hidden_dim,
+        )
+        self.predictor = LatentSequencePredictor(
+            embedding_dim=embedding_dim,
+            d_model=d_model,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            max_seq_len=max_seq_len,
+        )
+
+    def encode_states(self, states: torch.Tensor) -> torch.Tensor:
+        clamped_states = clamp_global_phase(states)
+        return self.autoencoder.encode(clamped_states)
+
+    def decode_latents(self, latent_states: torch.Tensor) -> torch.Tensor:
+        decoded = self.autoencoder.decode(latent_states)
+        decoded = normalize_state(decoded)
+        return clamp_global_phase(decoded)
+
+    def reconstruct_states(self, states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        latent_states = self.encode_states(states)
+        reconstructed = self.decode_latents(latent_states)
+        return latent_states, reconstructed
+
+    def predict_latent(
+        self,
+        latent_context: torch.Tensor,
+        phys_params: torch.Tensor,
+        padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.predictor(latent_context, phys_params, padding_mask=padding_mask)
+
+    def forward(
+        self,
+        latent_context: torch.Tensor,
+        phys_params: torch.Tensor,
+        padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.predict_latent(latent_context, phys_params, padding_mask=padding_mask)

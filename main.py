@@ -19,14 +19,18 @@ import config
 from input import generate_fixed_tfim_dataset
 from trainer import (
     AdaptiveTrainingTrace,
+    AutoencoderTrainingTrace,
+    benchmark_latent_pipeline,
     ModelSelectionTrace,
     TrainingHistory,
     build_model,
+    evaluate_autoencoder_reconstruction,
     compute_observable_curves,
     evaluate_autoregressive,
     evaluate_multistep,
     evaluate_teacher_forced,
     exposure_bias_detected,
+    plot_autoencoder_training_curves,
     plot_observable_curves,
     plot_training_curves,
     resolve_partial_warmup_steps,
@@ -66,6 +70,35 @@ def _observable_curves_as_serializable(curves) -> dict[str, object]:
         "cz_exact": [float(v) for v in curves.cz_exact.tolist()],
         "cz_multistep": [float(v) for v in curves.cz_multistep.tolist()],
         "cz_rollout": [float(v) for v in curves.cz_rollout.tolist()],
+        "entropy_exact": [float(v) for v in curves.entropy_exact.tolist()],
+        "entropy_multistep": [float(v) for v in curves.entropy_multistep.tolist()],
+        "entropy_rollout": [float(v) for v in curves.entropy_rollout.tolist()],
+    }
+
+
+def _autoencoder_trace_as_serializable(trace: AutoencoderTrainingTrace) -> dict[str, object]:
+    return {
+        "epochs": [int(v) for v in trace.epochs],
+        "train_loss": [float(v) for v in trace.train_loss],
+        "train_fidelity": [float(v) for v in trace.train_fidelity],
+        "validation_loss": [float(v) for v in trace.validation_loss],
+        "validation_fidelity": [float(v) for v in trace.validation_fidelity],
+        "best_epoch": int(trace.best_epoch),
+        "best_validation_fidelity": float(trace.best_validation_fidelity),
+        "training_seconds": float(trace.training_seconds),
+    }
+
+
+def _benchmark_as_serializable(benchmark) -> dict[str, object]:
+    return {
+        "input_feature_dim": int(benchmark.input_feature_dim),
+        "embedding_dim": int(benchmark.embedding_dim),
+        "compression_ratio": float(benchmark.compression_ratio),
+        "autoencoder_training_seconds": float(benchmark.autoencoder_training_seconds),
+        "train_cache_seconds": float(benchmark.train_cache_seconds),
+        "test_cache_seconds": float(benchmark.test_cache_seconds),
+        "teacher_eval_uncached_seconds": float(benchmark.teacher_eval_uncached_seconds),
+        "teacher_eval_cached_seconds": float(benchmark.teacher_eval_cached_seconds),
     }
 
 
@@ -177,6 +210,10 @@ def main():
         f"heads={config.NUM_HEADS}, ff={config.DIM_FEEDFORWARD}, dropout={config.DROPOUT}"
     )
     print(
+        f"Latent pipeline:       embedding_dim={config.EMBEDDING_DIM}, "
+        f"ae_hidden={config.AUTOENCODER_HIDDEN_DIM}, ae_epochs={config.AUTOENCODER_EPOCHS}"
+    )
+    print(
         f"Training:              batch_size={config.BATCH_SIZE}, lr={config.LEARNING_RATE:.2e}, "
         f"epochs={config.EPOCHS}, tf_only={config.HYBRID_TEACHER_FORCING_EPOCHS}, "
         f"early_stop_patience={config.EARLY_STOPPING_PATIENCE}"
@@ -197,6 +234,16 @@ def main():
     model = build_model()
     if config.EVAL_ONLY:
         history = _load_trained_model(model)
+        autoencoder_trace = AutoencoderTrainingTrace(
+            epochs=[],
+            train_loss=[],
+            train_fidelity=[],
+            validation_loss=[],
+            validation_fidelity=[],
+            best_epoch=0,
+            best_validation_fidelity=float("nan"),
+            training_seconds=0.0,
+        )
         adaptive_trace = AdaptiveTrainingTrace(
             enabled=False,
             initial_horizon=int(config.MULTISTEP_H),
@@ -219,6 +266,8 @@ def main():
         if history.epochs:
             plot_training_curves(history)
         print(f"Modalita eval-only:    checkpoint caricato da {config.CHECKPOINT_PATH}")
+        train_latent_states = None
+        test_latent_states = None
     else:
         resume_state = try_resume_from_last_checkpoint(model)
         if config.AUTO_RESUME:
@@ -231,7 +280,7 @@ def main():
                 print(f"Auto-resume:           {resume_state.reason}")
             else:
                 print(f"Auto-resume saltato:   {resume_state.reason}")
-        history, adaptive_trace, selection_trace = train_model(
+        history, adaptive_trace, selection_trace, autoencoder_trace, latent_cache = train_model(
             model,
             dataset.train.states,
             dataset.train.params,
@@ -245,24 +294,44 @@ def main():
             best_state=resume_state.best_state,
         )
         plot_training_curves(history)
+        plot_autoencoder_training_curves(autoencoder_trace)
+        train_latent_states = latent_cache.train_latent_states
+        test_latent_states = latent_cache.test_latent_states
 
-    train_teacher = evaluate_teacher_forced(model, dataset.train.states, dataset.train.params)
-    test_teacher = evaluate_teacher_forced(model, dataset.test.states, dataset.test.params)
-    train_multistep = evaluate_multistep(model, dataset.train.states, dataset.train.params)
-    test_multistep = evaluate_multistep(model, dataset.test.states, dataset.test.params)
+    if train_latent_states is None:
+        train_latent_states = model.encode_states(dataset.train.states.to(config.DEVICE)).detach().cpu()
+    if test_latent_states is None:
+        test_latent_states = model.encode_states(dataset.test.states.to(config.DEVICE)).detach().cpu()
+
+    train_teacher = evaluate_teacher_forced(
+        model, dataset.train.states, dataset.train.params, latent_states=train_latent_states
+    )
+    test_teacher = evaluate_teacher_forced(
+        model, dataset.test.states, dataset.test.params, latent_states=test_latent_states
+    )
+    train_multistep = evaluate_multistep(
+        model, dataset.train.states, dataset.train.params, latent_states=train_latent_states
+    )
+    test_multistep = evaluate_multistep(
+        model, dataset.test.states, dataset.test.params, latent_states=test_latent_states
+    )
     rollout_warmup = int(config.ROLLOUT_WARMUP_STATES)
     train_rollout = evaluate_autoregressive(
         model,
         dataset.train.states,
         dataset.train.params,
+        latent_states=train_latent_states,
         warmup_states=rollout_warmup,
     )
     test_rollout = evaluate_autoregressive(
         model,
-        dataset.train.states,
-        dataset.train.params,
+        dataset.test.states,
+        dataset.test.params,
+        latent_states=test_latent_states,
         warmup_states=rollout_warmup,
     )
+    train_autoencoder_eval = evaluate_autoencoder_reconstruction(model, dataset.train.states)
+    test_autoencoder_eval = evaluate_autoencoder_reconstruction(model, dataset.test.states)
 
     add_partial_curves = exposure_bias_detected(train_multistep.fidelity_curve, train_rollout.fidelity_curve) or (
         exposure_bias_detected(test_multistep.fidelity_curve, test_rollout.fidelity_curve)
@@ -276,10 +345,18 @@ def main():
         for warmup_n1 in warmup_n1_values:
             warmup_states = warmup_n1 + 1
             partial_results_train[warmup_n1] = evaluate_autoregressive(
-                model, dataset.train.states, dataset.train.params, warmup_states=warmup_states
+                model,
+                dataset.train.states,
+                dataset.train.params,
+                latent_states=train_latent_states,
+                warmup_states=warmup_states,
             )
             partial_results_test[warmup_n1] = evaluate_autoregressive(
-                model, dataset.test.states, dataset.test.params, warmup_states=warmup_states
+                model,
+                dataset.test.states,
+                dataset.test.params,
+                latent_states=test_latent_states,
+                warmup_states=warmup_states,
             )
     else:
         print("\nNessun exposure bias marcato: mantengo solo metodo 1 e 2.")
@@ -299,8 +376,20 @@ def main():
         model,
         test_single_sequence,
         test_single_params,
+        latent_states=test_latent_states[test_seq_idx : test_seq_idx + 1],
         warmup_states=rollout_warmup,
     )
+
+    benchmark = benchmark_latent_pipeline(
+        model,
+        dataset.test.states,
+        dataset.test.params,
+        test_latent_states,
+        autoencoder_trace=autoencoder_trace,
+    )
+    if not config.EVAL_ONLY:
+        benchmark.train_cache_seconds = float(latent_cache.train_cache_seconds)
+        benchmark.test_cache_seconds = float(latent_cache.test_cache_seconds)
 
     plot_observable_curves(
         curves=test_observables,
@@ -349,6 +438,12 @@ def main():
             "INITIAL_STATE_FAMILY": config.INITIAL_STATE_FAMILY,
             "FORCE_X_BASIS_ONLY": bool(config.FORCE_X_BASIS_ONLY),
             "DROPOUT": float(config.DROPOUT),
+            "EMBEDDING_DIM": int(config.EMBEDDING_DIM),
+            "AUTOENCODER_HIDDEN_DIM": int(config.AUTOENCODER_HIDDEN_DIM),
+            "AUTOENCODER_EPOCHS": int(config.AUTOENCODER_EPOCHS),
+            "AUTOENCODER_BATCH_SIZE": int(config.AUTOENCODER_BATCH_SIZE),
+            "AUTOENCODER_LEARNING_RATE": float(config.AUTOENCODER_LEARNING_RATE),
+            "AUTOENCODER_WEIGHT_DECAY": float(config.AUTOENCODER_WEIGHT_DECAY),
             "ROLLOUT_WARMUP_STATES": int(config.ROLLOUT_WARMUP_STATES),
             "EVAL_ONLY": bool(config.EVAL_ONLY),
             "AUTO_RESUME": bool(config.AUTO_RESUME),
@@ -381,8 +476,14 @@ def main():
             "rollout_evaluation_warmup_states": int(config.ROLLOUT_WARMUP_STATES),
         },
         "training_history": _history_as_serializable(history),
+        "autoencoder": {
+            "training_trace": _autoencoder_trace_as_serializable(autoencoder_trace),
+            "train_reconstruction": _as_serializable(train_autoencoder_eval),
+            "test_reconstruction": _as_serializable(test_autoencoder_eval),
+        },
         "adaptive_training": _adaptive_training_as_serializable(adaptive_trace),
         "model_selection": _model_selection_as_serializable(selection_trace),
+        "benchmark": _benchmark_as_serializable(benchmark),
         "evaluation": {
             "train_teacher_forced": _as_serializable(train_teacher),
             "train_multistep": _as_serializable(train_multistep),
@@ -397,6 +498,10 @@ def main():
             "test_partial_warmups": {str(k): _as_serializable(v) for k, v in partial_results_test.items()},
         },
         "artifacts": {
+            "autoencoder_checkpoint": str(config.AUTOENCODER_CHECKPOINT_PATH),
+            "autoencoder_training_plot": str(config.AUTOENCODER_TRAINING_CURVES_PATH),
+            "latent_train_cache": str(config.LATENT_TRAIN_CACHE_PATH),
+            "latent_test_cache": str(config.LATENT_TEST_CACHE_PATH),
             "fidelity_plot": str(config.FIDELITY_PLOT_PATH),
             "training_curves_plot": str(config.TRAINING_CURVES_PATH),
             "observables_train_plot": str(config.OBSERVABLES_TRAIN_PLOT_PATH),
@@ -410,6 +515,11 @@ def main():
     print("\nMetriche aggregate")
     print(f"  Train | teacher={train_teacher.mean_fidelity:.6f} | multistep={train_multistep.mean_fidelity:.6f} | rollout={train_rollout.mean_fidelity:.6f}")
     print(f"  Test  | teacher={test_teacher.mean_fidelity:.6f} | multistep={test_multistep.mean_fidelity:.6f} | rollout={test_rollout.mean_fidelity:.6f}")
+    print(
+        f"  AE    | train={train_autoencoder_eval.mean_fidelity:.6f} | "
+        f"test={test_autoencoder_eval.mean_fidelity:.6f} | "
+        f"compression={benchmark.compression_ratio:.2f}x"
+    )
     print(
         f"  Best  | epoch={selection_trace.best_epoch} | "
         f"score={selection_trace.best_objective:.6f} | "

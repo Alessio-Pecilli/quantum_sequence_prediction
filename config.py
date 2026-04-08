@@ -77,6 +77,12 @@ TRAINING_CURVES_PATH = RESULTS_DIR / "training_curves.png"
 OBSERVABLES_PLOT_PATH = RESULTS_DIR / "observables_vs_time.png"
 OBSERVABLES_TRAIN_PLOT_PATH = RESULTS_DIR / "observables_train_vs_rollout.png"
 OBSERVABLES_TEST_PLOT_PATH = RESULTS_DIR / "observables_test_vs_rollout.png"
+AUTOENCODER_RESULTS_DIR = RESULTS_DIR / "autoencoder"
+AUTOENCODER_CHECKPOINT_PATH = AUTOENCODER_RESULTS_DIR / "best_autoencoder.pt"
+AUTOENCODER_LAST_CHECKPOINT_PATH = AUTOENCODER_RESULTS_DIR / "last_autoencoder.pt"
+AUTOENCODER_TRAINING_CURVES_PATH = AUTOENCODER_RESULTS_DIR / "autoencoder_training_curves.png"
+LATENT_TRAIN_CACHE_PATH = RESULTS_DIR / "latent_train_cache.pt"
+LATENT_TEST_CACHE_PATH = RESULTS_DIR / "latent_test_cache.pt"
 
 
 SEED = _env_int("QSP_SEED", 7)
@@ -169,10 +175,14 @@ X_BASIS_SAMPLE_WITH_REPLACEMENT = INITIAL_STATE_SAMPLE_WITH_REPLACEMENT
 
 
 D_MODEL = _env_int("QSP_D_MODEL", 128)
+EMBEDDING_DIM = _env_int("QSP_EMBEDDING_DIM", 24 if N_QUBITS <= 4 else 48)
+AUTOENCODER_HIDDEN_DIM = _env_int("QSP_AUTOENCODER_HIDDEN_DIM", max(D_MODEL, 2 * DIM_2N - 1))
 NUM_HEADS = _env_int("QSP_NUM_HEADS", 8)
 NUM_LAYERS = _env_int("QSP_NUM_LAYERS", 6)
 DIM_FEEDFORWARD = _env_int("QSP_DIM_FEEDFORWARD", 512)
 DROPOUT = _env_float("QSP_DROPOUT", 0.1)
+if EMBEDDING_DIM <= 0 or AUTOENCODER_HIDDEN_DIM <= 0:
+    raise ValueError("EMBEDDING_DIM e AUTOENCODER_HIDDEN_DIM devono essere > 0.")
 if D_MODEL <= 0 or NUM_HEADS <= 0 or NUM_LAYERS <= 0 or DIM_FEEDFORWARD <= 0:
     raise ValueError("D_MODEL, NUM_HEADS, NUM_LAYERS e DIM_FEEDFORWARD devono essere > 0.")
 if D_MODEL % NUM_HEADS != 0:
@@ -192,12 +202,16 @@ def _default_power_batch_size() -> int:
 
 
 BATCH_SIZE = _env_int("QSP_BATCH_SIZE", _default_power_batch_size())
+AUTOENCODER_BATCH_SIZE = _env_int("QSP_AUTOENCODER_BATCH_SIZE", max(16, int(BATCH_SIZE)))
 EPOCHS = _env_int(
     "QSP_EPOCHS",
     _default_by_qubits({4: 10000, 6: 100}, 120),
 )
+AUTOENCODER_EPOCHS = _env_int("QSP_AUTOENCODER_EPOCHS", _default_by_qubits({4: 800, 6: 120}, 150))
 LEARNING_RATE = _env_float("QSP_LEARNING_RATE", 5e-4)
+AUTOENCODER_LEARNING_RATE = _env_float("QSP_AUTOENCODER_LEARNING_RATE", 1e-3)
 WEIGHT_DECAY = _env_float("QSP_WEIGHT_DECAY", 1e-4)
+AUTOENCODER_WEIGHT_DECAY = _env_float("QSP_AUTOENCODER_WEIGHT_DECAY", 1e-5)
 GRAD_CLIP_MAX_NORM = _env_float("QSP_GRAD_CLIP_MAX_NORM", 1.0)
 LOG_FIDELITY_EPS = _env_float("QSP_LOG_FIDELITY_EPS", 1e-8)
 
@@ -299,12 +313,18 @@ ROLLOUT_WARMUP_STATES = _env_int(
     "QSP_ROLLOUT_WARMUP_STATES",
     min(2, int(NUM_STATES) - 1),
 )
-if BATCH_SIZE < 1 or EPOCHS < 1:
-    raise ValueError("BATCH_SIZE e EPOCHS devono essere >= 1.")
+if BATCH_SIZE < 1 or EPOCHS < 1 or AUTOENCODER_BATCH_SIZE < 1 or AUTOENCODER_EPOCHS < 1:
+    raise ValueError("BATCH_SIZE, EPOCHS, AUTOENCODER_BATCH_SIZE e AUTOENCODER_EPOCHS devono essere >= 1.")
 if LEARNING_RATE <= 0.0:
     raise ValueError(f"LEARNING_RATE deve essere > 0, ricevuto: {LEARNING_RATE}")
+if AUTOENCODER_LEARNING_RATE <= 0.0:
+    raise ValueError(
+        f"AUTOENCODER_LEARNING_RATE deve essere > 0, ricevuto: {AUTOENCODER_LEARNING_RATE}"
+    )
 if WEIGHT_DECAY < 0.0 or GRAD_CLIP_MAX_NORM < 0.0:
     raise ValueError("WEIGHT_DECAY e GRAD_CLIP_MAX_NORM devono essere >= 0.")
+if AUTOENCODER_WEIGHT_DECAY < 0.0:
+    raise ValueError(f"AUTOENCODER_WEIGHT_DECAY deve essere >= 0, ricevuto: {AUTOENCODER_WEIGHT_DECAY}")
 if not (0.0 < LOG_FIDELITY_EPS < 1.0):
     raise ValueError(f"LOG_FIDELITY_EPS deve stare in (0,1), ricevuto: {LOG_FIDELITY_EPS}")
 if not (0.0 <= SCHEDULED_SAMPLING_MAX_PROB <= 1.0):

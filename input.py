@@ -79,6 +79,69 @@ class QuantumSequenceDataset(Dataset):
         return self.inputs[index], self.targets[index], self.params[index]
 
 
+class LatentSequenceDataset(Dataset):
+    def __init__(self, latent_states: torch.Tensor, target_states: torch.Tensor, params: torch.Tensor):
+        if latent_states.ndim != 3:
+            raise ValueError(
+                f"latent_states deve avere shape (batch, num_states, embedding_dim), ricevuto {tuple(latent_states.shape)}"
+            )
+        if target_states.ndim != 3:
+            raise ValueError(
+                f"target_states deve avere shape (batch, num_states, dim), ricevuto {tuple(target_states.shape)}"
+            )
+        if latent_states.shape[:2] != target_states.shape[:2]:
+            raise ValueError(
+                "latent_states e target_states devono condividere batch e num_states: "
+                f"{tuple(latent_states.shape[:2])} vs {tuple(target_states.shape[:2])}"
+            )
+        if params.ndim != 2 or params.shape[1] != 2 or params.shape[0] != latent_states.shape[0]:
+            raise ValueError(f"params deve avere shape (batch, 2), ricevuto {tuple(params.shape)}")
+        self.latent_states = latent_states.to(torch.float32)
+        self.target_states = target_states
+        self.params = params.to(torch.float32)
+        self.inputs = self.latent_states[:, :-1]
+        self.targets = self.latent_states[:, 1:]
+        self.target_future_states = self.target_states[:, 1:]
+
+    def __len__(self) -> int:
+        return int(self.latent_states.shape[0])
+
+    def __getitem__(self, index: int):
+        return self.inputs[index], self.targets[index], self.target_future_states[index], self.params[index]
+
+
+@torch.no_grad()
+def cache_latent_trajectories(
+    states: torch.Tensor,
+    params: torch.Tensor,
+    *,
+    encoder_fn,
+    batch_size: int,
+    device: torch.device | str,
+) -> torch.Tensor:
+    if states.ndim != 3:
+        raise ValueError(f"states deve avere shape (batch, num_states, dim), ricevuto {tuple(states.shape)}")
+    if params.ndim != 2 or params.shape[0] != states.shape[0]:
+        raise ValueError(
+            "params deve avere shape (batch, 2) e stesso batch di states: "
+            f"{tuple(params.shape)} vs {tuple(states.shape)}"
+        )
+
+    device = torch.device(device)
+    cached_batches: list[torch.Tensor] = []
+    for start in range(0, int(states.shape[0]), max(1, int(batch_size))):
+        stop = min(int(states.shape[0]), start + max(1, int(batch_size)))
+        batch_states = states[start:stop].to(device)
+        batch, num_states, dim = batch_states.shape
+        flattened = batch_states.reshape(batch * num_states, dim)
+        latent = encoder_fn(flattened)
+        latent = latent.reshape(batch, num_states, -1).detach().cpu()
+        cached_batches.append(latent)
+    if not cached_batches:
+        raise ValueError("Nessuna traiettoria disponibile per la cache latente.")
+    return torch.cat(cached_batches, dim=0).to(torch.float32)
+
+
 def build_uniform_couplings(
     n_qubits: int,
     coupling_strength: float = config.COUPLING_MEAN,

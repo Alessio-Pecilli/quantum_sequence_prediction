@@ -15,9 +15,13 @@ import torch
 from torch.utils.data import DataLoader
 
 import config
-from input import QuantumSequenceDataset
-from observables import batch_observables_tfim, precompute_observables
-from predictor import NegativeLogFidelityLoss, QuantumSequencePredictor, quantum_fidelity
+from input import LatentSequenceDataset, QuantumSequenceDataset, cache_latent_trajectories
+from observables import (
+    batch_average_entanglement_entropy,
+    batch_observables_tfim,
+    precompute_observables,
+)
+from predictor import NegativeLogFidelityLoss, QuantumLatentSequenceModel, QuantumSequencePredictor, quantum_fidelity
 
 
 @dataclass
@@ -50,6 +54,9 @@ class ObservableComparisonCurves:
     cz_exact: np.ndarray
     cz_multistep: np.ndarray
     cz_rollout: np.ndarray
+    entropy_exact: np.ndarray
+    entropy_multistep: np.ndarray
+    entropy_rollout: np.ndarray
 
 
 @dataclass
@@ -98,6 +105,38 @@ class AdaptiveTrainingTrace:
 
 
 @dataclass
+class AutoencoderTrainingTrace:
+    epochs: list[int]
+    train_loss: list[float]
+    train_fidelity: list[float]
+    validation_loss: list[float]
+    validation_fidelity: list[float]
+    best_epoch: int
+    best_validation_fidelity: float
+    training_seconds: float
+
+
+@dataclass
+class LatentCacheArtifacts:
+    train_latent_states: torch.Tensor
+    test_latent_states: torch.Tensor
+    train_cache_seconds: float
+    test_cache_seconds: float
+
+
+@dataclass
+class PipelineBenchmark:
+    input_feature_dim: int
+    embedding_dim: int
+    compression_ratio: float
+    autoencoder_training_seconds: float
+    train_cache_seconds: float
+    test_cache_seconds: float
+    teacher_eval_uncached_seconds: float
+    teacher_eval_cached_seconds: float
+
+
+@dataclass
 class ModelSelectionTrace:
     criterion: str
     best_epoch: int
@@ -140,8 +179,273 @@ def build_loader(states: torch.Tensor, params: torch.Tensor, shuffle: bool) -> D
     )
 
 
-def build_model() -> QuantumSequencePredictor:
-    return QuantumSequencePredictor().to(config.DEVICE)
+def build_latent_loader(
+    latent_states: torch.Tensor,
+    target_states: torch.Tensor,
+    params: torch.Tensor,
+    shuffle: bool,
+) -> DataLoader:
+    dataset = LatentSequenceDataset(latent_states, target_states, params)
+    safe_batch_size = max(1, int(config.BATCH_SIZE) // 2)
+    return DataLoader(
+        dataset,
+        batch_size=safe_batch_size,
+        shuffle=shuffle,
+        num_workers=0,
+        pin_memory=False,
+    )
+
+
+def build_model() -> QuantumLatentSequenceModel:
+    return QuantumLatentSequenceModel().to(config.DEVICE)
+
+
+def _build_autoencoder_state_loader(states: torch.Tensor, shuffle: bool) -> DataLoader:
+    flattened_states = states.reshape(-1, states.shape[-1])
+    dataset = torch.utils.data.TensorDataset(flattened_states)
+    return DataLoader(
+        dataset,
+        batch_size=max(1, int(config.AUTOENCODER_BATCH_SIZE)),
+        shuffle=shuffle,
+        num_workers=0,
+        pin_memory=False,
+    )
+
+
+@torch.no_grad()
+def evaluate_autoencoder_reconstruction(
+    model: QuantumLatentSequenceModel,
+    states: torch.Tensor,
+) -> EvaluationResult:
+    model.eval()
+    criterion = NegativeLogFidelityLoss()
+    loader = _build_autoencoder_state_loader(states, shuffle=False)
+    total_loss = 0.0
+    total_fidelity = 0.0
+    total_samples = 0
+    for (batch_states,) in loader:
+        batch_states = batch_states.to(config.DEVICE)
+        _, reconstructed = model.reconstruct_states(batch_states)
+        loss, mean_fidelity, _ = criterion(reconstructed, batch_states)
+        batch_size = int(batch_states.shape[0])
+        total_loss += float(loss.item()) * batch_size
+        total_fidelity += float(mean_fidelity.item()) * batch_size
+        total_samples += batch_size
+    return EvaluationResult(
+        loss=total_loss / max(1, total_samples),
+        mean_fidelity=total_fidelity / max(1, total_samples),
+        fidelity_curve=[],
+        coverage_curve=[],
+    )
+
+
+def train_autoencoder(
+    model: QuantumLatentSequenceModel,
+    train_states: torch.Tensor,
+    validation_states: torch.Tensor | None = None,
+) -> AutoencoderTrainingTrace:
+    if config.AUTO_RESUME and config.AUTOENCODER_CHECKPOINT_PATH.exists():
+        payload = torch.load(config.AUTOENCODER_CHECKPOINT_PATH, map_location=config.DEVICE)
+        if isinstance(payload, dict) and "model_state_dict" in payload:
+            model.autoencoder.load_state_dict(payload["model_state_dict"])
+            trace_payload = payload.get("trace", {})
+            return AutoencoderTrainingTrace(
+                epochs=[int(v) for v in trace_payload.get("epochs", [])],
+                train_loss=[float(v) for v in trace_payload.get("train_loss", [])],
+                train_fidelity=[float(v) for v in trace_payload.get("train_fidelity", [])],
+                validation_loss=[float(v) for v in trace_payload.get("validation_loss", [])],
+                validation_fidelity=[float(v) for v in trace_payload.get("validation_fidelity", [])],
+                best_epoch=int(trace_payload.get("best_epoch", 0)),
+                best_validation_fidelity=float(trace_payload.get("best_validation_fidelity", float("nan"))),
+                training_seconds=float(trace_payload.get("training_seconds", 0.0)),
+            )
+
+    train_loader = _build_autoencoder_state_loader(train_states, shuffle=True)
+    optimizer = torch.optim.AdamW(
+        model.autoencoder.parameters(),
+        lr=config.AUTOENCODER_LEARNING_RATE,
+        weight_decay=config.AUTOENCODER_WEIGHT_DECAY,
+    )
+    criterion = NegativeLogFidelityLoss()
+    use_amp = config.DEVICE == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    trace = AutoencoderTrainingTrace(
+        epochs=[],
+        train_loss=[],
+        train_fidelity=[],
+        validation_loss=[],
+        validation_fidelity=[],
+        best_epoch=0,
+        best_validation_fidelity=float("-inf"),
+        training_seconds=0.0,
+    )
+    best_state = copy.deepcopy(model.autoencoder.state_dict())
+    started_at = time.perf_counter()
+    config.AUTOENCODER_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    for epoch in range(1, int(config.AUTOENCODER_EPOCHS) + 1):
+        model.autoencoder.train()
+        loss_sum = 0.0
+        fidelity_sum = 0.0
+        sample_count = 0
+        for (batch_states,) in train_loader:
+            batch_states = batch_states.to(config.DEVICE)
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+                _, reconstructed = model.reconstruct_states(batch_states)
+                loss, mean_fidelity, _ = criterion(reconstructed, batch_states)
+            scaler.scale(loss).backward()
+            if config.GRAD_CLIP_MAX_NORM > 0.0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.autoencoder.parameters(), config.GRAD_CLIP_MAX_NORM)
+            scaler.step(optimizer)
+            scaler.update()
+            batch_size = int(batch_states.shape[0])
+            loss_sum += float(loss.item()) * batch_size
+            fidelity_sum += float(mean_fidelity.item()) * batch_size
+            sample_count += batch_size
+
+        trace.epochs.append(epoch)
+        trace.train_loss.append(loss_sum / max(1, sample_count))
+        trace.train_fidelity.append(fidelity_sum / max(1, sample_count))
+
+        if validation_states is not None:
+            validation = evaluate_autoencoder_reconstruction(model, validation_states)
+            val_loss = float(validation.loss)
+            val_fidelity = float(validation.mean_fidelity)
+        else:
+            val_loss = float("nan")
+            val_fidelity = float(trace.train_fidelity[-1])
+        trace.validation_loss.append(val_loss)
+        trace.validation_fidelity.append(val_fidelity)
+
+        if val_fidelity > trace.best_validation_fidelity:
+            trace.best_validation_fidelity = val_fidelity
+            trace.best_epoch = epoch
+            best_state = copy.deepcopy(model.autoencoder.state_dict())
+            _safe_atomic_torch_save(
+                {
+                    "model_state_dict": best_state,
+                    "trace": {
+                        "epochs": trace.epochs,
+                        "train_loss": trace.train_loss,
+                        "train_fidelity": trace.train_fidelity,
+                        "validation_loss": trace.validation_loss,
+                        "validation_fidelity": trace.validation_fidelity,
+                        "best_epoch": trace.best_epoch,
+                        "best_validation_fidelity": trace.best_validation_fidelity,
+                        "training_seconds": 0.0,
+                    },
+                },
+                config.AUTOENCODER_CHECKPOINT_PATH,
+                label="best autoencoder checkpoint",
+            )
+
+        if epoch == int(config.AUTOENCODER_EPOCHS) or epoch <= 3 or epoch % max(1, config.AUTOENCODER_EPOCHS // 10) == 0:
+            print(
+                f"  [autoencoder] epoca {epoch:4d}/{config.AUTOENCODER_EPOCHS} | "
+                f"train(fid/loss)=({trace.train_fidelity[-1]:.4f}/{trace.train_loss[-1]:.4f}) | "
+                f"val(fid/loss)=({val_fidelity:.4f}/{val_loss:.4f})"
+            )
+
+    trace.training_seconds = float(time.perf_counter() - started_at)
+    model.autoencoder.load_state_dict(best_state)
+    _safe_atomic_torch_save(
+        {
+            "model_state_dict": model.autoencoder.state_dict(),
+            "trace": {
+                "epochs": trace.epochs,
+                "train_loss": trace.train_loss,
+                "train_fidelity": trace.train_fidelity,
+                "validation_loss": trace.validation_loss,
+                "validation_fidelity": trace.validation_fidelity,
+                "best_epoch": trace.best_epoch,
+                "best_validation_fidelity": trace.best_validation_fidelity,
+                "training_seconds": trace.training_seconds,
+            },
+        },
+        config.AUTOENCODER_LAST_CHECKPOINT_PATH,
+        label="last autoencoder checkpoint",
+    )
+    _safe_atomic_torch_save(
+        {
+            "model_state_dict": model.autoencoder.state_dict(),
+            "trace": {
+                "epochs": trace.epochs,
+                "train_loss": trace.train_loss,
+                "train_fidelity": trace.train_fidelity,
+                "validation_loss": trace.validation_loss,
+                "validation_fidelity": trace.validation_fidelity,
+                "best_epoch": trace.best_epoch,
+                "best_validation_fidelity": trace.best_validation_fidelity,
+                "training_seconds": trace.training_seconds,
+            },
+        },
+        config.AUTOENCODER_CHECKPOINT_PATH,
+        label="final autoencoder checkpoint",
+    )
+    return trace
+
+
+def freeze_encoder(model: QuantumLatentSequenceModel):
+    for parameter in model.autoencoder.encoder.parameters():
+        parameter.requires_grad_(False)
+    model.autoencoder.encoder.eval()
+
+
+def build_latent_caches(
+    model: QuantumLatentSequenceModel,
+    train_states: torch.Tensor,
+    train_params: torch.Tensor,
+    test_states: torch.Tensor,
+    test_params: torch.Tensor,
+) -> LatentCacheArtifacts:
+    freeze_encoder(model)
+    started = time.perf_counter()
+    train_latent_states = cache_latent_trajectories(
+        train_states,
+        train_params,
+        encoder_fn=model.encode_states,
+        batch_size=config.AUTOENCODER_BATCH_SIZE,
+        device=config.DEVICE,
+    )
+    train_cache_seconds = float(time.perf_counter() - started)
+
+    started = time.perf_counter()
+    test_latent_states = cache_latent_trajectories(
+        test_states,
+        test_params,
+        encoder_fn=model.encode_states,
+        batch_size=config.AUTOENCODER_BATCH_SIZE,
+        device=config.DEVICE,
+    )
+    test_cache_seconds = float(time.perf_counter() - started)
+
+    if config.SAVE_MODEL:
+        config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        _safe_atomic_torch_save(
+            {
+                "latent_states": train_latent_states,
+                "params": train_params.to(torch.float32),
+            },
+            config.LATENT_TRAIN_CACHE_PATH,
+            label="latent train cache",
+        )
+        _safe_atomic_torch_save(
+            {
+                "latent_states": test_latent_states,
+                "params": test_params.to(torch.float32),
+            },
+            config.LATENT_TEST_CACHE_PATH,
+            label="latent test cache",
+        )
+
+    return LatentCacheArtifacts(
+        train_latent_states=train_latent_states,
+        test_latent_states=test_latent_states,
+        train_cache_seconds=train_cache_seconds,
+        test_cache_seconds=test_cache_seconds,
+    )
 
 
 def _empty_resume_state(reason: str) -> ResumeCheckpointState:
@@ -172,6 +476,12 @@ def _checkpoint_config_snapshot() -> dict[str, object]:
         "EPOCHS": int(config.EPOCHS),
         "LEARNING_RATE": float(config.LEARNING_RATE),
         "WEIGHT_DECAY": float(config.WEIGHT_DECAY),
+        "EMBEDDING_DIM": int(config.EMBEDDING_DIM),
+        "AUTOENCODER_HIDDEN_DIM": int(config.AUTOENCODER_HIDDEN_DIM),
+        "AUTOENCODER_EPOCHS": int(config.AUTOENCODER_EPOCHS),
+        "AUTOENCODER_BATCH_SIZE": int(config.AUTOENCODER_BATCH_SIZE),
+        "AUTOENCODER_LEARNING_RATE": float(config.AUTOENCODER_LEARNING_RATE),
+        "AUTOENCODER_WEIGHT_DECAY": float(config.AUTOENCODER_WEIGHT_DECAY),
         "D_MODEL": int(config.D_MODEL),
         "NUM_HEADS": int(config.NUM_HEADS),
         "NUM_LAYERS": int(config.NUM_LAYERS),
@@ -218,7 +528,7 @@ def _checkpoint_config_mismatches(saved_config: dict[str, object]) -> list[str]:
     return mismatches
 
 
-def try_resume_from_last_checkpoint(model: QuantumSequencePredictor) -> ResumeCheckpointState:
+def try_resume_from_last_checkpoint(model: QuantumLatentSequenceModel) -> ResumeCheckpointState:
     if not config.AUTO_RESUME:
         return _empty_resume_state("QSP_AUTO_RESUME=0")
     if not config.LAST_CHECKPOINT_PATH.exists():
@@ -443,14 +753,17 @@ def _update_adaptive_controller(
 
 
 def _teacher_forced_training_loss(
-    model: QuantumSequencePredictor,
+    model: QuantumLatentSequenceModel,
     criterion: NegativeLogFidelityLoss,
     inputs: torch.Tensor,
-    targets: torch.Tensor,
+    target_states: torch.Tensor,
     params: torch.Tensor,
 ):
-    predicted = model(inputs, params)
-    loss, mean_fidelity, fidelity_matrix = criterion(predicted, targets)
+    predicted_latent = model.predict_latent(inputs, params)
+    predicted = model.decode_latents(predicted_latent.reshape(-1, predicted_latent.shape[-1])).reshape(
+        target_states.shape
+    )
+    loss, mean_fidelity, fidelity_matrix = criterion(predicted, target_states)
     per_step_losses = -torch.log(fidelity_matrix.clamp(min=config.LOG_FIDELITY_EPS))
     mean_losses = per_step_losses.mean(dim=0)
     mean_fidelities = fidelity_matrix.mean(dim=0)
@@ -466,9 +779,10 @@ def _teacher_forced_training_loss(
 
 
 def compute_multistep_loss(
-    model: QuantumSequencePredictor,
+    model: QuantumLatentSequenceModel,
     x: torch.Tensor,
-    y: torch.Tensor,
+    y_latent: torch.Tensor,
+    y_states: torch.Tensor,
     params: torch.Tensor,
     current_h: int,
     loss_fn: NegativeLogFidelityLoss,
@@ -494,28 +808,38 @@ def compute_multistep_loss(
     # Nel repository y e' gia' shiftato di +1 rispetto a x:
     # il primo target dopo il contesto x[:, :t_start] e' y[:, t_start - 1].
     target_start = t_start - 1
-    targets = y[:, target_start : target_start + current_h, :]
+    target_latents = y_latent[:, target_start : target_start + current_h, :]
+    target_states = y_states[:, target_start : target_start + current_h, :]
+    teacher_steps = current_h if teacher_steps_override is None else max(0, min(int(teacher_steps_override), current_h))
 
     for step_idx in range(current_h):
-        out = model(current_context, params)
+        out = model.predict_latent(current_context, params)
         next_pred = out[:, -1:, :]
         predictions.append(next_pred)
 
-        step_target = targets[:, step_idx : step_idx + 1, :]
-        step_loss, step_mean_fidelity, _ = loss_fn(next_pred, step_target)
+        step_target = target_states[:, step_idx : step_idx + 1, :]
+        decoded_step = model.decode_latents(next_pred[:, 0, :]).unsqueeze(1)
+        step_loss, step_mean_fidelity, _ = loss_fn(decoded_step, step_target)
         step_losses.append(float(step_loss.detach().item()))
         step_fidelities.append(float(step_mean_fidelity.detach().item()))
 
         if step_idx + 1 >= current_h:
             continue
 
-        current_context = torch.cat([current_context, next_pred], dim=1)
+        if step_idx + 1 < teacher_steps:
+            next_context = target_latents[:, step_idx : step_idx + 1, :]
+        else:
+            next_context = next_pred
+        current_context = torch.cat([current_context, next_context], dim=1)
 
     predictions_tensor = torch.cat(predictions, dim=1)
-    total_loss, total_fidelity, _ = loss_fn(predictions_tensor, targets)
+    decoded_predictions = model.decode_latents(predictions_tensor.reshape(-1, predictions_tensor.shape[-1])).reshape(
+        target_states.shape
+    )
+    total_loss, total_fidelity, _ = loss_fn(decoded_predictions, target_states)
     stats = BatchAdaptiveStats(
         horizon=current_h,
-        teacher_steps=0,
+        teacher_steps=teacher_steps,
         mean_offset_losses=step_losses,
         mean_offset_fidelities=step_fidelities,
         mean_offset_weights=[1.0 for _ in range(current_h)],
@@ -524,10 +848,11 @@ def compute_multistep_loss(
 
 
 def _multistep_training_loss(
-    model: QuantumSequencePredictor,
+    model: QuantumLatentSequenceModel,
     criterion: NegativeLogFidelityLoss,
     inputs: torch.Tensor,
     targets: torch.Tensor,
+    target_states: torch.Tensor,
     params: torch.Tensor,
     horizon_limit: int,
     teacher_steps_override: int,
@@ -547,7 +872,8 @@ def _multistep_training_loss(
     multistep_loss, multistep_fidelity, stats = compute_multistep_loss(
         model=model,
         x=inputs,
-        y=targets,
+        y_latent=targets,
+        y_states=target_states,
         params=params,
         current_h=horizon,
         loss_fn=criterion,
@@ -642,7 +968,7 @@ def _save_last_checkpoint(
 
 
 def train_model(
-    model: QuantumSequencePredictor,
+    model: QuantumLatentSequenceModel,
     train_states: torch.Tensor,
     train_params: torch.Tensor,
     validation_states: torch.Tensor | None = None,
@@ -653,14 +979,30 @@ def train_model(
     scheduler_state_dict: dict | None = None,
     best_objective: float | None = None,
     best_state: dict | None = None,
-) -> tuple[TrainingHistory, AdaptiveTrainingTrace, ModelSelectionTrace]:
+) -> tuple[TrainingHistory, AdaptiveTrainingTrace, ModelSelectionTrace, AutoencoderTrainingTrace, LatentCacheArtifacts]:
     history = history or TrainingHistory(epochs=[], train_loss=[], train_fidelity=[])
+    autoencoder_trace = train_autoencoder(model, train_states, validation_states=validation_states)
+    if validation_states is None or validation_params is None:
+        validation_states = train_states
+        validation_params = train_params
+    latent_cache = build_latent_caches(
+        model,
+        train_states=train_states,
+        train_params=train_params,
+        test_states=validation_states,
+        test_params=validation_params,
+    )
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        model.predictor.parameters(),
         lr=config.LEARNING_RATE,
         weight_decay=config.WEIGHT_DECAY,
     )
-    loader = build_loader(train_states, train_params, shuffle=True)
+    loader = build_latent_loader(
+        latent_cache.train_latent_states,
+        train_states,
+        train_params,
+        shuffle=True,
+    )
     steps_per_epoch = len(loader)
     use_amp = config.DEVICE == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -725,9 +1067,10 @@ def train_model(
             offset_weight_sums = np.zeros(epoch_horizon, dtype=np.float64)
             offset_counts = np.zeros(epoch_horizon, dtype=np.float64)
 
-            for batch_idx, (inputs, targets, params) in enumerate(loader, start=1):
+            for batch_idx, (inputs, targets, target_states, params) in enumerate(loader, start=1):
                 inputs = inputs.to(config.DEVICE)
                 targets = targets.to(config.DEVICE)
+                target_states = target_states.to(config.DEVICE)
                 params = params.to(config.DEVICE)
 
                 batch_size = int(inputs.shape[0])
@@ -741,7 +1084,7 @@ def train_model(
                         model=model,
                         criterion=criterion,
                         inputs=inputs,
-                        targets=targets,
+                        target_states=target_states,
                         params=params,
                     )
                     if phase == "teacher_forced":
@@ -754,6 +1097,7 @@ def train_model(
                             criterion=criterion,
                             inputs=inputs,
                             targets=targets,
+                            target_states=target_states,
                             params=params,
                             horizon_limit=epoch_horizon,
                             teacher_steps_override=epoch_teacher_steps,
@@ -824,11 +1168,17 @@ def train_model(
             if validation_states is not None:
                 if validation_params is None:
                     raise ValueError("validation_params e' richiesto quando validation_states non e' None.")
-                teacher_metric = evaluate_teacher_forced(model, validation_states, validation_params)
+                teacher_metric = evaluate_teacher_forced(
+                    model,
+                    validation_states,
+                    validation_params,
+                    latent_states=latent_cache.test_latent_states,
+                )
                 multistep_metric = evaluate_multistep(
                     model,
                     validation_states,
                     validation_params,
+                    latent_states=latent_cache.test_latent_states,
                     horizon_limit=eval_horizon,
                     teacher_steps_override=_effective_multistep_teacher_steps(eval_horizon),
                 )
@@ -972,29 +1322,39 @@ def train_model(
         final_teacher_steps=int(_effective_multistep_teacher_steps(int(current_horizon))),
         epoch_summaries=adaptive_epoch_summaries,
     )
-    return history, adaptive_trace, selection_trace
+    return history, adaptive_trace, selection_trace, autoencoder_trace, latent_cache
 
 
 @torch.no_grad()
 def evaluate_teacher_forced(
-    model: QuantumSequencePredictor,
+    model: QuantumLatentSequenceModel,
     states: torch.Tensor,
     params: torch.Tensor,
+    latent_states: torch.Tensor | None = None,
 ) -> EvaluationResult:
     model.eval()
     criterion = NegativeLogFidelityLoss()
-    loader = build_loader(states, params, shuffle=False)
+    if latent_states is None:
+        latent_states = cache_latent_trajectories(
+            states,
+            params,
+            encoder_fn=model.encode_states,
+            batch_size=config.AUTOENCODER_BATCH_SIZE,
+            device=config.DEVICE,
+        )
+    loader = build_latent_loader(latent_states, states, params, shuffle=False)
 
     total_loss = 0.0
     total_fidelity = 0.0
     total_sequences = 0
     per_step_sum = torch.zeros(states.shape[1] - 1, dtype=torch.float64)
 
-    for inputs, targets, batch_params in loader:
+    for inputs, _, targets, batch_params in loader:
         inputs = inputs.to(config.DEVICE)
         targets = targets.to(config.DEVICE)
         batch_params = batch_params.to(config.DEVICE)
-        predicted = model(inputs, batch_params)
+        predicted_latent = model.predict_latent(inputs, batch_params)
+        predicted = model.decode_latents(predicted_latent.reshape(-1, predicted_latent.shape[-1])).reshape(targets.shape)
         loss, mean_fidelity, fidelity_matrix = criterion(predicted, targets)
 
         batch_size = int(inputs.shape[0])
@@ -1014,36 +1374,52 @@ def evaluate_teacher_forced(
 
 @torch.no_grad()
 def evaluate_multistep(
-    model: QuantumSequencePredictor,
+    model: QuantumLatentSequenceModel,
     states: torch.Tensor,
     params: torch.Tensor,
+    latent_states: torch.Tensor | None = None,
     horizon_limit: int | None = None,
     teacher_steps_override: int | None = None,
 ) -> EvaluationResult:
     model.eval()
     pred_steps = int(states.shape[1]) - 1
     horizon = max(1, min(int(config.MULTISTEP_H if horizon_limit is None else horizon_limit), pred_steps))
-    loader = build_loader(states, params, shuffle=False)
+    if latent_states is None:
+        latent_states = cache_latent_trajectories(
+            states,
+            params,
+            encoder_fn=model.encode_states,
+            batch_size=config.AUTOENCODER_BATCH_SIZE,
+            device=config.DEVICE,
+        )
+    loader = build_latent_loader(latent_states, states, params, shuffle=False)
 
     loss_sum = torch.zeros(pred_steps, dtype=torch.float64)
     fidelity_sum = torch.zeros(pred_steps, dtype=torch.float64)
     counts = torch.zeros(pred_steps, dtype=torch.float64)
 
-    for inputs, targets, batch_params in loader:
+    for inputs, targets, target_states, batch_params in loader:
         inputs = inputs.to(config.DEVICE)
         targets = targets.to(config.DEVICE)
+        target_states = target_states.to(config.DEVICE)
         batch_params = batch_params.to(config.DEVICE)
 
         for t_start in range(1, pred_steps + 1):
             current_h = min(horizon, pred_steps - (t_start - 1))
             current_context = inputs[:, :t_start, :]
             target_start = t_start - 1
+            teacher_steps = (
+                current_h
+                if teacher_steps_override is None
+                else max(0, min(int(teacher_steps_override), current_h))
+            )
 
             for step_idx in range(current_h):
-                out = model(current_context, batch_params)
+                out = model.predict_latent(current_context, batch_params)
                 next_pred = out[:, -1:, :]
-                step_target = targets[:, target_start + step_idx : target_start + step_idx + 1, :]
-                step_fidelity = quantum_fidelity(next_pred[:, 0, :], step_target[:, 0, :]).cpu().double()
+                step_target = target_states[:, target_start + step_idx : target_start + step_idx + 1, :]
+                decoded_step = model.decode_latents(next_pred[:, 0, :])
+                step_fidelity = quantum_fidelity(decoded_step, step_target[:, 0, :]).cpu().double()
                 curve_index = target_start + step_idx
                 fidelity_sum[curve_index] += step_fidelity.sum()
                 loss_sum[curve_index] += (
@@ -1054,7 +1430,11 @@ def evaluate_multistep(
                 if step_idx + 1 >= current_h:
                     continue
 
-                current_context = torch.cat([current_context, next_pred], dim=1)
+                if step_idx + 1 < teacher_steps:
+                    next_context = targets[:, target_start + step_idx : target_start + step_idx + 1, :]
+                else:
+                    next_context = next_pred
+                current_context = torch.cat([current_context, next_context], dim=1)
 
     fidelity_curve: list[float] = []
     coverage_curve: list[float] = []
@@ -1084,9 +1464,10 @@ def evaluate_multistep(
 
 @torch.no_grad()
 def evaluate_autoregressive(
-    model: QuantumSequencePredictor,
+    model: QuantumLatentSequenceModel,
     states: torch.Tensor,
     params: torch.Tensor,
+    latent_states: torch.Tensor | None = None,
     warmup_states: int = 1,
 ) -> EvaluationResult:
     if warmup_states < 1:
@@ -1098,20 +1479,31 @@ def evaluate_autoregressive(
 
     model.eval()
     pred_steps = states.shape[1] - 1
-    loader = build_loader(states, params, shuffle=False)
+    batch_size = max(1, int(config.BATCH_SIZE) // 2)
+    if latent_states is None:
+        latent_states = cache_latent_trajectories(
+            states,
+            params,
+            encoder_fn=model.encode_states,
+            batch_size=config.AUTOENCODER_BATCH_SIZE,
+            device=config.DEVICE,
+        )
 
     loss_sum = torch.zeros(pred_steps, dtype=torch.float64)
     fidelity_sum = torch.zeros(pred_steps, dtype=torch.float64)
     counts = torch.zeros(pred_steps, dtype=torch.float64)
 
-    for inputs, targets, batch_params in loader:
-        true_states = torch.cat([inputs[:, :1, :], targets], dim=1).to(config.DEVICE)
-        batch_params = batch_params.to(config.DEVICE)
-        context = true_states[:, :warmup_states, :]
+    for start in range(0, int(states.shape[0]), batch_size):
+        stop = min(int(states.shape[0]), start + batch_size)
+        true_states = states[start:stop].to(config.DEVICE)
+        true_latents = latent_states[start:stop].to(config.DEVICE)
+        batch_params = params[start:stop].to(config.DEVICE)
+        context = true_latents[:, :warmup_states, :]
 
         for target_index in range(warmup_states, true_states.shape[1]):
-            predicted_next = model(context, batch_params)[:, -1, :]
-            fidelity = quantum_fidelity(predicted_next, true_states[:, target_index, :]).cpu().double()
+            predicted_next = model.predict_latent(context, batch_params)[:, -1, :]
+            decoded_next = model.decode_latents(predicted_next)
+            fidelity = quantum_fidelity(decoded_next, true_states[:, target_index, :]).cpu().double()
             curve_index = target_index - 1
             fidelity_sum[curve_index] += fidelity.sum()
             loss_sum[curve_index] += (-torch.log(fidelity.clamp(min=config.LOG_FIDELITY_EPS))).sum()
@@ -1172,9 +1564,10 @@ def _average_observable_curve(
 
 @torch.no_grad()
 def compute_observable_curves(
-    model: QuantumSequencePredictor,
+    model: QuantumLatentSequenceModel,
     states: torch.Tensor,
     params: torch.Tensor,
+    latent_states: torch.Tensor | None = None,
     warmup_states: int = 1,
     time_step: float = float(config.TIME_STEP),
 ) -> ObservableComparisonCurves:
@@ -1194,28 +1587,40 @@ def compute_observable_curves(
     z_eigs = z_eigs.to(device)
     zz_nn_eigs = zz_nn_eigs.to(device)
     x_flip_idx = [idx.to(device) for idx in x_flip_idx]
+    if latent_states is None:
+        latent_states = cache_latent_trajectories(
+            states,
+            params,
+            encoder_fn=model.encode_states,
+            batch_size=config.AUTOENCODER_BATCH_SIZE,
+            device=config.DEVICE,
+        )
 
     num_states = int(states.shape[1])
     total_sequences = int(states.shape[0])
     pred_steps = num_states - 1
+    batch_size = max(1, int(config.BATCH_SIZE) // 2)
 
     exact_mz = torch.zeros(num_states, dtype=torch.float64, device=device)
     exact_mx = torch.zeros(num_states, dtype=torch.float64, device=device)
     exact_cz = torch.zeros(num_states, dtype=torch.float64, device=device)
+    exact_entropy = torch.zeros(num_states, dtype=torch.float64, device=device)
     multistep_mz = torch.zeros(num_states, dtype=torch.float64, device=device)
     multistep_mx = torch.zeros(num_states, dtype=torch.float64, device=device)
     multistep_cz = torch.zeros(num_states, dtype=torch.float64, device=device)
+    multistep_entropy = torch.zeros(num_states, dtype=torch.float64, device=device)
     multistep_counts = torch.zeros(num_states, dtype=torch.float64, device=device)
     rollout_mz = torch.zeros(num_states, dtype=torch.float64, device=device)
     rollout_mx = torch.zeros(num_states, dtype=torch.float64, device=device)
     rollout_cz = torch.zeros(num_states, dtype=torch.float64, device=device)
+    rollout_entropy = torch.zeros(num_states, dtype=torch.float64, device=device)
     rollout_counts = torch.zeros(num_states, dtype=torch.float64, device=device)
 
-    loader = build_loader(states, params, shuffle=False)
-
-    for inputs, targets, batch_params in loader:
-        true_states = torch.cat([inputs[:, :1, :], targets], dim=1).to(device)
-        batch_params = batch_params.to(device)
+    for start in range(0, total_sequences, batch_size):
+        stop = min(total_sequences, start + batch_size)
+        true_states = states[start:stop].to(device)
+        true_latents = latent_states[start:stop].to(device)
+        batch_params = params[start:stop].to(device)
 
         for t in range(num_states):
             mz, mx, cz = batch_observables_tfim(
@@ -1227,6 +1632,8 @@ def compute_observable_curves(
             exact_mz[t] += mz.double().sum()
             exact_mx[t] += mx.double().sum()
             exact_cz[t] += cz.double().sum()
+            entropy = batch_average_entanglement_entropy(true_states[:, t, :], n_qubits=config.N_QUBITS)
+            exact_entropy[t] += entropy.double().sum()
 
         mz0, mx0, cz0 = batch_observables_tfim(
             true_states[:, 0, :],
@@ -1234,40 +1641,45 @@ def compute_observable_curves(
             zz_nn_eigs,
             x_flip_idx,
         )
+        entropy0 = batch_average_entanglement_entropy(true_states[:, 0, :], n_qubits=config.N_QUBITS)
         multistep_mz[0] += mz0.double().sum()
         multistep_mx[0] += mx0.double().sum()
         multistep_cz[0] += cz0.double().sum()
+        multistep_entropy[0] += entropy0.double().sum()
         multistep_counts[0] += float(true_states.shape[0])
 
         for start_index in range(pred_steps):
             horizon = min(int(config.MULTISTEP_H), pred_steps - start_index)
             teacher_steps = _effective_multistep_teacher_steps(horizon)
-            context = true_states[:, : start_index + 1, :]
+            context = true_latents[:, : start_index + 1, :]
 
             for step_offset in range(horizon):
                 target_state_index = start_index + step_offset + 1
-                predicted_next = model(context, batch_params)[:, -1, :]
+                predicted_next_latent = model.predict_latent(context, batch_params)[:, -1, :]
+                predicted_next = model.decode_latents(predicted_next_latent)
                 mz, mx, cz = batch_observables_tfim(
                     predicted_next,
                     z_eigs,
                     zz_nn_eigs,
                     x_flip_idx,
                 )
+                entropy = batch_average_entanglement_entropy(predicted_next, n_qubits=config.N_QUBITS)
                 multistep_mz[target_state_index] += mz.double().sum()
                 multistep_mx[target_state_index] += mx.double().sum()
                 multistep_cz[target_state_index] += cz.double().sum()
+                multistep_entropy[target_state_index] += entropy.double().sum()
                 multistep_counts[target_state_index] += float(true_states.shape[0])
 
                 if step_offset + 1 >= horizon:
                     continue
 
                 if step_offset + 1 < teacher_steps:
-                    next_context = true_states[:, target_state_index : target_state_index + 1, :]
+                    next_context = true_latents[:, target_state_index : target_state_index + 1, :]
                 else:
-                    next_context = predicted_next.unsqueeze(1)
+                    next_context = predicted_next_latent.unsqueeze(1)
                 context = torch.cat([context, next_context], dim=1)
 
-        context = true_states[:, :warmup_states, :]
+        context = true_latents[:, :warmup_states, :]
         for t in range(warmup_states):
             mz, mx, cz = batch_observables_tfim(
                 true_states[:, t, :],
@@ -1275,24 +1687,29 @@ def compute_observable_curves(
                 zz_nn_eigs,
                 x_flip_idx,
             )
+            entropy = batch_average_entanglement_entropy(true_states[:, t, :], n_qubits=config.N_QUBITS)
             rollout_mz[t] += mz.double().sum()
             rollout_mx[t] += mx.double().sum()
             rollout_cz[t] += cz.double().sum()
+            rollout_entropy[t] += entropy.double().sum()
             rollout_counts[t] += float(true_states.shape[0])
 
         for t in range(warmup_states, num_states):
-            predicted_next = model(context, batch_params)[:, -1, :]
+            predicted_next_latent = model.predict_latent(context, batch_params)[:, -1, :]
+            predicted_next = model.decode_latents(predicted_next_latent)
             mz, mx, cz = batch_observables_tfim(
                 predicted_next,
                 z_eigs,
                 zz_nn_eigs,
                 x_flip_idx,
             )
+            entropy = batch_average_entanglement_entropy(predicted_next, n_qubits=config.N_QUBITS)
             rollout_mz[t] += mz.double().sum()
             rollout_mx[t] += mx.double().sum()
             rollout_cz[t] += cz.double().sum()
+            rollout_entropy[t] += entropy.double().sum()
             rollout_counts[t] += float(true_states.shape[0])
-            context = torch.cat([context, predicted_next.unsqueeze(1)], dim=1)
+            context = torch.cat([context, predicted_next_latent.unsqueeze(1)], dim=1)
 
     scale = float(max(1, total_sequences))
     time_indices = np.arange(num_states, dtype=np.float64)
@@ -1311,6 +1728,9 @@ def compute_observable_curves(
         cz_exact=(exact_cz * inv_scale).cpu().numpy(),
         cz_multistep=_average_observable_curve(multistep_cz, multistep_counts),
         cz_rollout=_average_observable_curve(rollout_cz, rollout_counts),
+        entropy_exact=(exact_entropy * inv_scale).cpu().numpy(),
+        entropy_multistep=_average_observable_curve(multistep_entropy, multistep_counts),
+        entropy_rollout=_average_observable_curve(rollout_entropy, rollout_counts),
     )
 
 
@@ -1333,7 +1753,8 @@ def plot_observable_curves(
     title: str,
 ):
     config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    fig, axes = plt.subplots(1, 3, figsize=(16, 4.8), sharex=True)
+    fig, axes = plt.subplots(2, 2, figsize=(16, 9.0), sharex=True)
+    axes = axes.reshape(-1)
 
     t = curves.physical_time
     axes[0].plot(t, curves.mz_exact, label="Esatto (Hamiltoniana)", color="#1f618d", linewidth=2.2)
@@ -1362,7 +1783,16 @@ def plot_observable_curves(
     axes[2].grid(alpha=0.25)
     axes[2].legend(frameon=False, fontsize=9)
 
+    axes[3].plot(t, curves.entropy_exact, label="Esatto (Hamiltoniana)", color="#1f618d", linewidth=2.2)
+    axes[3].plot(t, curves.entropy_multistep, label="Predetto (multi-step)", color="#117a65", linewidth=2.2)
+    axes[3].plot(t, curves.entropy_rollout, label="Predetto (rollout)", color="#b03a2e", linewidth=2.2)
+    axes[3].set_title(r"Entanglement entropy media $\bar{S}_A$")
+    axes[3].set_ylabel(r"$\bar{S}_A$")
+    axes[3].grid(alpha=0.25)
+    axes[3].legend(frameon=False, fontsize=9)
+
     axes[2].set_xlabel(r"Tempo $t = k\,\Delta t$ (indice stato $k$)")
+    axes[3].set_xlabel(r"Tempo $t = k\,\Delta t$ (indice stato $k$)")
 
     fig.suptitle(title, fontsize=13)
     fig.tight_layout()
@@ -1430,3 +1860,57 @@ def plot_training_curves(history: TrainingHistory):
     fig.tight_layout()
     fig.savefig(config.TRAINING_CURVES_PATH, dpi=config.PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
+
+
+def plot_autoencoder_training_curves(trace: AutoencoderTrainingTrace):
+    config.AUTOENCODER_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+    axes[0].plot(trace.epochs, trace.train_loss, label="train", color="#b03a2e", linewidth=2.0)
+    axes[0].plot(trace.epochs, trace.validation_loss, label="validation", color="#7d6608", linewidth=2.0)
+    axes[0].set_title("Autoencoder Loss")
+    axes[0].set_xlabel("Epoca")
+    axes[0].set_ylabel("Neg. log fidelity loss")
+    axes[0].grid(alpha=0.25)
+    axes[0].legend(frameon=False, fontsize=9)
+
+    axes[1].plot(trace.epochs, trace.train_fidelity, label="train", color="#1f618d", linewidth=2.0)
+    axes[1].plot(trace.epochs, trace.validation_fidelity, label="validation", color="#117a65", linewidth=2.0)
+    axes[1].set_title("Autoencoder Fidelity")
+    axes[1].set_xlabel("Epoca")
+    axes[1].set_ylabel("Fidelity media")
+    axes[1].grid(alpha=0.25)
+    axes[1].legend(frameon=False, fontsize=9)
+
+    fig.tight_layout()
+    fig.savefig(config.AUTOENCODER_TRAINING_CURVES_PATH, dpi=config.PLOT_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def benchmark_latent_pipeline(
+    model: QuantumLatentSequenceModel,
+    states: torch.Tensor,
+    params: torch.Tensor,
+    latent_states: torch.Tensor,
+    *,
+    autoencoder_trace: AutoencoderTrainingTrace,
+) -> PipelineBenchmark:
+    started = time.perf_counter()
+    evaluate_teacher_forced(model, states, params)
+    teacher_eval_uncached_seconds = float(time.perf_counter() - started)
+
+    started = time.perf_counter()
+    evaluate_teacher_forced(model, states, params, latent_states=latent_states)
+    teacher_eval_cached_seconds = float(time.perf_counter() - started)
+
+    input_feature_dim = 2 * int(config.DIM_2N) - 1
+    embedding_dim = int(latent_states.shape[-1])
+    return PipelineBenchmark(
+        input_feature_dim=input_feature_dim,
+        embedding_dim=embedding_dim,
+        compression_ratio=float(input_feature_dim / max(1, embedding_dim)),
+        autoencoder_training_seconds=float(autoencoder_trace.training_seconds),
+        train_cache_seconds=0.0,
+        test_cache_seconds=0.0,
+        teacher_eval_uncached_seconds=teacher_eval_uncached_seconds,
+        teacher_eval_cached_seconds=teacher_eval_cached_seconds,
+    )

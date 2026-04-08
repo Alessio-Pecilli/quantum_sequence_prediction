@@ -51,6 +51,49 @@ def precompute_observables(n_qubits: int, device: torch.device | str):
 
 
 @torch.no_grad()
+def batch_average_entanglement_entropy(
+    states: torch.Tensor,
+    *,
+    n_qubits: int,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """
+    Entropia media di entanglement su tutti i tagli bipartiti 1..N-1.
+
+    Per ogni taglio ``cut`` si risagoma |psi> in (2^cut, 2^(N-cut)), si calcolano
+    i coefficienti di Schmidt tramite SVD e si valuta l'entropia di von Neumann
+    della matrice ridotta corrispondente. L'output è la media sui tagli.
+    """
+    if states.ndim != 2:
+        raise ValueError(f"states deve avere shape (batch, dim), ricevuto: {tuple(states.shape)}")
+    if n_qubits < 1:
+        raise ValueError(f"n_qubits deve essere >= 1, ricevuto: {n_qubits}")
+
+    batch, dim = states.shape
+    expected_dim = 1 << int(n_qubits)
+    if dim != expected_dim:
+        raise ValueError(f"dim mismatch: states dim={dim}, atteso {expected_dim} per n_qubits={n_qubits}")
+
+    if n_qubits == 1:
+        return torch.zeros((batch,), device=states.device, dtype=torch.float32)
+
+    entropies: list[torch.Tensor] = []
+    log2 = torch.log(torch.tensor(2.0, device=states.device, dtype=torch.float32))
+    for cut in range(1, n_qubits):
+        left_dim = 1 << cut
+        right_dim = 1 << (n_qubits - cut)
+        psi_matrix = states.reshape(batch, left_dim, right_dim)
+        schmidt = torch.linalg.svdvals(psi_matrix).to(torch.float32)
+        probs = (schmidt**2).clamp(min=eps)
+        probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=eps)
+        entropy = -(probs * torch.log(probs)).sum(dim=-1) / log2
+        entropies.append(entropy)
+
+    stacked = torch.stack(entropies, dim=0)
+    return stacked.mean(dim=0)
+
+
+@torch.no_grad()
 def batch_observables(
     states: torch.Tensor,
     z_eigs: torch.Tensor,
