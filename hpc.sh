@@ -7,10 +7,7 @@
 #SBATCH --qos=boost_qos_lprod
 #SBATCH --account=iscrc_qusala
 
-#SBATCH --nodes=5
-#SBATCH --ntasks-per-node=20     # 5 x 20 = 100 rank (ben sotto il limite 256)
-#SBATCH --cpus-per-task=1
-#SBATCH --mem=0                  # usa TUTTA la RAM del nodo BOOST
+#SBATCH --nodes=1
 #SBATCH --time=15:00:00
 
 echo "=== JOB $SLURM_JOB_ID STARTED at $(date) on $(hostname) ==="
@@ -32,7 +29,7 @@ export UCX_CONNECT_TIMEOUT=300s
 # Risolve spesso il problema "Shared memory error" su architetture NVIDIA/Atos
 export UCX_MEMTYPE_CACHE=n
 
-cd /leonardo_work/IscrC_QuSALa/vqt2/variational_quantum_transformer_superposition || exit 1
+cd /leonardo_work/IscrC_QuSALa/vqt2/qsp || exit 1
 mkdir -p logs
 
-srun --mpi=pmix_v3 python3 -m vqt.scripts.main_hpc
+srun --mpi=pmix_v3 python3 -m main
