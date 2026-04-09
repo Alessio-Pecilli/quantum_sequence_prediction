@@ -94,7 +94,7 @@ def _default_by_qubits(defaults: dict[int, int], fallback: int) -> int:
 
 # Numero totale di stati in ogni traiettoria, incluso psi(0).
 # Nel progetto SEQ_LEN = NUM_STATES - 1, quindi 12 stati totali -> 11 predizioni.
-NUM_STATES = _env_int("QSP_NUM_STATES", 12)
+NUM_STATES = _env_int("QSP_NUM_STATES", 60)
 if NUM_STATES < 2:
     raise ValueError(f"NUM_STATES deve essere >= 2, ricevuto: {NUM_STATES}")
 
@@ -105,7 +105,7 @@ SEQ_LEN = NUM_STATES - 1
 def _is_long_horizon() -> bool:
     return False
     # Run con rollout lungo: >=60 stati (59+ predizioni).
-    return int(NUM_STATES) >= 12
+    return int(NUM_STATES) >= 15
 
 
 TRAIN_SEQUENCES = _env_int("QSP_TRAIN_SEQUENCES", 4000)
