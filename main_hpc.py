@@ -643,7 +643,9 @@ def main():
 
     model = build_model()
     if DDP_ACTIVE:
-        model = DDPModelAdapter(DistributedDataParallel(model, device_ids=[local_rank]))
+        device_id = [rank % 4] if device.type == "cuda" else None
+        model.autoencoder = DDP(model.autoencoder, device_ids=device_id, find_unused_parameters=True)
+        model.predictor = DDP(model.predictor, device_ids=device_id, find_unused_parameters=True)
 
     if config.EVAL_ONLY:
         history = _load_trained_model(model)
