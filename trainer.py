@@ -244,147 +244,165 @@ def train_autoencoder(
     train_states: torch.Tensor,
     validation_states: torch.Tensor | None = None,
 ) -> AutoencoderTrainingTrace:
-    if config.AUTO_RESUME and config.AUTOENCODER_CHECKPOINT_PATH.exists():
-        payload = torch.load(config.AUTOENCODER_CHECKPOINT_PATH, map_location=config.DEVICE)
-        if isinstance(payload, dict) and "model_state_dict" in payload:
-            model.autoencoder.load_state_dict(payload["model_state_dict"])
-            trace_payload = payload.get("trace", {})
-            return AutoencoderTrainingTrace(
-                epochs=[int(v) for v in trace_payload.get("epochs", [])],
-                train_loss=[float(v) for v in trace_payload.get("train_loss", [])],
-                train_fidelity=[float(v) for v in trace_payload.get("train_fidelity", [])],
-                validation_loss=[float(v) for v in trace_payload.get("validation_loss", [])],
-                validation_fidelity=[float(v) for v in trace_payload.get("validation_fidelity", [])],
-                best_epoch=int(trace_payload.get("best_epoch", 0)),
-                best_validation_fidelity=float(trace_payload.get("best_validation_fidelity", float("nan"))),
-                training_seconds=float(trace_payload.get("training_seconds", 0.0)),
-            )
+    predictor_grad_state = [parameter.requires_grad for parameter in model.predictor.parameters()]
+    predictor_was_training = model.predictor.training
+    for parameter in model.predictor.parameters():
+        parameter.requires_grad_(False)
+    model.predictor.eval()
 
-    train_loader = _build_autoencoder_state_loader(train_states, shuffle=True)
-    optimizer = torch.optim.AdamW(
-        model.autoencoder.parameters(),
-        lr=config.AUTOENCODER_LEARNING_RATE,
-        weight_decay=config.AUTOENCODER_WEIGHT_DECAY,
-    )
-    criterion = NegativeLogFidelityLoss()
-    use_amp = config.DEVICE == "cuda"
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-    trace = AutoencoderTrainingTrace(
-        epochs=[],
-        train_loss=[],
-        train_fidelity=[],
-        validation_loss=[],
-        validation_fidelity=[],
-        best_epoch=0,
-        best_validation_fidelity=float("-inf"),
-        training_seconds=0.0,
-    )
-    best_state = copy.deepcopy(model.autoencoder.state_dict())
-    started_at = time.perf_counter()
-    config.AUTOENCODER_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        if config.AUTO_RESUME and config.AUTOENCODER_CHECKPOINT_PATH.exists():
+            payload = torch.load(config.AUTOENCODER_CHECKPOINT_PATH, map_location=config.DEVICE)
+            if isinstance(payload, dict) and "model_state_dict" in payload:
+                model.autoencoder.load_state_dict(payload["model_state_dict"])
+                trace_payload = payload.get("trace", {})
+                return AutoencoderTrainingTrace(
+                    epochs=[int(v) for v in trace_payload.get("epochs", [])],
+                    train_loss=[float(v) for v in trace_payload.get("train_loss", [])],
+                    train_fidelity=[float(v) for v in trace_payload.get("train_fidelity", [])],
+                    validation_loss=[float(v) for v in trace_payload.get("validation_loss", [])],
+                    validation_fidelity=[float(v) for v in trace_payload.get("validation_fidelity", [])],
+                    best_epoch=int(trace_payload.get("best_epoch", 0)),
+                    best_validation_fidelity=float(trace_payload.get("best_validation_fidelity", float("nan"))),
+                    training_seconds=float(trace_payload.get("training_seconds", 0.0)),
+                )
 
-    for epoch in range(1, int(config.AUTOENCODER_EPOCHS) + 1):
-        model.autoencoder.train()
-        loss_sum = 0.0
-        fidelity_sum = 0.0
-        sample_count = 0
-        for (batch_states,) in train_loader:
-            batch_states = batch_states.to(config.DEVICE)
-            optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
-                _, reconstructed = model.reconstruct_states(batch_states)
-                loss, mean_fidelity, _ = criterion(reconstructed, batch_states)
-            scaler.scale(loss).backward()
-            if config.GRAD_CLIP_MAX_NORM > 0.0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.autoencoder.parameters(), config.GRAD_CLIP_MAX_NORM)
-            scaler.step(optimizer)
-            scaler.update()
-            batch_size = int(batch_states.shape[0])
-            loss_sum += float(loss.item()) * batch_size
-            fidelity_sum += float(mean_fidelity.item()) * batch_size
-            sample_count += batch_size
+        train_loader = _build_autoencoder_state_loader(train_states, shuffle=True)
+        optimizer = torch.optim.AdamW(
+            model.autoencoder.parameters(),
+            lr=config.AUTOENCODER_LEARNING_RATE,
+            weight_decay=config.AUTOENCODER_WEIGHT_DECAY,
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(1, int(config.AUTOENCODER_EPOCHS)),
+            eta_min=float(config.AUTOENCODER_LEARNING_RATE) * 0.05,
+        )
+        criterion = NegativeLogFidelityLoss()
+        use_amp = config.DEVICE == "cuda"
+        scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+        trace = AutoencoderTrainingTrace(
+            epochs=[],
+            train_loss=[],
+            train_fidelity=[],
+            validation_loss=[],
+            validation_fidelity=[],
+            best_epoch=0,
+            best_validation_fidelity=float("-inf"),
+            training_seconds=0.0,
+        )
+        best_state = copy.deepcopy(model.autoencoder.state_dict())
+        started_at = time.perf_counter()
+        config.AUTOENCODER_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-        trace.epochs.append(epoch)
-        trace.train_loss.append(loss_sum / max(1, sample_count))
-        trace.train_fidelity.append(fidelity_sum / max(1, sample_count))
+        for epoch in range(1, int(config.AUTOENCODER_EPOCHS) + 1):
+            model.autoencoder.train()
+            loss_sum = 0.0
+            fidelity_sum = 0.0
+            sample_count = 0
+            for (batch_states,) in train_loader:
+                batch_states = batch_states.to(config.DEVICE)
+                optimizer.zero_grad(set_to_none=True)
+                with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+                    _, reconstructed = model.reconstruct_states(batch_states)
+                    loss, mean_fidelity, _ = criterion(reconstructed, batch_states)
+                scaler.scale(loss).backward()
+                if config.GRAD_CLIP_MAX_NORM > 0.0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.autoencoder.parameters(), config.GRAD_CLIP_MAX_NORM)
+                scaler.step(optimizer)
+                scaler.update()
+                batch_size = int(batch_states.shape[0])
+                loss_sum += float(loss.item()) * batch_size
+                fidelity_sum += float(mean_fidelity.item()) * batch_size
+                sample_count += batch_size
 
-        if validation_states is not None:
-            validation = evaluate_autoencoder_reconstruction(model, validation_states)
-            val_loss = float(validation.loss)
-            val_fidelity = float(validation.mean_fidelity)
-        else:
-            val_loss = float("nan")
-            val_fidelity = float(trace.train_fidelity[-1])
-        trace.validation_loss.append(val_loss)
-        trace.validation_fidelity.append(val_fidelity)
+            trace.epochs.append(epoch)
+            trace.train_loss.append(loss_sum / max(1, sample_count))
+            trace.train_fidelity.append(fidelity_sum / max(1, sample_count))
 
-        if val_fidelity > trace.best_validation_fidelity:
-            trace.best_validation_fidelity = val_fidelity
-            trace.best_epoch = epoch
-            best_state = copy.deepcopy(model.autoencoder.state_dict())
-            _safe_atomic_torch_save(
-                {
-                    "model_state_dict": best_state,
-                    "trace": {
-                        "epochs": trace.epochs,
-                        "train_loss": trace.train_loss,
-                        "train_fidelity": trace.train_fidelity,
-                        "validation_loss": trace.validation_loss,
-                        "validation_fidelity": trace.validation_fidelity,
-                        "best_epoch": trace.best_epoch,
-                        "best_validation_fidelity": trace.best_validation_fidelity,
-                        "training_seconds": 0.0,
+            if validation_states is not None:
+                validation = evaluate_autoencoder_reconstruction(model, validation_states)
+                val_loss = float(validation.loss)
+                val_fidelity = float(validation.mean_fidelity)
+            else:
+                val_loss = float("nan")
+                val_fidelity = float(trace.train_fidelity[-1])
+            trace.validation_loss.append(val_loss)
+            trace.validation_fidelity.append(val_fidelity)
+            scheduler.step()
+
+            if val_fidelity > trace.best_validation_fidelity:
+                trace.best_validation_fidelity = val_fidelity
+                trace.best_epoch = epoch
+                best_state = copy.deepcopy(model.autoencoder.state_dict())
+                _safe_atomic_torch_save(
+                    {
+                        "model_state_dict": best_state,
+                        "trace": {
+                            "epochs": trace.epochs,
+                            "train_loss": trace.train_loss,
+                            "train_fidelity": trace.train_fidelity,
+                            "validation_loss": trace.validation_loss,
+                            "validation_fidelity": trace.validation_fidelity,
+                            "best_epoch": trace.best_epoch,
+                            "best_validation_fidelity": trace.best_validation_fidelity,
+                            "training_seconds": 0.0,
+                        },
                     },
+                    config.AUTOENCODER_CHECKPOINT_PATH,
+                    label="best autoencoder checkpoint",
+                )
+
+            if epoch == int(config.AUTOENCODER_EPOCHS) or epoch <= 3 or epoch % max(1, config.AUTOENCODER_EPOCHS // 10) == 0:
+                print(
+                    f"  [autoencoder] epoca {epoch:4d}/{config.AUTOENCODER_EPOCHS} | "
+                    f"train(fid/loss)=({trace.train_fidelity[-1]:.4f}/{trace.train_loss[-1]:.4f}) | "
+                    f"val(fid/loss)=({val_fidelity:.4f}/{val_loss:.4f}) | "
+                    f"lr={optimizer.param_groups[0]['lr']:.2e}"
+                )
+
+        trace.training_seconds = float(time.perf_counter() - started_at)
+        model.autoencoder.load_state_dict(best_state)
+        _safe_atomic_torch_save(
+            {
+                "model_state_dict": model.autoencoder.state_dict(),
+                "trace": {
+                    "epochs": trace.epochs,
+                    "train_loss": trace.train_loss,
+                    "train_fidelity": trace.train_fidelity,
+                    "validation_loss": trace.validation_loss,
+                    "validation_fidelity": trace.validation_fidelity,
+                    "best_epoch": trace.best_epoch,
+                    "best_validation_fidelity": trace.best_validation_fidelity,
+                    "training_seconds": trace.training_seconds,
                 },
-                config.AUTOENCODER_CHECKPOINT_PATH,
-                label="best autoencoder checkpoint",
-            )
-
-        if epoch == int(config.AUTOENCODER_EPOCHS) or epoch <= 3 or epoch % max(1, config.AUTOENCODER_EPOCHS // 10) == 0:
-            print(
-                f"  [autoencoder] epoca {epoch:4d}/{config.AUTOENCODER_EPOCHS} | "
-                f"train(fid/loss)=({trace.train_fidelity[-1]:.4f}/{trace.train_loss[-1]:.4f}) | "
-                f"val(fid/loss)=({val_fidelity:.4f}/{val_loss:.4f})"
-            )
-
-    trace.training_seconds = float(time.perf_counter() - started_at)
-    model.autoencoder.load_state_dict(best_state)
-    _safe_atomic_torch_save(
-        {
-            "model_state_dict": model.autoencoder.state_dict(),
-            "trace": {
-                "epochs": trace.epochs,
-                "train_loss": trace.train_loss,
-                "train_fidelity": trace.train_fidelity,
-                "validation_loss": trace.validation_loss,
-                "validation_fidelity": trace.validation_fidelity,
-                "best_epoch": trace.best_epoch,
-                "best_validation_fidelity": trace.best_validation_fidelity,
-                "training_seconds": trace.training_seconds,
             },
-        },
-        config.AUTOENCODER_LAST_CHECKPOINT_PATH,
-        label="last autoencoder checkpoint",
-    )
-    _safe_atomic_torch_save(
-        {
-            "model_state_dict": model.autoencoder.state_dict(),
-            "trace": {
-                "epochs": trace.epochs,
-                "train_loss": trace.train_loss,
-                "train_fidelity": trace.train_fidelity,
-                "validation_loss": trace.validation_loss,
-                "validation_fidelity": trace.validation_fidelity,
-                "best_epoch": trace.best_epoch,
-                "best_validation_fidelity": trace.best_validation_fidelity,
-                "training_seconds": trace.training_seconds,
+            config.AUTOENCODER_LAST_CHECKPOINT_PATH,
+            label="last autoencoder checkpoint",
+        )
+        _safe_atomic_torch_save(
+            {
+                "model_state_dict": model.autoencoder.state_dict(),
+                "trace": {
+                    "epochs": trace.epochs,
+                    "train_loss": trace.train_loss,
+                    "train_fidelity": trace.train_fidelity,
+                    "validation_loss": trace.validation_loss,
+                    "validation_fidelity": trace.validation_fidelity,
+                    "best_epoch": trace.best_epoch,
+                    "best_validation_fidelity": trace.best_validation_fidelity,
+                    "training_seconds": trace.training_seconds,
+                },
             },
-        },
-        config.AUTOENCODER_CHECKPOINT_PATH,
-        label="final autoencoder checkpoint",
-    )
-    return trace
+            config.AUTOENCODER_CHECKPOINT_PATH,
+            label="final autoencoder checkpoint",
+        )
+        return trace
+    finally:
+        for parameter, requires_grad in zip(model.predictor.parameters(), predictor_grad_state):
+            parameter.requires_grad_(requires_grad)
+        model.predictor.train(predictor_was_training)
 
 
 def freeze_encoder(model: QuantumLatentSequenceModel):

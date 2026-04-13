@@ -67,13 +67,18 @@ class QuantumStateEncoder(nn.Module):
         self.dim_2n = int(dim_2n)
         self.input_dim = 2 * self.dim_2n - 1
         self.embedding_dim = int(embedding_dim)
-        self.hidden_dim = max(int(hidden_dim), self.embedding_dim)
+        self.hidden_dim = max(int(hidden_dim), self.embedding_dim * 4)
+        self.hidden_dim_half = max(self.hidden_dim // 2, self.embedding_dim * 2)
+        self.hidden_dim_quarter = max(self.hidden_dim // 4, self.embedding_dim)
         self.network = nn.Sequential(
             nn.Linear(self.input_dim, self.hidden_dim),
-            nn.GELU(),
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-            nn.GELU(),
-            nn.Linear(self.hidden_dim, self.embedding_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim_half),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim_half, self.hidden_dim_quarter),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim_quarter, self.embedding_dim),
         )
 
     def forward(self, states: torch.Tensor) -> torch.Tensor:
@@ -99,12 +104,17 @@ class QuantumStateDecoder(nn.Module):
         self.dim_2n = int(dim_2n)
         self.embedding_dim = int(embedding_dim)
         self.feature_dim = 2 * self.dim_2n - 1
-        self.hidden_dim = max(int(hidden_dim), self.embedding_dim)
+        self.hidden_dim = max(int(hidden_dim), self.embedding_dim * 4)
+        self.hidden_dim_half = max(self.hidden_dim // 2, self.embedding_dim * 2)
+        self.hidden_dim_quarter = max(self.hidden_dim // 4, self.embedding_dim)
         self.network = nn.Sequential(
-            nn.Linear(self.embedding_dim, self.hidden_dim),
-            nn.GELU(),
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-            nn.GELU(),
+            nn.Linear(self.embedding_dim, self.hidden_dim_quarter),
+            nn.LayerNorm(self.hidden_dim_quarter),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim_quarter, self.hidden_dim_half),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim_half, self.hidden_dim),
+            nn.SiLU(),
             nn.Linear(self.hidden_dim, self.feature_dim),
         )
 
