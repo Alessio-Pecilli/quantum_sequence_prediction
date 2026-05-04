@@ -1,0 +1,657 @@
+{
+  "seed": 7,
+  "device": "cpu",
+  "config": {
+    "DATASET_SOURCE": "fixed_tfim_basis",
+    "N_QUBITS": 6,
+    "DIM_2N": 64,
+    "NUM_STATES": 6,
+    "SEQ_LEN": 5,
+    "MULTISTEP_H": 5,
+    "MULTISTEP_H_START": 5,
+    "MULTISTEP_H_MAX": 5,
+    "MULTISTEP_EFFECTIVE_TEACHER_FORCING_STEPS": 2,
+    "MULTISTEP_TEACHER_FORCING_STEPS": 2,
+    "HYBRID_TEACHER_FORCING_EPOCHS": 1,
+    "MULTISTEP_H_PLATEAU_PATIENCE": 250,
+    "MULTISTEP_H_PLATEAU_MIN_DELTA": 0.0001,
+    "EARLY_STOPPING_PATIENCE": 600,
+    "EARLY_STOPPING_MIN_EPOCHS": 1,
+    "ADAPTIVE_MULTISTEP_ENABLED": false,
+    "ADAPTIVE_STATS_EMA": 0.7,
+    "ADAPTIVE_WEIGHT_ALPHA": 0.8,
+    "ADAPTIVE_WEIGHT_MIN": 1.0,
+    "ADAPTIVE_WEIGHT_MAX": 2.0,
+    "ADAPTIVE_H_MIN": 5,
+    "ADAPTIVE_H_MAX": 5,
+    "ADAPTIVE_TEACHER_MIN": 1,
+    "ADAPTIVE_TEACHER_MAX": 5,
+    "ADAPTIVE_H_LOSS_THRESHOLD": 0.95,
+    "ADAPTIVE_H_FIDELITY_THRESHOLD": 0.58,
+    "ADAPTIVE_TEACHER_LOSS_THRESHOLD": 0.85,
+    "ADAPTIVE_TEACHER_FIDELITY_THRESHOLD": 0.62,
+    "TRAIN_SEQUENCES": 8,
+    "TEST_SEQUENCES": 4,
+    "INITIAL_STATE_FAMILY": "xyz_basis",
+    "FORCE_X_BASIS_ONLY": true,
+    "DROPOUT": 0.1,
+    "ROLLOUT_WARMUP_STATES": 4,
+    "EVAL_ONLY": false,
+    "AUTO_RESUME": true,
+    "PARTIAL_WARMUP_STEPS": "auto",
+    "OBSERVABLES_TEST_SEQUENCE_INDEX": 0,
+    "CLAMP_AUDIT_PRINT": true,
+    "CLAMP_AUDIT_MAX_SEQUENCES": 3,
+    "CLAMP_AUDIT_MAX_STATES": 6,
+    "active_env_overrides": {
+      "QSP_N_QUBITS": {
+        "raw": "6",
+        "value": 6
+      },
+      "QSP_NUM_STATES": {
+        "raw": "6",
+        "value": 6
+      },
+      "QSP_TRAIN_SEQUENCES": {
+        "raw": "8",
+        "value": 8
+      },
+      "QSP_TEST_SEQUENCES": {
+        "raw": "4",
+        "value": 4
+      },
+      "QSP_DATASET_SOURCE": {
+        "raw": "fixed_tfim_basis",
+        "value": "fixed_tfim_basis"
+      },
+      "QSP_EPOCHS": {
+        "raw": "1",
+        "value": 1
+      },
+      "QSP_HYBRID_TEACHER_FORCING_EPOCHS": {
+        "raw": "1",
+        "value": 1
+      },
+      "QSP_HPC_DISTRIBUTED": {
+        "raw": "0",
+        "value": false
+      },
+      "QSP_HPC_DISTRIBUTED_DATASET": {
+        "raw": "1",
+        "value": true
+      },
+      "QSP_HPC_DISTRIBUTED_TRAINING": {
+        "raw": "1",
+        "value": true
+      }
+    }
+  },
+  "dataset": {
+    "source": "fixed_tfim_basis",
+    "initial_state_family": "x_basis",
+    "initial_state_family_reason": "override FORCE_X_BASIS_ONLY attivo; stati iniziali solo in base X clampata; campionamento senza rimpiazzo",
+    "train_initial_state_codes": [
+      37,
+      39,
+      1,
+      62,
+      41,
+      52,
+      13,
+      16
+    ],
+    "test_initial_state_codes": [
+      3,
+      25,
+      24,
+      59
+    ]
+  },
+  "resume": {
+    "enabled": true,
+    "resumed": false,
+    "reason": "config incompatibile; DATASET_SOURCE: checkpoint=haar_multi_hamiltonian current=fixed_tfim_basis; N_QUBITS: checkpoint=4 current=6; DIM_2N: checkpoint=16 current=64; NUM_STATES: checkpoint=8 current=6; TRAIN_SEQUENCES: checkpoint=4 current=8; TEST_SEQUENCES: checkpoint=2 current=4; MULTISTEP_H_START: checkpoint=7 current=5; MULTISTEP_H_MAX: checkpoint=7 current=5; MULTISTEP_H: checkpoint=7 current=5; MULTISTEP_TEACHER_FORCING_STEPS: checkpoint=3 current=2; MULTISTEP_EFFECTIVE_TEACHER_FORCING_STEPS: checkpoint=3 current=2; ADAPTIVE_H_MIN: checkpoint=7 current=5; ADAPTIVE_H_MAX: checkpoint=7 current=5; ADAPTIVE_TEACHER_MAX: checkpoint=7 current=5"
+  },
+  "training_scheme": {
+    "mode": "teacher_forced_then_hybrid_50_50_vectorized_multistep",
+    "teacher_forcing_epochs": 1,
+    "multistep_epochs": 0,
+    "multistep_horizon_start": 5,
+    "multistep_horizon_max": 5,
+    "multistep_horizon_eval": 5,
+    "multistep_teacher_steps": 2,
+    "hybrid_teacher_forced_weight": 0.5,
+    "hybrid_multistep_weight": 0.5,
+    "multistep_step_weighting": "descending_linear_mean_normalized",
+    "rollout_evaluation_warmup_states": 4
+  },
+  "training_history": {
+    "epochs": [
+      1
+    ],
+    "train_loss": [
+      4.919557571411133
+    ],
+    "train_fidelity": [
+      0.014471463859081268
+    ]
+  },
+  "adaptive_training": {
+    "enabled": false,
+    "initial_horizon": 5,
+    "initial_teacher_steps": 3,
+    "final_horizon": 5,
+    "final_teacher_steps": 3,
+    "epoch_summaries": [
+      {
+        "epoch": 1,
+        "horizon": 5,
+        "teacher_steps": 5,
+        "head_loss": 4.912680625915527,
+        "tail_loss": 4.7047810554504395,
+        "head_fidelity": 0.013768543489277363,
+        "tail_fidelity": 0.016061363741755486,
+        "mean_offset_losses": [
+          4.912680625915527,
+          4.809208869934082,
+          5.526986122131348,
+          4.644131660461426,
+          4.7047810554504395
+        ],
+        "mean_offset_fidelities": [
+          0.013768543489277363,
+          0.020729584619402885,
+          0.00513992877677083,
+          0.01665790006518364,
+          0.016061363741755486
+        ],
+        "mean_offset_weights": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      }
+    ]
+  },
+  "model_selection": {
+    "criterion": "maximize test_multistep mean_fidelity @ H=5",
+    "best_epoch": 1,
+    "best_objective": 0.014874027104815469,
+    "best_teacher_forced_fidelity": 0.01476103812456131,
+    "best_multistep_fidelity": 0.014874027104815469,
+    "best_rollout_fidelity": NaN,
+    "rollout_weight": 0.0,
+    "multistep_weight": 1.0,
+    "teacher_forced_weight": 0.0
+  },
+  "evaluation": {
+    "train_teacher_forced": {
+      "loss": 5.119009494781494,
+      "mean_fidelity": 0.014546571299433708,
+      "fidelity_curve": [
+        0.012335012666881084,
+        0.02630479820072651,
+        0.0063736336305737495,
+        0.013350783847272396,
+        0.014368630014359951
+      ],
+      "coverage_curve": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ]
+    },
+    "train_multistep": {
+      "loss": 5.074307408615533,
+      "mean_fidelity": 0.0139687550073783,
+      "fidelity_curve": [
+        0.012335011910181493,
+        0.026502721971382925,
+        0.0063846855143007515,
+        0.013224988262663828,
+        0.01442737193283392
+      ],
+      "coverage_curve": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "per_hamiltonian_curves": {
+        "TFIM": [
+          0.012335011910181493,
+          0.026502721971382925,
+          0.0063846855143007515,
+          0.013224988262663828,
+          0.01442737193283392
+        ],
+        "XXZ": [
+          null,
+          null,
+          null,
+          null,
+          null
+        ],
+        "Fermi-Hubbard": [
+          null,
+          null,
+          null,
+          null,
+          null
+        ],
+        "Max-3-SAT": [
+          null,
+          null,
+          null,
+          null,
+          null
+        ]
+      },
+      "per_hamiltonian_final_fidelity": {
+        "TFIM": 0.01442737193283392,
+        "XXZ": null,
+        "Fermi-Hubbard": null,
+        "Max-3-SAT": null
+      }
+    },
+    "train_autoregressive": {
+      "loss": 4.809745146299964,
+      "mean_fidelity": 0.013911124886362813,
+      "fidelity_curve": [
+        null,
+        null,
+        null,
+        0.013350780427572317,
+        0.01447146934515331
+      ],
+      "coverage_curve": [
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        1.0
+      ],
+      "per_hamiltonian_curves": {
+        "TFIM": [
+          null,
+          null,
+          null,
+          0.013350780427572317,
+          0.01447146934515331
+        ],
+        "XXZ": [
+          null,
+          null,
+          null,
+          null,
+          null
+        ],
+        "Fermi-Hubbard": [
+          null,
+          null,
+          null,
+          null,
+          null
+        ],
+        "Max-3-SAT": [
+          null,
+          null,
+          null,
+          null,
+          null
+        ]
+      },
+      "per_hamiltonian_final_fidelity": {
+        "TFIM": 0.01447146934515331,
+        "XXZ": null,
+        "Fermi-Hubbard": null,
+        "Max-3-SAT": null
+      }
+    },
+    "test_teacher_forced": {
+      "loss": 4.679275989532471,
+      "mean_fidelity": 0.01476103812456131,
+      "fidelity_curve": [
+        0.016593575477600098,
+        0.006792077329009771,
+        0.021190796047449112,
+        0.016477322205901146,
+        0.012751414440572262
+      ],
+      "coverage_curve": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ]
+    },
+    "test_multistep": {
+      "loss": 4.75250681793431,
+      "mean_fidelity": 0.014874027104815469,
+      "fidelity_curve": [
+        0.016593575797742233,
+        0.006800103088608012,
+        0.021308756666257977,
+        0.016508904460351914,
+        0.012590947351418436
+      ],
+      "coverage_curve": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "per_hamiltonian_curves": {
+        "TFIM": [
+          0.016593575797742233,
+          0.006800103088608012,
+          0.021308756666257977,
+          0.016508904460351914,
+          0.012590947351418436
+        ],
+        "XXZ": [
+          null,
+          null,
+          null,
+          null,
+          null
+        ],
+        "Fermi-Hubbard": [
+          null,
+          null,
+          null,
+          null,
+          null
+        ],
+        "Max-3-SAT": [
+          null,
+          null,
+          null,
+          null,
+          null
+        ]
+      },
+      "per_hamiltonian_final_fidelity": {
+        "TFIM": 0.012590947351418436,
+        "XXZ": null,
+        "Fermi-Hubbard": null,
+        "Max-3-SAT": null
+      }
+    },
+    "test_autoregressive": {
+      "loss": 4.822041845809597,
+      "mean_fidelity": 0.014574286265997216,
+      "fidelity_curve": [
+        null,
+        null,
+        null,
+        0.016477326629683375,
+        0.012671245902311057
+      ],
+      "coverage_curve": [
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        1.0
+      ],
+      "per_hamiltonian_curves": {
+        "TFIM": [
+          null,
+          null,
+          null,
+          0.016477326629683375,
+          0.012671245902311057
+        ],
+        "XXZ": [
+          null,
+          null,
+          null,
+          null,
+          null
+        ],
+        "Fermi-Hubbard": [
+          null,
+          null,
+          null,
+          null,
+          null
+        ],
+        "Max-3-SAT": [
+          null,
+          null,
+          null,
+          null,
+          null
+        ]
+      },
+      "per_hamiltonian_final_fidelity": {
+        "TFIM": 0.012671245902311057,
+        "XXZ": null,
+        "Fermi-Hubbard": null,
+        "Max-3-SAT": null
+      }
+    },
+    "test_observables_sequence_index": 0,
+    "test_observables": {
+      "time_indices": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "physical_time": [
+        0.0,
+        1.0,
+        2.0,
+        3.0,
+        4.0,
+        5.0
+      ],
+      "mz_exact": [
+        3.725290298461914e-09,
+        -3.476937493473997e-08,
+        -5.4016709327697754e-08,
+        -1.1672576505361576e-07,
+        -1.1144826572717648e-07,
+        -1.7105291760799446e-07
+      ],
+      "mz_multistep": [
+        3.725290298461914e-09,
+        -0.09581052511930466,
+        -0.12572097778320312,
+        -0.13220487534999847,
+        -0.11611688137054443,
+        -0.09591225981712341
+      ],
+      "mz_rollout": [
+        3.725290298461914e-09,
+        -3.476937493473997e-08,
+        -5.4016709327697754e-08,
+        -1.1672576505361576e-07,
+        -0.11552560329437256,
+        -0.09558675438165665
+      ],
+      "mx_exact": [
+        0.33333325386047363,
+        0.1181488111615181,
+        0.19474703073501587,
+        0.03820708394050598,
+        0.1851801872253418,
+        0.10610070079565048
+      ],
+      "mx_multistep": [
+        0.33333325386047363,
+        -0.04550543799996376,
+        -0.05036114156246185,
+        -0.05044976994395256,
+        -0.05235692299902439,
+        -0.04734869971871376
+      ],
+      "mx_rollout": [
+        0.33333325386047363,
+        0.1181488111615181,
+        0.19474703073501587,
+        0.03820708394050598,
+        -0.052549127489328384,
+        -0.0472906231880188
+      ],
+      "cz_exact": [
+        -2.4835269951672956e-10,
+        0.06476996093988419,
+        0.0289898794144392,
+        0.04914918914437294,
+        0.06401822715997696,
+        0.050959512591362
+      ],
+      "cz_multistep": [
+        -2.4835269951672956e-10,
+        0.009105986915528774,
+        0.019984502345323563,
+        0.024692043662071228,
+        0.02642112411558628,
+        0.027410057932138444
+      ],
+      "cz_rollout": [
+        -2.4835269951672956e-10,
+        0.06476996093988419,
+        0.0289898794144392,
+        0.04914918914437294,
+        0.026544533669948578,
+        0.027498628944158554
+      ]
+    },
+    "entanglement_random_cuts": {
+      "exact": [
+        2.981060447382333e-07,
+        0.7336024306714535,
+        0.8533042762428522,
+        0.9511016784235835,
+        0.8008720222860575,
+        0.8683029152452946
+      ],
+      "multistep": [
+        2.981060447382333e-07,
+        1.1595186349004507,
+        1.1401468496769667,
+        1.1275964714586735,
+        1.1289682760834694,
+        1.1381418816745281
+      ],
+      "rollout": [
+        2.981060447382333e-07,
+        0.7336024306714535,
+        0.8533042762428522,
+        0.9511016784235835,
+        1.1289682760834694,
+        1.1388791874051094
+      ],
+      "cuts": [
+        "0,5",
+        "0,2,3,5",
+        "2",
+        "1,5",
+        "0,1,5",
+        "4",
+        "0,2,3,4",
+        "0,1,2,4"
+      ]
+    },
+    "per_h_observables": {
+      "TFIM": {
+        "exact": [
+          0.0,
+          0.003638368798419833,
+          -0.051999762654304504,
+          -0.09188631549477577,
+          -0.06472361832857132,
+          0.01263404916971922
+        ],
+        "pred": [
+          0.0,
+          0.003638368798419833,
+          -0.051999762654304504,
+          -0.09188631549477577,
+          -0.05265129264444113,
+          -0.04700226616114378
+        ]
+      },
+      "XXZ": {
+        "exact": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "pred": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "Fermi-Hubbard": {
+        "exact": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "pred": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "Max-3-SAT": {
+        "exact": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "pred": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      }
+    },
+    "partial_warmup_n1_values": [],
+    "train_partial_warmups": {},
+    "test_partial_warmups": {}
+  },
+  "artifacts": {
+    "fidelity_plot": "C:\\Users\\Ale\\Desktop\\progetti\\quantum_sequence_prediction\\results_multi_4q_h100\\fidelity_vs_time.png",
+    "fidelity_methods_plot": "C:\\Users\\Ale\\Desktop\\progetti\\quantum_sequence_prediction\\results_multi_4q_h100\\fidelity_methods_vs_time.png",
+    "training_curves_plot": "C:\\Users\\Ale\\Desktop\\progetti\\quantum_sequence_prediction\\results_multi_4q_h100\\training_curves.png",
+    "observables_train_plot": "C:\\Users\\Ale\\Desktop\\progetti\\quantum_sequence_prediction\\results_multi_4q_h100\\observables_train_vs_rollout.png",
+    "observables_test_plot": "C:\\Users\\Ale\\Desktop\\progetti\\quantum_sequence_prediction\\results_multi_4q_h100\\observables_test_vs_rollout.png",
+    "entanglement_plot": "C:\\Users\\Ale\\Desktop\\progetti\\quantum_sequence_prediction\\results_multi_4q_h100\\entanglement_vs_time.png",
+    "per_h_observables_plot": "C:\\Users\\Ale\\Desktop\\progetti\\quantum_sequence_prediction\\results_multi_4q_h100\\per_h_observables_vs_time.png",
+    "summary_json": "C:\\Users\\Ale\\Desktop\\progetti\\quantum_sequence_prediction\\results_multi_4q_h100\\run_summary.json"
+  }
+}

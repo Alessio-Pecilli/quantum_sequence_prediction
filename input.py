@@ -4,6 +4,7 @@ import random
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 from torch.utils.data import Dataset
 
 import config
@@ -15,6 +16,22 @@ X = torch.tensor([[0, 1], [1, 0]], dtype=torch.complex64)
 Y = torch.tensor([[0, -1j], [1j, 0]], dtype=torch.complex64)
 Z = torch.tensor([[1, 0], [0, -1]], dtype=torch.complex64)
 PARAM_VECTOR_DIM = 6
+
+
+def _dist_is_initialized() -> bool:
+    return bool(dist.is_available() and dist.is_initialized())
+
+
+def _dist_rank_world() -> tuple[int, int]:
+    if not _dist_is_initialized():
+        return 0, 1
+    return int(dist.get_rank()), int(dist.get_world_size())
+
+
+def _split_count(total: int, rank: int, world_size: int) -> int:
+    base = int(total) // int(world_size)
+    rem = int(total) % int(world_size)
+    return base + (1 if rank < rem else 0)
 
 @dataclass
 class HamiltonianData:
@@ -453,7 +470,127 @@ def generate_fixed_tfim_dataset(
     n_qubits: int = config.N_QUBITS,
     num_states: int = config.NUM_STATES,
     seed: int = config.SEED,
+    *,
+    enable_distributed: bool = True,
 ) -> QuantumDatasetBundle:
+    if (
+        enable_distributed
+        and config.HPC_DISTRIBUTED
+        and config.HPC_DISTRIBUTED_DATASET
+        and _dist_is_initialized()
+    ):
+        rank, world_size = _dist_rank_world()
+        local_train = _split_count(int(train_sequences), rank, world_size)
+        local_test = _split_count(int(test_sequences), rank, world_size)
+        local_seed = int(seed) + int(config.HPC_DIST_SEED_STRIDE) * int(rank)
+
+        if (local_train + local_test) > 0:
+            local_bundle = generate_fixed_tfim_dataset(
+                train_sequences=local_train,
+                test_sequences=local_test,
+                n_qubits=n_qubits,
+                num_states=num_states,
+                seed=local_seed,
+                enable_distributed=False,
+            )
+        else:
+            dim = 2 ** int(n_qubits)
+            empty_hamiltonian = HamiltonianData(
+                couplings=[],
+                field_strength=float("nan"),
+                backend="empty_shard",
+                hamiltonian=torch.empty((0, 0), dtype=torch.complex64),
+                evolution_operator=torch.empty((0, 0), dtype=torch.complex64),
+            )
+            local_bundle = QuantumDatasetBundle(
+                train=DatasetSplit(
+                    states=torch.empty((0, int(num_states), dim), dtype=torch.complex64),
+                    params=torch.empty((0, PARAM_VECTOR_DIM), dtype=torch.float32),
+                    initial_state_codes=[],
+                    initial_state_family="empty_shard",
+                    support_size=0,
+                ),
+                test=DatasetSplit(
+                    states=torch.empty((0, int(num_states), dim), dtype=torch.complex64),
+                    params=torch.empty((0, PARAM_VECTOR_DIM), dtype=torch.float32),
+                    initial_state_codes=[],
+                    initial_state_family="empty_shard",
+                    support_size=0,
+                ),
+                hamiltonian=empty_hamiltonian,
+                basis_support_size=0,
+                used_support_fraction=0.0,
+                initial_state_family_reason="empty shard",
+            )
+
+        gathered: list[object] = [None for _ in range(world_size)]
+        payload = {
+            "train_states": local_bundle.train.states,
+            "train_params": local_bundle.train.params,
+            "train_codes": local_bundle.train.initial_state_codes,
+            "test_states": local_bundle.test.states,
+            "test_params": local_bundle.test.params,
+            "test_codes": local_bundle.test.initial_state_codes,
+            "hamiltonian": local_bundle.hamiltonian,
+            "basis_support_size": int(local_bundle.basis_support_size),
+            "used_support_fraction": float(local_bundle.used_support_fraction),
+            "initial_state_family_reason": str(local_bundle.initial_state_family_reason),
+            "initial_state_family": str(local_bundle.train.initial_state_family),
+        }
+        dist.all_gather_object(gathered, payload)
+
+        reconstructed: QuantumDatasetBundle | None = None
+        if rank == 0:
+            chunks = [item for item in gathered if isinstance(item, dict)]
+            non_empty_chunks = [
+                item
+                for item in chunks
+                if int(item["train_states"].shape[0]) + int(item["test_states"].shape[0]) > 0
+            ]
+            train_states = torch.cat([item["train_states"] for item in chunks], dim=0).contiguous()
+            train_params = torch.cat([item["train_params"] for item in chunks], dim=0).contiguous()
+            test_states = torch.cat([item["test_states"] for item in chunks], dim=0).contiguous()
+            test_params = torch.cat([item["test_params"] for item in chunks], dim=0).contiguous()
+            train_codes: list[int] = []
+            test_codes: list[int] = []
+            for item in chunks:
+                train_codes.extend([int(v) for v in item["train_codes"]])
+                test_codes.extend([int(v) for v in item["test_codes"]])
+
+            reference_chunk = non_empty_chunks[0] if non_empty_chunks else chunks[0]
+            train_family = str(reference_chunk["initial_state_family"])
+            reason = (
+                f"distributed_generation(world_size={world_size}) | "
+                + " | ".join(str(item["initial_state_family_reason"]) for item in chunks)
+            )
+            reconstructed = QuantumDatasetBundle(
+                train=DatasetSplit(
+                    states=train_states,
+                    params=train_params[: int(train_sequences)].contiguous(),
+                    initial_state_codes=train_codes[: int(train_sequences)],
+                    initial_state_family=train_family,
+                    support_size=int(train_sequences) + int(test_sequences),
+                ),
+                test=DatasetSplit(
+                    states=test_states,
+                    params=test_params[: int(test_sequences)].contiguous(),
+                    initial_state_codes=test_codes[: int(test_sequences)],
+                    initial_state_family=train_family,
+                    support_size=int(train_sequences) + int(test_sequences),
+                ),
+                hamiltonian=reference_chunk["hamiltonian"],
+                basis_support_size=int(train_sequences) + int(test_sequences),
+                used_support_fraction=1.0,
+                initial_state_family_reason=reason,
+            )
+
+        broadcast_obj = [reconstructed]
+        dist.broadcast_object_list(broadcast_obj, src=0)
+        final_bundle = broadcast_obj[0]
+        if not isinstance(final_bundle, QuantumDatasetBundle):
+            raise RuntimeError("Broadcast dataset fallito: oggetto non valido.")
+        return final_bundle
+
     if config.DATASET_SOURCE in {"haar_tfim", "haar_multi_hamiltonian"}:
         return generate_haar_tfim_dataset(
             train_sequences=train_sequences,
@@ -461,6 +598,7 @@ def generate_fixed_tfim_dataset(
             n_qubits=n_qubits,
             num_states=num_states,
             seed=seed,
+            enable_distributed=enable_distributed,
         )
 
     total_sequences = int(train_sequences) + int(test_sequences)
@@ -538,6 +676,8 @@ def generate_haar_tfim_dataset(
     n_qubits: int = config.N_QUBITS,
     num_states: int = config.NUM_STATES,
     seed: int = config.SEED,
+    *,
+    enable_distributed: bool = True,
 ) -> QuantumDatasetBundle:
     if int(n_qubits) != 4:
         raise ValueError("Il setup multi-H richiesto e' definito per 4 qubit.")

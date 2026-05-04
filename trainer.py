@@ -12,7 +12,10 @@ from dataclasses import dataclass
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 import config
 from input import QuantumSequenceDataset
@@ -20,6 +23,51 @@ from observables import batch_observables_tfim, precompute_observables
 from predictor import NegativeLogFidelityLoss, QuantumSequencePredictor, quantum_fidelity
 
 H_LABELS = {0: "TFIM", 1: "XXZ", 2: "Fermi-Hubbard", 3: "Max-3-SAT"}
+
+
+def _dist_is_initialized() -> bool:
+    return bool(dist.is_available() and dist.is_initialized())
+
+
+def _dist_rank_world() -> tuple[int, int]:
+    if not _dist_is_initialized():
+        return 0, 1
+    return int(dist.get_rank()), int(dist.get_world_size())
+
+
+def _is_main_process() -> bool:
+    rank, _ = _dist_rank_world()
+    return rank == 0
+
+
+def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    return model.module if isinstance(model, DistributedDataParallel) else model
+
+
+def _model_state_dict(model: torch.nn.Module) -> dict:
+    return copy.deepcopy(_unwrap_model(model).state_dict())
+
+
+def _load_model_state_dict(model: torch.nn.Module, state_dict: dict):
+    _unwrap_model(model).load_state_dict(state_dict)
+
+
+def _allreduce_scalar(value: float, *, op=dist.ReduceOp.SUM) -> float:
+    if not _dist_is_initialized():
+        return float(value)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tensor = torch.tensor(float(value), dtype=torch.float64, device=device)
+    dist.all_reduce(tensor, op=op)
+    return float(tensor.item())
+
+
+def _allreduce_array(values: np.ndarray, *, op=dist.ReduceOp.SUM) -> np.ndarray:
+    if not _dist_is_initialized():
+        return values
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tensor = torch.tensor(values, dtype=torch.float64, device=device)
+    dist.all_reduce(tensor, op=op)
+    return tensor.detach().cpu().numpy()
 
 
 @dataclass
@@ -132,16 +180,38 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
-def build_loader(states: torch.Tensor, params: torch.Tensor, shuffle: bool) -> DataLoader:
+def build_loader(
+    states: torch.Tensor,
+    params: torch.Tensor,
+    shuffle: bool,
+) -> tuple[DataLoader, DistributedSampler | None]:
     dataset = QuantumSequenceDataset(states, params)
     safe_batch_size = max(1, int(config.BATCH_SIZE) // 2)
-    return DataLoader(
+    _, world_size = _dist_rank_world()
+    if (
+        shuffle
+        and config.HPC_DISTRIBUTED
+        and config.HPC_DISTRIBUTED_TRAINING
+        and _dist_is_initialized()
+        and world_size > 1
+    ):
+        sampler: DistributedSampler | None = DistributedSampler(
+            dataset,
+            num_replicas=world_size,
+            shuffle=shuffle,
+            drop_last=False,
+        )
+    else:
+        sampler = None
+    loader = DataLoader(
         dataset,
         batch_size=safe_batch_size,
-        shuffle=shuffle,
-        num_workers=0,
-        pin_memory=False,
+        shuffle=shuffle if sampler is None else False,
+        sampler=sampler,
+        num_workers=int(config.NUM_WORKERS),
+        pin_memory=bool(config.PIN_MEMORY),
     )
+    return loader, sampler
 
 
 def build_model() -> QuantumSequencePredictor:
@@ -222,7 +292,7 @@ def _checkpoint_config_mismatches(saved_config: dict[str, object]) -> list[str]:
     return mismatches
 
 
-def try_resume_from_last_checkpoint(model: QuantumSequencePredictor) -> ResumeCheckpointState:
+def try_resume_from_last_checkpoint(model: torch.nn.Module) -> ResumeCheckpointState:
     if not config.AUTO_RESUME:
         return _empty_resume_state("QSP_AUTO_RESUME=0")
     if not config.LAST_CHECKPOINT_PATH.exists():
@@ -246,7 +316,7 @@ def try_resume_from_last_checkpoint(model: QuantumSequencePredictor) -> ResumeCh
         return _empty_resume_state("model_state_dict mancante")
 
     try:
-        model.load_state_dict(model_state_dict)
+        _load_model_state_dict(model, model_state_dict)
     except Exception as exc:
         return _empty_resume_state(f"state_dict incompatibile: {exc}")
 
@@ -610,7 +680,7 @@ def _safe_atomic_torch_save(payload: dict, destination: os.PathLike, *, label: s
 
 
 def _save_last_checkpoint(
-    model: QuantumSequencePredictor,
+    model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     history: TrainingHistory,
@@ -618,12 +688,12 @@ def _save_last_checkpoint(
     best_objective: float,
     best_state: dict | None,
 ):
-    if not config.SAVE_MODEL:
+    if not config.SAVE_MODEL or not _is_main_process():
         return
     config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     checkpoint_payload = {
         "epoch": int(epoch),
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": _model_state_dict(model),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
         "history": {
@@ -646,7 +716,7 @@ def _save_last_checkpoint(
 
 
 def train_model(
-    model: QuantumSequencePredictor,
+    model: torch.nn.Module,
     train_states: torch.Tensor,
     train_params: torch.Tensor,
     validation_states: torch.Tensor | None = None,
@@ -659,12 +729,25 @@ def train_model(
     best_state: dict | None = None,
 ) -> tuple[TrainingHistory, AdaptiveTrainingTrace, ModelSelectionTrace]:
     history = history or TrainingHistory(epochs=[], train_loss=[], train_fidelity=[])
+    if (
+        config.HPC_DISTRIBUTED
+        and config.HPC_DISTRIBUTED_TRAINING
+        and _dist_is_initialized()
+        and not isinstance(model, DistributedDataParallel)
+    ):
+        if torch.cuda.is_available():
+            local_rank = int(os.getenv("LOCAL_RANK", "0"))
+            device_index = local_rank % max(1, int(torch.cuda.device_count()))
+            model = DistributedDataParallel(model, device_ids=[device_index], output_device=device_index)
+        else:
+            model = DistributedDataParallel(model)
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config.LEARNING_RATE,
         weight_decay=config.WEIGHT_DECAY,
     )
-    loader = build_loader(train_states, train_params, shuffle=True)
+    loader, distributed_sampler = build_loader(train_states, train_params, shuffle=True)
     steps_per_epoch = len(loader)
     use_amp = config.DEVICE == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -712,6 +795,8 @@ def train_model(
     try:
         for epoch in range(max(1, start_epoch), config.EPOCHS + 1):
             model.train()
+            if distributed_sampler is not None:
+                distributed_sampler.set_epoch(int(epoch))
             loss_sum = 0.0
             fidelity_sum = 0.0
             sample_weight = 0
@@ -807,16 +892,24 @@ def train_model(
                         best_state=best_state,
                     )
 
-            epoch_loss = loss_sum / max(1, sample_weight)
-            epoch_fidelity = fidelity_sum / max(1, sample_weight)
+            global_loss_sum = _allreduce_scalar(loss_sum)
+            global_fidelity_sum = _allreduce_scalar(fidelity_sum)
+            global_sample_weight = _allreduce_scalar(float(sample_weight))
+            global_offset_loss_sums = _allreduce_array(offset_loss_sums)
+            global_offset_fidelity_sums = _allreduce_array(offset_fidelity_sums)
+            global_offset_weight_sums = _allreduce_array(offset_weight_sums)
+            global_offset_counts = _allreduce_array(offset_counts)
+
+            epoch_loss = global_loss_sum / max(1.0, global_sample_weight)
+            epoch_fidelity = global_fidelity_sum / max(1.0, global_sample_weight)
             adaptive_summary = _summarize_epoch_adaptive_stats(
                 epoch=epoch,
                 horizon=epoch_horizon,
                 teacher_steps=epoch_teacher_steps,
-                loss_sums=offset_loss_sums,
-                fidelity_sums=offset_fidelity_sums,
-                weight_sums=offset_weight_sums,
-                counts=offset_counts,
+                loss_sums=global_offset_loss_sums,
+                fidelity_sums=global_offset_fidelity_sums,
+                weight_sums=global_offset_weight_sums,
+                counts=global_offset_counts,
             )
             adaptive_epoch_summaries.append(adaptive_summary)
             history.epochs.append(epoch)
@@ -847,7 +940,7 @@ def train_model(
 
             if epoch_objective > best_objective + best_metric_delta:
                 best_objective = epoch_objective
-                best_state = copy.deepcopy(model.state_dict())
+                best_state = _model_state_dict(model)
                 selection_trace = ModelSelectionTrace(
                     criterion=f"maximize test_multistep mean_fidelity @ H={eval_horizon}"
                     if validation_states is not None
@@ -866,10 +959,10 @@ def train_model(
                     teacher_forced_weight=0.0,
                 )
                 early_stop_counter = 0
-                if config.SAVE_MODEL:
+                if config.SAVE_MODEL and _is_main_process():
                     config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
                     _safe_atomic_torch_save(
-                        model.state_dict(),
+                        _model_state_dict(model),
                         config.CHECKPOINT_PATH,
                         label="best model checkpoint",
                     )
@@ -877,7 +970,7 @@ def train_model(
                 early_stop_counter += 1
 
             log_every = max(1, min(10, config.EPOCHS // 20 if config.EPOCHS > 20 else 1))
-            if epoch <= 3 or epoch == config.EPOCHS or epoch % log_every == 0:
+            if _is_main_process() and (epoch <= 3 or epoch == config.EPOCHS or epoch % log_every == 0):
                 phase_label = "teacher-forced" if phase == "teacher_forced" else "hybrid-50/50"
                 if teacher_metric is not None and multistep_metric is not None:
                     print(
@@ -907,10 +1000,11 @@ def train_model(
             ):
                 current_horizon += 1
                 plateau_epochs = 0
-                print(
+                if _is_main_process():
+                    print(
                     f"  Curriculum H: aumento orizzonte a {current_horizon} "
                     f"(plateau teacher-forced sul validation split)."
-                )
+                    )
 
             if epoch % config.CHECKPOINT_EVERY_EPOCH == 0:
                 _save_last_checkpoint(
@@ -927,17 +1021,19 @@ def train_model(
                 and epoch >= int(config.EARLY_STOPPING_MIN_EPOCHS)
                 and early_stop_counter >= int(config.EARLY_STOPPING_PATIENCE)
             ):
-                print(
-                    "Early stopping: nessun miglioramento della metrica "
-                    "`test_multistep` entro la patience configurata."
-                )
+                if _is_main_process():
+                    print(
+                        "Early stopping: nessun miglioramento della metrica "
+                        "`test_multistep` entro la patience configurata."
+                    )
                 break
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
     except KeyboardInterrupt:
         interrupted = True
-        print("\nInterruzione manuale rilevata (Ctrl+C): salvo checkpoint e genero i risultati correnti...")
+        if _is_main_process():
+            print("\nInterruzione manuale rilevata (Ctrl+C): salvo checkpoint e genero i risultati correnti...")
         _save_last_checkpoint(
             model=model,
             optimizer=optimizer,
@@ -949,12 +1045,12 @@ def train_model(
         )
 
     if best_state is not None:
-        model.load_state_dict(best_state)
+        _load_model_state_dict(model, best_state)
 
-    if config.SAVE_MODEL:
+    if config.SAVE_MODEL and _is_main_process():
         config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
         _safe_atomic_torch_save(
-            model.state_dict(),
+            _model_state_dict(model),
             config.CHECKPOINT_PATH,
             label="final best model checkpoint",
         )
@@ -976,6 +1072,8 @@ def train_model(
         final_teacher_steps=int(_effective_multistep_teacher_steps(int(current_horizon))),
         epoch_summaries=adaptive_epoch_summaries,
     )
+    if _dist_is_initialized():
+        dist.barrier()
     return history, adaptive_trace, selection_trace
 
 
@@ -987,7 +1085,7 @@ def evaluate_teacher_forced(
 ) -> EvaluationResult:
     model.eval()
     criterion = NegativeLogFidelityLoss()
-    loader = build_loader(states, params, shuffle=False)
+    loader, _ = build_loader(states, params, shuffle=False)
 
     total_loss = 0.0
     total_fidelity = 0.0
@@ -1027,7 +1125,7 @@ def evaluate_multistep(
     model.eval()
     pred_steps = int(states.shape[1]) - 1
     horizon = max(1, min(int(config.MULTISTEP_H if horizon_limit is None else horizon_limit), pred_steps))
-    loader = build_loader(states, params, shuffle=False)
+    loader, _ = build_loader(states, params, shuffle=False)
 
     loss_sum = torch.zeros(pred_steps, dtype=torch.float64)
     fidelity_sum = torch.zeros(pred_steps, dtype=torch.float64)
@@ -1127,7 +1225,7 @@ def evaluate_autoregressive(
 
     model.eval()
     pred_steps = states.shape[1] - 1
-    loader = build_loader(states, params, shuffle=False)
+    loader, _ = build_loader(states, params, shuffle=False)
 
     loss_sum = torch.zeros(pred_steps, dtype=torch.float64)
     fidelity_sum = torch.zeros(pred_steps, dtype=torch.float64)
@@ -1305,7 +1403,7 @@ def compute_entanglement_curves(
     exact_sum = torch.zeros(num_states, dtype=torch.float64)
     teacher_sum = torch.zeros(num_states, dtype=torch.float64)
     rollout_sum = torch.zeros(num_states, dtype=torch.float64)
-    loader = build_loader(states, params, shuffle=False)
+    loader, _ = build_loader(states, params, shuffle=False)
     total = 0
 
     for inputs, targets, batch_params in loader:
@@ -1390,7 +1488,7 @@ def compute_per_h_observable_curves(
             "count": torch.zeros(num_states, dtype=torch.float64),
         }
 
-    loader = build_loader(states, params, shuffle=False)
+    loader, _ = build_loader(states, params, shuffle=False)
     for inputs, targets, batch_params in loader:
         true_states = torch.cat([inputs[:, :1, :], targets], dim=1).to(device)
         batch_params = batch_params.to(device)
@@ -1523,7 +1621,7 @@ def compute_observable_curves(
     rollout_cz = torch.zeros(num_states, dtype=torch.float64, device=device)
     rollout_counts = torch.zeros(num_states, dtype=torch.float64, device=device)
 
-    loader = build_loader(states, params, shuffle=False)
+    loader, _ = build_loader(states, params, shuffle=False)
 
     for inputs, targets, batch_params in loader:
         true_states = torch.cat([inputs[:, :1, :], targets], dim=1).to(device)

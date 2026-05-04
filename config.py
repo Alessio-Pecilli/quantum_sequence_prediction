@@ -394,6 +394,11 @@ if ENTANGLEMENT_RANDOM_CUTS < 1:
 
 NUM_WORKERS = _env_int("QSP_NUM_WORKERS", 0)
 PIN_MEMORY = _env_bool("QSP_PIN_MEMORY", False)
+HPC_DISTRIBUTED = _env_bool("QSP_HPC_DISTRIBUTED", False)
+HPC_DISTRIBUTED_BACKEND = _env_str("QSP_HPC_DISTRIBUTED_BACKEND", "auto")
+HPC_DISTRIBUTED_DATASET = _env_bool("QSP_HPC_DISTRIBUTED_DATASET", True)
+HPC_DISTRIBUTED_TRAINING = _env_bool("QSP_HPC_DISTRIBUTED_TRAINING", True)
+HPC_DIST_SEED_STRIDE = _env_int("QSP_HPC_DIST_SEED_STRIDE", 1_000_003)
 SAVE_MODEL = _env_bool("QSP_SAVE_MODEL", True)
 # Se attivo, salta il training e ricalcola metriche/plot da best_model.pt.
 EVAL_ONLY = _env_bool("QSP_EVAL_ONLY", False)
