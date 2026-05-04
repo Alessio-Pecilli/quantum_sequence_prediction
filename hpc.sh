@@ -54,7 +54,15 @@ export QSP_EPOCHS="${QSP_EPOCHS:-5}"
 export QSP_TRAIN_SEQUENCES="${QSP_TRAIN_SEQUENCES:-256}"
 export QSP_TEST_SEQUENCES="${QSP_TEST_SEQUENCES:-64}"
 
-cd "$(dirname "$0")"
+# Under sbatch, $0 points to a temporary copy in /var/spool/slurmd/... .
+# SLURM_SUBMIT_DIR preserves the directory from which the job was submitted.
+PROJECT_DIR="${SLURM_SUBMIT_DIR:-$(pwd)}"
+cd "${PROJECT_DIR}"
+
+if [[ ! -f "main_hpc.py" ]]; then
+  echo "ERROR: main_hpc.py non trovato in ${PROJECT_DIR}" >&2
+  exit 1
+fi
 
 # Infer processes from visible GPUs unless explicitly set.
 if [[ -n "${NPROC_PER_NODE:-}" ]]; then
@@ -72,6 +80,7 @@ else
   PROC_PER_NODE=1
 fi
 
+echo "Working directory: ${PROJECT_DIR}"
 echo "Launching torchrun with nproc_per_node=${PROC_PER_NODE}"
 echo "Config: qubits=${QSP_N_QUBITS} num_states=${QSP_NUM_STATES} H=${QSP_MULTISTEP_H} train=${QSP_TRAIN_SEQUENCES} test=${QSP_TEST_SEQUENCES} epochs=${QSP_EPOCHS} batch=${QSP_BATCH_SIZE}"
 
