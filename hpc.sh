@@ -9,7 +9,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:4
-#SBATCH --time=02:00:00
+#SBATCH --time=03:00:00
 
 set -euo pipefail
 
@@ -50,7 +50,8 @@ export QSP_PIN_MEMORY="${QSP_PIN_MEMORY:-1}"
 
 # 4 Hamiltoniane x 200 traiettorie train = 800 train totali.
 export QSP_BATCH_SIZE="${QSP_BATCH_SIZE:-32}"
-export QSP_EPOCHS="${QSP_EPOCHS:-5}"
+export QSP_EPOCHS="${QSP_EPOCHS:-100}"
+export QSP_HYBRID_TEACHER_FORCING_EPOCHS="${QSP_HYBRID_TEACHER_FORCING_EPOCHS:-20}"
 export QSP_TRAIN_SEQUENCES="${QSP_TRAIN_SEQUENCES:-800}"
 export QSP_TEST_SEQUENCES="${QSP_TEST_SEQUENCES:-200}"
 
