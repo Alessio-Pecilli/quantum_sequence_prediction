@@ -7,9 +7,9 @@
 #SBATCH --account=iscrc_qusala
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=4
-#SBATCH --gres=gpu:1
-#SBATCH --time=00:30:00
+#SBATCH --cpus-per-task=8
+#SBATCH --gres=gpu:4
+#SBATCH --time=02:00:00
 
 set -euo pipefail
 
@@ -34,7 +34,7 @@ export QSP_HPC_DISTRIBUTED_DATASET=1
 export QSP_HPC_DISTRIBUTED_TRAINING=1
 export QSP_HPC_DISTRIBUTED_BACKEND="${QSP_HPC_DISTRIBUTED_BACKEND:-auto}"
 
-# Safe first-run defaults for the 4-qubit H=100 setup.
+# 100 evoluzioni per traiettoria: 101 stati totali -> 100 predizioni.
 export QSP_N_QUBITS="${QSP_N_QUBITS:-4}"
 export QSP_NUM_STATES="${QSP_NUM_STATES:-101}"
 export QSP_MULTISTEP_H="${QSP_MULTISTEP_H:-100}"
@@ -48,11 +48,11 @@ else
 fi
 export QSP_PIN_MEMORY="${QSP_PIN_MEMORY:-1}"
 
-# Conservative defaults for the first submission; override from shell if needed.
+# 4 Hamiltoniane x 200 traiettorie train = 800 train totali.
 export QSP_BATCH_SIZE="${QSP_BATCH_SIZE:-32}"
 export QSP_EPOCHS="${QSP_EPOCHS:-5}"
-export QSP_TRAIN_SEQUENCES="${QSP_TRAIN_SEQUENCES:-256}"
-export QSP_TEST_SEQUENCES="${QSP_TEST_SEQUENCES:-64}"
+export QSP_TRAIN_SEQUENCES="${QSP_TRAIN_SEQUENCES:-800}"
+export QSP_TEST_SEQUENCES="${QSP_TEST_SEQUENCES:-200}"
 
 # Under sbatch, $0 points to a temporary copy in /var/spool/slurmd/... .
 # SLURM_SUBMIT_DIR preserves the directory from which the job was submitted.
