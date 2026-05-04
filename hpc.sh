@@ -64,6 +64,8 @@ if [[ ! -f "main_hpc.py" ]]; then
   exit 1
 fi
 
+MAIN_SCRIPT="${PROJECT_DIR}/main_hpc.py"
+
 # Infer processes from visible GPUs unless explicitly set.
 if [[ -n "${NPROC_PER_NODE:-}" ]]; then
   PROC_PER_NODE="${NPROC_PER_NODE}"
@@ -83,7 +85,8 @@ fi
 echo "Working directory: ${PROJECT_DIR}"
 echo "Launching torchrun with nproc_per_node=${PROC_PER_NODE}"
 echo "Config: qubits=${QSP_N_QUBITS} num_states=${QSP_NUM_STATES} H=${QSP_MULTISTEP_H} train=${QSP_TRAIN_SEQUENCES} test=${QSP_TEST_SEQUENCES} epochs=${QSP_EPOCHS} batch=${QSP_BATCH_SIZE}"
+echo "Main script: ${MAIN_SCRIPT}"
 
-torchrun --standalone --nproc_per_node="${PROC_PER_NODE}" main_hpc.py
+torchrun --standalone --nproc_per_node="${PROC_PER_NODE}" "${MAIN_SCRIPT}"
 
 echo "=== JOB ${SLURM_JOB_ID:-local} FINISHED at $(date) ==="
