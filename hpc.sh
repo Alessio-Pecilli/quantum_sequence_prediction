@@ -2,17 +2,25 @@
 #SBATCH --job-name=qsp_hpc
 #SBATCH --output=logs/qsp_%j.out
 #SBATCH --error=logs/qsp_%j.err
+#SBATCH --partition=boost_usr_prod
+#SBATCH --qos=boost_qos_lprod
+#SBATCH --account=iscrc_qusala
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=8
-#SBATCH --gres=gpu:4
-#SBATCH --time=24:00:00
+#SBATCH --cpus-per-task=4
+#SBATCH --gres=gpu:1
+#SBATCH --time=00:30:00
 
 set -euo pipefail
 
 mkdir -p logs
 
 echo "=== JOB ${SLURM_JOB_ID:-local} STARTED at $(date) on $(hostname) ==="
+
+module purge
+module load python/3.11.7
+
+source /leonardo_work/IscrC_QuSALa/venv_py311/bin/activate
 
 # Threading controls: avoid CPU oversubscription on HPC.
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
@@ -26,6 +34,12 @@ export QSP_HPC_DISTRIBUTED_DATASET=1
 export QSP_HPC_DISTRIBUTED_TRAINING=1
 export QSP_HPC_DISTRIBUTED_BACKEND="${QSP_HPC_DISTRIBUTED_BACKEND:-auto}"
 
+# Safe first-run defaults for the 4-qubit H=100 setup.
+export QSP_N_QUBITS="${QSP_N_QUBITS:-4}"
+export QSP_NUM_STATES="${QSP_NUM_STATES:-101}"
+export QSP_MULTISTEP_H="${QSP_MULTISTEP_H:-100}"
+export QSP_MULTISTEP_H_MAX="${QSP_MULTISTEP_H_MAX:-100}"
+
 # Tune dataloader workers from allocated CPU cores.
 if [[ -n "${SLURM_CPUS_PER_TASK:-}" ]]; then
   export QSP_NUM_WORKERS="${QSP_NUM_WORKERS:-$(( SLURM_CPUS_PER_TASK > 2 ? SLURM_CPUS_PER_TASK - 2 : 0 ))}"
@@ -34,12 +48,11 @@ else
 fi
 export QSP_PIN_MEMORY="${QSP_PIN_MEMORY:-1}"
 
-# Optional training overrides (examples).
-# export QSP_BATCH_SIZE=256
-# export QSP_EPOCHS=200
-
-# Activate your environment here if needed:
-# source /path/to/venv/bin/activate
+# Conservative defaults for the first submission; override from shell if needed.
+export QSP_BATCH_SIZE="${QSP_BATCH_SIZE:-32}"
+export QSP_EPOCHS="${QSP_EPOCHS:-5}"
+export QSP_TRAIN_SEQUENCES="${QSP_TRAIN_SEQUENCES:-256}"
+export QSP_TEST_SEQUENCES="${QSP_TEST_SEQUENCES:-64}"
 
 cd "$(dirname "$0")"
 
@@ -60,6 +73,7 @@ else
 fi
 
 echo "Launching torchrun with nproc_per_node=${PROC_PER_NODE}"
+echo "Config: qubits=${QSP_N_QUBITS} num_states=${QSP_NUM_STATES} H=${QSP_MULTISTEP_H} train=${QSP_TRAIN_SEQUENCES} test=${QSP_TEST_SEQUENCES} epochs=${QSP_EPOCHS} batch=${QSP_BATCH_SIZE}"
 
 torchrun --standalone --nproc_per_node="${PROC_PER_NODE}" main_hpc.py
 
