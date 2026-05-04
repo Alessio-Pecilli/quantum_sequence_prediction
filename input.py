@@ -7,12 +7,14 @@ import torch
 from torch.utils.data import Dataset
 
 import config
+import generate_dataset as hgen
 
 
 I = torch.eye(2, dtype=torch.complex64)
 X = torch.tensor([[0, 1], [1, 0]], dtype=torch.complex64)
 Y = torch.tensor([[0, -1j], [1j, 0]], dtype=torch.complex64)
 Z = torch.tensor([[1, 0], [0, -1]], dtype=torch.complex64)
+PARAM_VECTOR_DIM = 6
 
 @dataclass
 class HamiltonianData:
@@ -60,8 +62,10 @@ class QuantumSequenceDataset(Dataset):
             raise ValueError(f"states deve avere shape (batch, num_states, dim), ricevuto {tuple(states.shape)}")
         if states.shape[1] < 2:
             raise ValueError("Ogni traiettoria deve contenere almeno 2 stati.")
-        if params.ndim != 2 or params.shape[1] != 2:
-            raise ValueError(f"params deve avere shape (batch, 2), ricevuto {tuple(params.shape)}")
+        if params.ndim != 2 or params.shape[1] != PARAM_VECTOR_DIM:
+            raise ValueError(
+                f"params deve avere shape (batch, {PARAM_VECTOR_DIM}), ricevuto {tuple(params.shape)}"
+            )
         if params.shape[0] != states.shape[0]:
             raise ValueError(
                 "states e params devono avere lo stesso numero di traiettorie: "
@@ -91,15 +95,15 @@ def build_uniform_couplings(
 
 
 def sample_haar_random_states(
-    num_states: int,
+    num_samples: int,
     dim: int,
     seed: int,
     dtype: torch.dtype = torch.complex64,
 ) -> torch.Tensor:
     generator = torch.Generator(device="cpu")
     generator.manual_seed(seed)
-    real = torch.randn((num_states, dim), generator=generator, dtype=torch.float32)
-    imag = torch.randn((num_states, dim), generator=generator, dtype=torch.float32)
+    real = torch.randn((num_samples, dim), generator=generator, dtype=torch.float32)
+    imag = torch.randn((num_samples, dim), generator=generator, dtype=torch.float32)
     states = torch.complex(real, imag)
     # Gaussiani complessi iid + normalizzazione L2 batch-wise -> campionamento Haar.
     norms = torch.linalg.vector_norm(states, dim=-1, keepdim=True).clamp(min=1e-8)
@@ -367,8 +371,10 @@ def evolve_haar_tfim_sequences_with_params(
     time_step: float = config.TIME_STEP,
     device: str | torch.device = config.DEVICE,
 ) -> tuple[torch.Tensor, str]:
-    if params.ndim != 2 or params.shape[1] != 2:
-        raise ValueError(f"params deve avere shape (batch, 2), ricevuto {tuple(params.shape)}")
+    if params.ndim != 2 or params.shape[1] != PARAM_VECTOR_DIM:
+        raise ValueError(
+            f"params deve avere shape (batch, {PARAM_VECTOR_DIM}), ricevuto {tuple(params.shape)}"
+        )
     if initial_states.shape[0] != params.shape[0]:
         raise ValueError(
             "initial_states e params devono avere lo stesso batch size: "
@@ -378,8 +384,8 @@ def evolve_haar_tfim_sequences_with_params(
     trajectories = []
     backend_name = "per_trajectory_exact_diag"
     for initial_state, trajectory_params in zip(initial_states, params):
-        coupling_j = float(trajectory_params[0].item())
-        field_h = float(trajectory_params[1].item())
+        coupling_j = float(trajectory_params[1].item())
+        field_h = float(trajectory_params[2].item())
         couplings = build_uniform_couplings(n_qubits, coupling_strength=coupling_j)
         hamiltonian = build_tfim_hamiltonian(
             n_qubits=n_qubits,
@@ -448,7 +454,7 @@ def generate_fixed_tfim_dataset(
     num_states: int = config.NUM_STATES,
     seed: int = config.SEED,
 ) -> QuantumDatasetBundle:
-    if config.DATASET_SOURCE == "haar_tfim":
+    if config.DATASET_SOURCE in {"haar_tfim", "haar_multi_hamiltonian"}:
         return generate_haar_tfim_dataset(
             train_sequences=train_sequences,
             test_sequences=test_sequences,
@@ -477,7 +483,7 @@ def generate_fixed_tfim_dataset(
     train_split = DatasetSplit(
         states=all_states[:train_sequences],
         params=torch.tensor(
-            [float(config.COUPLING_MEAN), float(config.FIELD_STRENGTH)],
+            [0.0, float(config.COUPLING_MEAN), float(config.FIELD_STRENGTH), 0.0, 0.0, 0.0],
             dtype=torch.float32,
         ).repeat(train_sequences, 1),
         initial_state_codes=initial_state_codes[:train_sequences],
@@ -487,7 +493,7 @@ def generate_fixed_tfim_dataset(
     test_split = DatasetSplit(
         states=all_states[train_sequences:],
         params=torch.tensor(
-            [float(config.COUPLING_MEAN), float(config.FIELD_STRENGTH)],
+            [0.0, float(config.COUPLING_MEAN), float(config.FIELD_STRENGTH), 0.0, 0.0, 0.0],
             dtype=torch.float32,
         ).repeat(test_sequences, 1),
         initial_state_codes=initial_state_codes[train_sequences:],
@@ -533,28 +539,50 @@ def generate_haar_tfim_dataset(
     num_states: int = config.NUM_STATES,
     seed: int = config.SEED,
 ) -> QuantumDatasetBundle:
+    if int(n_qubits) != 4:
+        raise ValueError("Il setup multi-H richiesto e' definito per 4 qubit.")
+    if int(num_states) < 2:
+        raise ValueError("Il setup richiesto usa almeno 2 stati per traiettoria.")
+
     total_sequences = int(train_sequences) + int(test_sequences)
     dim = 2 ** int(n_qubits)
-    params = sample_tfim_params(total_sequences, seed + 31)
+    rng = random.Random(seed + 31)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed + 23)
 
-    initial_states = sample_haar_random_states(
-        num_states=total_sequences,
-        dim=dim,
-        seed=seed + 23,
-        dtype=torch.complex64,
-    )
-    all_states, backend = evolve_haar_tfim_sequences_with_params(
-        initial_states=initial_states,
-        params=params,
-        num_states=num_states,
-        n_qubits=n_qubits,
-        time_step=config.TIME_STEP,
-    )
+    trajectories: list[torch.Tensor] = []
+    params_list: list[torch.Tensor] = []
+    class_counts = {0: 0, 1: 0, 2: 0, 3: 0}
+    for _ in range(total_sequences):
+        initial_state = sample_haar_random_states(
+            num_samples=1,
+            dim=dim,
+            seed=int(torch.randint(0, 10_000_000, (1,), generator=generator).item()),
+            dtype=torch.complex64,
+        )[0]
+        h_id, hamiltonian, params = hgen.sample_hamiltonian_instance(int(n_qubits), rng)
+        unitary = torch.linalg.matrix_exp((-1j * float(config.TIME_STEP)) * hamiltonian)
+        trajectory = torch.empty((num_states, dim), dtype=torch.complex64)
+        current = initial_state
+        trajectory[0] = current
+        for step in range(1, num_states):
+            current = unitary @ current
+            current = current / torch.linalg.vector_norm(current).clamp(min=1e-8)
+            trajectory[step] = current
+        trajectories.append(trajectory)
+        params_list.append(params.to(torch.float32))
+        class_counts[h_id] += 1
+
+    all_states = torch.stack(trajectories, dim=0).contiguous()
+    params = torch.stack(params_list, dim=0).to(torch.float32).contiguous()
     initial_state_codes = list(range(total_sequences))
     reason = (
         "stati iniziali Haar random da gaussiane complesse normalizzate; "
-        "TFIM condizionato con parametri per-traiettoria campionati uniformemente "
-        f"in [0.2, 2.0] per J e h; dt={float(config.TIME_STEP):.6g}"
+        "4 classi Hamiltoniane con campionamento per traiettoria "
+        "(TFIM, XXZ, Fermi-Hubbard, Max-3-SAT), "
+        "params=[H_ID,p1,p2,0,0,0], "
+        f"n_qubits={int(n_qubits)}, num_states={int(num_states)}, "
+        f"dt={float(config.TIME_STEP):.6g}, class_counts={class_counts}"
     )
 
     train_split = DatasetSplit(
@@ -578,7 +606,7 @@ def generate_haar_tfim_dataset(
         hamiltonian=HamiltonianData(
             couplings=[],
             field_strength=float("nan"),
-            backend=backend,
+            backend="per_trajectory_matrix_exp",
             hamiltonian=torch.empty((0, 0), dtype=torch.complex64),
             evolution_operator=torch.empty((0, 0), dtype=torch.complex64),
         ),

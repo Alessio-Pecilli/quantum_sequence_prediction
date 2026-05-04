@@ -19,6 +19,8 @@ from input import QuantumSequenceDataset
 from observables import batch_observables_tfim, precompute_observables
 from predictor import NegativeLogFidelityLoss, QuantumSequencePredictor, quantum_fidelity
 
+H_LABELS = {0: "TFIM", 1: "XXZ", 2: "Fermi-Hubbard", 3: "Max-3-SAT"}
+
 
 @dataclass
 class TrainingHistory:
@@ -33,6 +35,8 @@ class EvaluationResult:
     mean_fidelity: float
     fidelity_curve: list[float]
     coverage_curve: list[float]
+    per_hamiltonian_curves: dict[str, list[float]] | None = None
+    per_hamiltonian_final_fidelity: dict[str, float] | None = None
 
 
 @dataclass
@@ -1028,11 +1032,14 @@ def evaluate_multistep(
     loss_sum = torch.zeros(pred_steps, dtype=torch.float64)
     fidelity_sum = torch.zeros(pred_steps, dtype=torch.float64)
     counts = torch.zeros(pred_steps, dtype=torch.float64)
+    class_fidelity_sum = {h_id: torch.zeros(pred_steps, dtype=torch.float64) for h_id in H_LABELS}
+    class_counts = {h_id: torch.zeros(pred_steps, dtype=torch.float64) for h_id in H_LABELS}
 
     for inputs, targets, batch_params in loader:
         inputs = inputs.to(config.DEVICE)
         targets = targets.to(config.DEVICE)
         batch_params = batch_params.to(config.DEVICE)
+        batch_h_ids = batch_params[:, 0].round().to(torch.int64).cpu()
 
         for t_start in range(1, pred_steps + 1):
             current_h = min(horizon, pred_steps - (t_start - 1))
@@ -1050,6 +1057,13 @@ def evaluate_multistep(
                     -torch.log(step_fidelity.clamp(min=config.LOG_FIDELITY_EPS))
                 ).sum()
                 counts[curve_index] += float(step_fidelity.shape[0])
+                for h_id in H_LABELS:
+                    mask = batch_h_ids == int(h_id)
+                    if not torch.any(mask):
+                        continue
+                    selected = step_fidelity[mask]
+                    class_fidelity_sum[h_id][curve_index] += selected.sum()
+                    class_counts[h_id][curve_index] += float(selected.shape[0])
 
                 if step_idx + 1 >= current_h:
                     continue
@@ -1074,11 +1088,26 @@ def evaluate_multistep(
         mean_loss = float("nan")
         mean_fidelity = float("nan")
 
+    per_curves: dict[str, list[float]] = {}
+    per_final: dict[str, float] = {}
+    for h_id, label in H_LABELS.items():
+        curve: list[float] = []
+        for index in range(pred_steps):
+            if class_counts[h_id][index] <= 0:
+                curve.append(float("nan"))
+            else:
+                curve.append(float(class_fidelity_sum[h_id][index] / class_counts[h_id][index]))
+        per_curves[label] = curve
+        finite = [v for v in curve if np.isfinite(v)]
+        per_final[label] = float(finite[-1] if finite else float("nan"))
+
     return EvaluationResult(
         loss=mean_loss,
         mean_fidelity=mean_fidelity,
         fidelity_curve=fidelity_curve,
         coverage_curve=coverage_curve,
+        per_hamiltonian_curves=per_curves,
+        per_hamiltonian_final_fidelity=per_final,
     )
 
 
@@ -1103,11 +1132,14 @@ def evaluate_autoregressive(
     loss_sum = torch.zeros(pred_steps, dtype=torch.float64)
     fidelity_sum = torch.zeros(pred_steps, dtype=torch.float64)
     counts = torch.zeros(pred_steps, dtype=torch.float64)
+    class_fidelity_sum = {h_id: torch.zeros(pred_steps, dtype=torch.float64) for h_id in H_LABELS}
+    class_counts = {h_id: torch.zeros(pred_steps, dtype=torch.float64) for h_id in H_LABELS}
 
     for inputs, targets, batch_params in loader:
         true_states = torch.cat([inputs[:, :1, :], targets], dim=1).to(config.DEVICE)
         batch_params = batch_params.to(config.DEVICE)
         context = true_states[:, :warmup_states, :]
+        batch_h_ids = batch_params[:, 0].round().to(torch.int64).cpu()
 
         for target_index in range(warmup_states, true_states.shape[1]):
             predicted_next = model(context, batch_params)[:, -1, :]
@@ -1116,6 +1148,13 @@ def evaluate_autoregressive(
             fidelity_sum[curve_index] += fidelity.sum()
             loss_sum[curve_index] += (-torch.log(fidelity.clamp(min=config.LOG_FIDELITY_EPS))).sum()
             counts[curve_index] += float(fidelity.shape[0])
+            for h_id in H_LABELS:
+                mask = batch_h_ids == int(h_id)
+                if not torch.any(mask):
+                    continue
+                selected = fidelity[mask]
+                class_fidelity_sum[h_id][curve_index] += selected.sum()
+                class_counts[h_id][curve_index] += float(selected.shape[0])
             context = torch.cat([context, predicted_next.unsqueeze(1)], dim=1)
 
     fidelity_curve: list[float] = []
@@ -1136,11 +1175,26 @@ def evaluate_autoregressive(
         mean_loss = float("nan")
         mean_fidelity = float("nan")
 
+    per_curves: dict[str, list[float]] = {}
+    per_final: dict[str, float] = {}
+    for h_id, label in H_LABELS.items():
+        curve: list[float] = []
+        for index in range(pred_steps):
+            if class_counts[h_id][index] <= 0:
+                curve.append(float("nan"))
+            else:
+                curve.append(float(class_fidelity_sum[h_id][index] / class_counts[h_id][index]))
+        per_curves[label] = curve
+        finite = [v for v in curve if np.isfinite(v)]
+        per_final[label] = float(finite[-1] if finite else float("nan"))
+
     return EvaluationResult(
         loss=mean_loss,
         mean_fidelity=mean_fidelity,
         fidelity_curve=fidelity_curve,
         coverage_curve=coverage_curve,
+        per_hamiltonian_curves=per_curves,
+        per_hamiltonian_final_fidelity=per_final,
     )
 
 
@@ -1168,6 +1222,264 @@ def _average_observable_curve(
     valid = counts > 0
     averaged[valid] = totals[valid] / counts[valid]
     return averaged.cpu().numpy()
+
+
+def plot_fidelity_global_and_per_h(
+    multistep: EvaluationResult,
+    rollout: EvaluationResult,
+    output_path,
+):
+    time_axis = np.arange(1, len(multistep.fidelity_curve) + 1, dtype=np.float64) * float(config.TIME_STEP)
+    fig, axes = plt.subplots(3, 2, figsize=(13.5, 10.5), sharey=True)
+    flat = axes.flatten()
+
+    flat[0].plot(time_axis, multistep.fidelity_curve, color="#117a65", linewidth=2.2, label="Multistep")
+    flat[0].plot(time_axis, rollout.fidelity_curve, color="#b03a2e", linewidth=2.2, label="Rollout")
+    flat[0].set_title("Globale")
+    flat[0].set_ylabel("Fidelity")
+    flat[0].set_ylim(0.0, 1.02)
+    flat[0].grid(alpha=0.25)
+    flat[0].legend(frameon=False)
+
+    for idx, label in enumerate(["TFIM", "XXZ", "Fermi-Hubbard", "Max-3-SAT"], start=1):
+        ms_curve = (multistep.per_hamiltonian_curves or {}).get(label, [])
+        ro_curve = (rollout.per_hamiltonian_curves or {}).get(label, [])
+        flat[idx].plot(time_axis, ms_curve, color="#117a65", linewidth=2.1, label="Multistep")
+        flat[idx].plot(time_axis, ro_curve, color="#b03a2e", linewidth=2.1, linestyle="--", label="Rollout")
+        flat[idx].set_title(label)
+        flat[idx].set_ylim(0.0, 1.02)
+        flat[idx].grid(alpha=0.25)
+        flat[idx].legend(frameon=False, fontsize=8)
+
+    flat[4].set_xlabel(r"Tempo $t = k\,\Delta t$")
+    flat[5].set_xlabel(r"Tempo $t = k\,\Delta t$")
+    flat[2].set_ylabel("Fidelity")
+    flat[4].set_ylabel("Fidelity")
+    fig.suptitle("Fidelity globale e per Hamiltoniana", fontsize=14)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=config.PLOT_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _random_cuts(n_qubits: int, num_cuts: int, seed: int) -> list[list[int]]:
+    rng = random.Random(seed)
+    cuts: list[list[int]] = []
+    while len(cuts) < num_cuts:
+        cut_size = rng.randint(1, n_qubits - 1)
+        subset = sorted(rng.sample(range(n_qubits), cut_size))
+        if subset not in cuts:
+            cuts.append(subset)
+    return cuts
+
+
+def _entropy_for_cut_batch(states: torch.Tensor, cut_a: list[int], n_qubits: int) -> torch.Tensor:
+    remaining = [q for q in range(n_qubits) if q not in cut_a]
+    perm = cut_a + remaining
+    inv_perm = torch.tensor(perm, device=states.device)
+    batch = states.shape[0]
+    dims = [2] * n_qubits
+    tensor = states.reshape(batch, *dims)
+    tensor = tensor.permute(0, *(inv_perm + 1).tolist()).contiguous()
+    da = 2 ** len(cut_a)
+    db = 2 ** (n_qubits - len(cut_a))
+    mat = tensor.reshape(batch, da, db)
+    svals = torch.linalg.svdvals(mat)
+    probs = (svals ** 2).clamp(min=1e-12)
+    entropy = -(probs * torch.log(probs)).sum(dim=-1)
+    return entropy.real.to(torch.float64)
+
+
+@torch.no_grad()
+def compute_entanglement_curves(
+    model: QuantumSequencePredictor,
+    states: torch.Tensor,
+    params: torch.Tensor,
+    warmup_states: int = 1,
+    num_random_cuts: int = 8,
+    seed: int = 7,
+) -> dict[str, list[float]]:
+    model.eval()
+    n_qubits = int(config.N_QUBITS)
+    cuts = _random_cuts(n_qubits, int(num_random_cuts), int(seed))
+    num_states = int(states.shape[1])
+    exact_sum = torch.zeros(num_states, dtype=torch.float64)
+    teacher_sum = torch.zeros(num_states, dtype=torch.float64)
+    rollout_sum = torch.zeros(num_states, dtype=torch.float64)
+    loader = build_loader(states, params, shuffle=False)
+    total = 0
+
+    for inputs, targets, batch_params in loader:
+        true_states = torch.cat([inputs[:, :1, :], targets], dim=1).to(config.DEVICE)
+        batch_params = batch_params.to(config.DEVICE)
+        batch = int(true_states.shape[0])
+        total += batch
+
+        teacher_states = [true_states[:, 0, :]]
+        for target_index in range(1, num_states):
+            pred = model(true_states[:, :target_index, :], batch_params)[:, -1, :]
+            teacher_states.append(pred)
+        teacher_tensor = torch.stack(teacher_states, dim=1)
+
+        context = true_states[:, :warmup_states, :]
+        rollout_states = [true_states[:, t, :] for t in range(warmup_states)]
+        for target_index in range(warmup_states, num_states):
+            pred = model(context, batch_params)[:, -1, :]
+            rollout_states.append(pred)
+            context = torch.cat([context, pred.unsqueeze(1)], dim=1)
+        rollout_tensor = torch.stack(rollout_states, dim=1)
+
+        for t in range(num_states):
+            exact_acc = torch.zeros(batch, dtype=torch.float64, device=true_states.device)
+            teacher_acc = torch.zeros(batch, dtype=torch.float64, device=true_states.device)
+            rollout_acc = torch.zeros(batch, dtype=torch.float64, device=true_states.device)
+            for cut in cuts:
+                exact_acc += _entropy_for_cut_batch(true_states[:, t, :], cut, n_qubits).to(true_states.device)
+                teacher_acc += _entropy_for_cut_batch(teacher_tensor[:, t, :], cut, n_qubits).to(true_states.device)
+                rollout_acc += _entropy_for_cut_batch(rollout_tensor[:, t, :], cut, n_qubits).to(true_states.device)
+            exact_sum[t] += (exact_acc / len(cuts)).sum().cpu()
+            teacher_sum[t] += (teacher_acc / len(cuts)).sum().cpu()
+            rollout_sum[t] += (rollout_acc / len(cuts)).sum().cpu()
+
+    scale = max(1, total)
+    return {
+        "exact": (exact_sum / scale).tolist(),
+        "multistep": (teacher_sum / scale).tolist(),
+        "rollout": (rollout_sum / scale).tolist(),
+        "cuts": [",".join(str(q) for q in cut) for cut in cuts],
+    }
+
+
+def plot_entanglement_curves(curves: dict[str, list[float]], output_path):
+    t = np.arange(len(curves["exact"]), dtype=np.float64) * float(config.TIME_STEP)
+    fig, ax = plt.subplots(1, 1, figsize=(7.5, 4.8))
+    ax.plot(t, curves["exact"], color="#1f618d", linewidth=2.2, label="Esatto")
+    ax.plot(t, curves["multistep"], color="#117a65", linewidth=2.2, label="Multistep")
+    ax.plot(t, curves["rollout"], color="#b03a2e", linewidth=2.2, label="Rollout")
+    ax.set_xlabel(r"Tempo $t = k\,\Delta t$")
+    ax.set_ylabel("Entanglement entropy media (tagli random)")
+    ax.set_title("Entanglement vs Time")
+    ax.grid(alpha=0.25)
+    ax.legend(frameon=False)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=config.PLOT_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+@torch.no_grad()
+def compute_per_h_observable_curves(
+    model: QuantumSequencePredictor,
+    states: torch.Tensor,
+    params: torch.Tensor,
+    warmup_states: int = 1,
+) -> dict[str, dict[str, list[float]]]:
+    model.eval()
+    n_qubits = int(config.N_QUBITS)
+    device = torch.device(config.DEVICE)
+    z_eigs, zz_nn_eigs, zz_all_eigs, x_flip_idx = precompute_observables(n_qubits, device)
+    z_eigs = z_eigs.to(device)
+    zz_nn_eigs = zz_nn_eigs.to(device)
+    zz_all_eigs = zz_all_eigs.to(device)
+    x_flip_idx = [idx.to(device) for idx in x_flip_idx]
+    num_states = int(states.shape[1])
+
+    metrics: dict[int, dict[str, torch.Tensor]] = {}
+    for h_id in H_LABELS:
+        metrics[h_id] = {
+            "exact_sum": torch.zeros(num_states, dtype=torch.float64),
+            "pred_sum": torch.zeros(num_states, dtype=torch.float64),
+            "count": torch.zeros(num_states, dtype=torch.float64),
+        }
+
+    loader = build_loader(states, params, shuffle=False)
+    for inputs, targets, batch_params in loader:
+        true_states = torch.cat([inputs[:, :1, :], targets], dim=1).to(device)
+        batch_params = batch_params.to(device)
+        h_ids = batch_params[:, 0].round().to(torch.int64)
+        context = true_states[:, :warmup_states, :]
+        pred_states = [true_states[:, t, :] for t in range(warmup_states)]
+        for t in range(warmup_states, num_states):
+            pred_next = model(context, batch_params)[:, -1, :]
+            pred_states.append(pred_next)
+            context = torch.cat([context, pred_next.unsqueeze(1)], dim=1)
+        pred_tensor = torch.stack(pred_states, dim=1)
+
+        for h_id in H_LABELS:
+            mask = h_ids == int(h_id)
+            if not torch.any(mask):
+                continue
+            true_h = true_states[mask]
+            pred_h = pred_tensor[mask]
+            count = float(true_h.shape[0])
+            for t in range(num_states):
+                if h_id == 0:
+                    _, obs_true, _ = batch_observables_tfim(true_h[:, t, :], z_eigs, zz_nn_eigs, x_flip_idx)
+                    _, obs_pred, _ = batch_observables_tfim(pred_h[:, t, :], z_eigs, zz_nn_eigs, x_flip_idx)
+                elif h_id == 1:
+                    probs_t = torch.abs(true_h[:, t, :]) ** 2
+                    probs_p = torch.abs(pred_h[:, t, :]) ** 2
+                    obs_true = (probs_t @ zz_nn_eigs.T).mean(dim=1)
+                    obs_pred = (probs_p @ zz_nn_eigs.T).mean(dim=1)
+                elif h_id == 2:
+                    probs_t = torch.abs(true_h[:, t, :]) ** 2
+                    probs_p = torch.abs(pred_h[:, t, :]) ** 2
+                    n0 = (1.0 - z_eigs[0]) * 0.5
+                    n1 = (1.0 - z_eigs[1]) * 0.5
+                    n2 = (1.0 - z_eigs[2]) * 0.5
+                    n3 = (1.0 - z_eigs[3]) * 0.5
+                    n4 = (1.0 - z_eigs[4]) * 0.5
+                    n5 = (1.0 - z_eigs[5]) * 0.5
+                    d = torch.stack([n0 * n1, n2 * n3, n4 * n5], dim=0).mean(dim=0)
+                    obs_true = probs_t @ d
+                    obs_pred = probs_p @ d
+                else:
+                    probs_t = torch.abs(true_h[:, t, :]) ** 2
+                    probs_p = torch.abs(pred_h[:, t, :]) ** 2
+                    pair_sum_t = torch.zeros((probs_t.shape[0],), device=device)
+                    pair_sum_p = torch.zeros((probs_p.shape[0],), device=device)
+                    pair_count = 0
+                    for i in range(n_qubits):
+                        for j in range(i + 1, n_qubits):
+                            pair_sum_t += torch.sum(probs_t * zz_all_eigs[i, j], dim=1)
+                            pair_sum_p += torch.sum(probs_p * zz_all_eigs[i, j], dim=1)
+                            pair_count += 1
+                    obs_true = pair_sum_t / max(1, pair_count)
+                    obs_pred = pair_sum_p / max(1, pair_count)
+
+                metrics[h_id]["exact_sum"][t] += obs_true.double().sum().cpu()
+                metrics[h_id]["pred_sum"][t] += obs_pred.double().sum().cpu()
+                metrics[h_id]["count"][t] += count
+
+    output: dict[str, dict[str, list[float]]] = {}
+    for h_id, label in H_LABELS.items():
+        count = metrics[h_id]["count"].clamp(min=1.0)
+        output[label] = {
+            "exact": (metrics[h_id]["exact_sum"] / count).tolist(),
+            "pred": (metrics[h_id]["pred_sum"] / count).tolist(),
+        }
+    return output
+
+
+def plot_per_h_observables(curves: dict[str, dict[str, list[float]]], output_path):
+    t = None
+    fig, axes = plt.subplots(2, 2, figsize=(12.5, 8.0), sharex=True)
+    for ax, label in zip(axes.flatten(), ["TFIM", "XXZ", "Fermi-Hubbard", "Max-3-SAT"]):
+        exact = curves[label]["exact"]
+        pred = curves[label]["pred"]
+        if t is None:
+            t = np.arange(len(exact), dtype=np.float64) * float(config.TIME_STEP)
+        ax.plot(t, exact, color="#1f618d", linewidth=2.1, label="Esatto")
+        ax.plot(t, pred, color="#b03a2e", linewidth=2.1, linestyle="--", label="Predetto")
+        ax.set_title(label)
+        ax.grid(alpha=0.25)
+        ax.legend(frameon=False, fontsize=8)
+    axes[1, 0].set_xlabel(r"Tempo $t = k\,\Delta t$")
+    axes[1, 1].set_xlabel(r"Tempo $t = k\,\Delta t$")
+    axes[0, 0].set_ylabel("Osservabile")
+    axes[1, 0].set_ylabel("Osservabile")
+    fig.suptitle("Osservabile dedicata per Hamiltoniana", fontsize=13)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=config.PLOT_DPI, bbox_inches="tight")
+    plt.close(fig)
 
 
 @torch.no_grad()

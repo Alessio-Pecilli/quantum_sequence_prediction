@@ -22,12 +22,17 @@ from trainer import (
     ModelSelectionTrace,
     TrainingHistory,
     build_model,
+    compute_entanglement_curves,
+    compute_per_h_observable_curves,
     compute_observable_curves,
     evaluate_autoregressive,
     evaluate_multistep,
     evaluate_teacher_forced,
     exposure_bias_detected,
+    plot_entanglement_curves,
+    plot_fidelity_global_and_per_h,
     plot_observable_curves,
+    plot_per_h_observables,
     plot_training_curves,
     resolve_partial_warmup_steps,
     set_seed,
@@ -37,12 +42,23 @@ from trainer import (
 
 
 def _as_serializable(result) -> dict[str, object]:
-    return {
+    payload = {
         "loss": float(result.loss),
         "mean_fidelity": float(result.mean_fidelity),
         "fidelity_curve": [None if np.isnan(v) else float(v) for v in result.fidelity_curve],
         "coverage_curve": [float(v) for v in result.coverage_curve],
     }
+    if getattr(result, "per_hamiltonian_curves", None) is not None:
+        payload["per_hamiltonian_curves"] = {
+            key: [None if np.isnan(v) else float(v) for v in values]
+            for key, values in result.per_hamiltonian_curves.items()
+        }
+    if getattr(result, "per_hamiltonian_final_fidelity", None) is not None:
+        payload["per_hamiltonian_final_fidelity"] = {
+            key: (None if np.isnan(v) else float(v))
+            for key, v in result.per_hamiltonian_final_fidelity.items()
+        }
+    return payload
 
 
 def _history_as_serializable(history: TrainingHistory) -> dict[str, object]:
@@ -155,6 +171,19 @@ def _plot_split_curves(ax, title: str, multistep, autoregressive, partial_result
     ax.legend(frameon=False, fontsize=9)
 
 
+def _print_per_h_metrics(split_name: str, multistep, rollout):
+    per_ms = getattr(multistep, "per_hamiltonian_final_fidelity", None) or {}
+    per_ro = getattr(rollout, "per_hamiltonian_final_fidelity", None) or {}
+    if not per_ms and not per_ro:
+        return
+    print(f"\nFidelity finale per Hamiltoniana ({split_name})")
+    labels = sorted(set(per_ms) | set(per_ro))
+    for label in labels:
+        ms = per_ms.get(label, float("nan"))
+        ro = per_ro.get(label, float("nan"))
+        print(f"  {label:14s} | multistep={ms:.6f} | rollout={ro:.6f}")
+
+
 def main():
     set_seed(config.SEED)
     config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -259,8 +288,8 @@ def main():
     )
     test_rollout = evaluate_autoregressive(
         model,
-        dataset.train.states,
-        dataset.train.params,
+        dataset.test.states,
+        dataset.test.params,
         warmup_states=rollout_warmup,
     )
 
@@ -284,12 +313,19 @@ def main():
     else:
         print("\nNessun exposure bias marcato: mantengo solo metodo 1 e 2.")
 
+    plot_fidelity_global_and_per_h(
+        multistep=test_multistep,
+        rollout=test_rollout,
+        output_path=config.FIDELITY_PLOT_PATH,
+    )
+
     fig, axes = plt.subplots(1, 2, figsize=(15.5, 5.3), sharey=True)
     _plot_split_curves(axes[0], "Train Set", train_multistep, train_rollout, partial_results_train)
     _plot_split_curves(axes[1], "Test Set", test_multistep, test_rollout, partial_results_test)
     fig.suptitle("Fidelity multi-step vs rollout nel tempo", fontsize=14)
     fig.tight_layout()
-    fig.savefig(config.FIDELITY_PLOT_PATH, dpi=config.PLOT_DPI, bbox_inches="tight")
+    methods_plot_path = config.RESULTS_DIR / "fidelity_methods_vs_time.png"
+    fig.savefig(methods_plot_path, dpi=config.PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
 
     test_seq_idx = min(int(config.OBSERVABLES_TEST_SEQUENCE_INDEX), int(dataset.test.num_sequences) - 1)
@@ -311,6 +347,24 @@ def main():
             f"{test_observables.time_indices.size} stati per traiettoria, warmup={rollout_warmup}"
         ),
     )
+
+    entanglement_curves = compute_entanglement_curves(
+        model,
+        dataset.test.states,
+        dataset.test.params,
+        warmup_states=rollout_warmup,
+        num_random_cuts=int(config.ENTANGLEMENT_RANDOM_CUTS),
+        seed=int(config.SEED) + 101,
+    )
+    plot_entanglement_curves(entanglement_curves, config.ENTANGLEMENT_PLOT_PATH)
+
+    per_h_observables = compute_per_h_observable_curves(
+        model,
+        dataset.test.states,
+        dataset.test.params,
+        warmup_states=rollout_warmup,
+    )
+    plot_per_h_observables(per_h_observables, config.PER_H_OBSERVABLES_PLOT_PATH)
 
     summary = {
         "seed": int(config.SEED),
@@ -392,15 +446,20 @@ def main():
             "test_autoregressive": _as_serializable(test_rollout),
             "test_observables_sequence_index": int(test_seq_idx),
             "test_observables": _observable_curves_as_serializable(test_observables),
+            "entanglement_random_cuts": entanglement_curves,
+            "per_h_observables": per_h_observables,
             "partial_warmup_n1_values": warmup_n1_values,
             "train_partial_warmups": {str(k): _as_serializable(v) for k, v in partial_results_train.items()},
             "test_partial_warmups": {str(k): _as_serializable(v) for k, v in partial_results_test.items()},
         },
         "artifacts": {
             "fidelity_plot": str(config.FIDELITY_PLOT_PATH),
+            "fidelity_methods_plot": str(methods_plot_path),
             "training_curves_plot": str(config.TRAINING_CURVES_PATH),
             "observables_train_plot": str(config.OBSERVABLES_TRAIN_PLOT_PATH),
             "observables_test_plot": str(config.OBSERVABLES_TEST_PLOT_PATH),
+            "entanglement_plot": str(config.ENTANGLEMENT_PLOT_PATH),
+            "per_h_observables_plot": str(config.PER_H_OBSERVABLES_PLOT_PATH),
             "summary_json": str(config.SUMMARY_PATH),
         },
     }
@@ -410,6 +469,8 @@ def main():
     print("\nMetriche aggregate")
     print(f"  Train | teacher={train_teacher.mean_fidelity:.6f} | multistep={train_multistep.mean_fidelity:.6f} | rollout={train_rollout.mean_fidelity:.6f}")
     print(f"  Test  | teacher={test_teacher.mean_fidelity:.6f} | multistep={test_multistep.mean_fidelity:.6f} | rollout={test_rollout.mean_fidelity:.6f}")
+    _print_per_h_metrics("train", train_multistep, train_rollout)
+    _print_per_h_metrics("test", test_multistep, test_rollout)
     print(
         f"  Best  | epoch={selection_trace.best_epoch} | "
         f"score={selection_trace.best_objective:.6f} | "
@@ -417,8 +478,11 @@ def main():
         f"{selection_trace.best_multistep_fidelity:.6f})"
     )
     print(f"\nPlot fidelity:  {config.FIDELITY_PLOT_PATH}")
+    print(f"Plot methods:   {methods_plot_path}")
     print(f"Plot training:  {config.TRAINING_CURVES_PATH}")
     print(f"Obs test plot:  {config.OBSERVABLES_TEST_PLOT_PATH}")
+    print(f"Entanglement:   {config.ENTANGLEMENT_PLOT_PATH}")
+    print(f"Per-H obs plot: {config.PER_H_OBSERVABLES_PLOT_PATH}")
     print(f"Summary JSON:   {config.SUMMARY_PATH}")
 
 

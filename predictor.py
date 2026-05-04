@@ -95,7 +95,7 @@ class QuantumSequencePredictor(nn.Module):
         self.feature_dim = 2 * self.dim_2n - 1
         self.embedding = ComplexEmbedding(dim_2n=dim_2n, d_model=d_model)
         self.param_embedding = nn.Sequential(
-            nn.Linear(2, d_model),
+            nn.Linear(6, d_model),
             nn.GELU(),
             nn.Linear(d_model, d_model),
         )

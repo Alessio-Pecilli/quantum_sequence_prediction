@@ -66,9 +66,9 @@ def get_active_env_overrides() -> dict[str, dict[str, object]]:
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-# Directory risultati separata per la run "paper-like" (logamp+phase),
-# così non sovrascriviamo i risultati del baseline.
-RESULTS_DIR = PROJECT_ROOT / "results_paper_logamp_phase"
+# Directory risultati separata per il profilo multi-H a 4 qubit con
+# orizzonte lungo, così non sovrascriviamo checkpoint e plot 6-qubit.
+RESULTS_DIR = PROJECT_ROOT / "results_multi_4q_h100"
 CHECKPOINT_PATH = RESULTS_DIR / "best_model.pt"
 LAST_CHECKPOINT_PATH = RESULTS_DIR / "last_checkpoint.pt"
 SUMMARY_PATH = RESULTS_DIR / "run_summary.json"
@@ -77,6 +77,8 @@ TRAINING_CURVES_PATH = RESULTS_DIR / "training_curves.png"
 OBSERVABLES_PLOT_PATH = RESULTS_DIR / "observables_vs_time.png"
 OBSERVABLES_TRAIN_PLOT_PATH = RESULTS_DIR / "observables_train_vs_rollout.png"
 OBSERVABLES_TEST_PLOT_PATH = RESULTS_DIR / "observables_test_vs_rollout.png"
+ENTANGLEMENT_PLOT_PATH = RESULTS_DIR / "entanglement_vs_time.png"
+PER_H_OBSERVABLES_PLOT_PATH = RESULTS_DIR / "per_h_observables_vs_time.png"
 
 
 SEED = _env_int("QSP_SEED", 7)
@@ -93,8 +95,8 @@ def _default_by_qubits(defaults: dict[int, int], fallback: int) -> int:
     return int(defaults.get(int(N_QUBITS), fallback))
 
 # Numero totale di stati in ogni traiettoria, incluso psi(0).
-# Nel progetto SEQ_LEN = NUM_STATES - 1, quindi 12 stati totali -> 11 predizioni.
-NUM_STATES = _env_int("QSP_NUM_STATES", 60)
+# Con 101 stati totali otteniamo un orizzonte di 100 predizioni.
+NUM_STATES = _env_int("QSP_NUM_STATES", 101)
 if NUM_STATES < 2:
     raise ValueError(f"NUM_STATES deve essere >= 2, ricevuto: {NUM_STATES}")
 
@@ -103,9 +105,8 @@ SEQ_LEN = NUM_STATES - 1
 
 
 def _is_long_horizon() -> bool:
-    return False
     # Run con rollout lungo: >=60 stati (59+ predizioni).
-    return int(NUM_STATES) >= 15
+    return int(NUM_STATES) >= 60
 
 
 TRAIN_SEQUENCES = _env_int("QSP_TRAIN_SEQUENCES", 4000)
@@ -120,7 +121,7 @@ B_TEST = 1
 S_TEST = TEST_SEQUENCES
 
 
-HAMILTONIAN_TYPE = "TFIM"
+HAMILTONIAN_TYPE = "MULTI_H"
 BOUNDARY_CONDITION = _env_str("QSP_BOUNDARY_CONDITION", "open")
 if BOUNDARY_CONDITION != "open":
     raise ValueError(
@@ -149,11 +150,11 @@ if EXACT_DIAG_MAX_DIM < 2:
     raise ValueError(f"EXACT_DIAG_MAX_DIM deve essere >= 2, ricevuto: {EXACT_DIAG_MAX_DIM}")
 
 
-DATASET_SOURCE = _env_str("QSP_DATASET_SOURCE", "haar_tfim")
-if DATASET_SOURCE not in {"fixed_tfim_basis", "haar_tfim"}:
+DATASET_SOURCE = _env_str("QSP_DATASET_SOURCE", "haar_multi_hamiltonian")
+if DATASET_SOURCE not in {"fixed_tfim_basis", "haar_tfim", "haar_multi_hamiltonian"}:
     raise ValueError(
         f"DATASET_SOURCE={DATASET_SOURCE!r} non valido. "
-        "Valori ammessi: fixed_tfim_basis, haar_tfim."
+        "Valori ammessi: fixed_tfim_basis, haar_tfim, haar_multi_hamiltonian."
     )
 
 
@@ -183,7 +184,7 @@ if not (0.0 <= DROPOUT < 1.0):
 
 def _default_power_batch_size() -> int:
     if not torch.cuda.is_available():
-        return 128
+        return 32 if _is_long_horizon() else 128
     try:
         total_memory_gib = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
     except Exception:
@@ -194,7 +195,7 @@ def _default_power_batch_size() -> int:
 BATCH_SIZE = _env_int("QSP_BATCH_SIZE", _default_power_batch_size())
 EPOCHS = _env_int(
     "QSP_EPOCHS",
-    _default_by_qubits({4: 10000, 6: 100}, 120),
+    _default_by_qubits({4: 2000, 6: 1500}, 120),
 )
 LEARNING_RATE = _env_float("QSP_LEARNING_RATE", 5e-4)
 WEIGHT_DECAY = _env_float("QSP_WEIGHT_DECAY", 1e-4)
@@ -203,8 +204,8 @@ LOG_FIDELITY_EPS = _env_float("QSP_LOG_FIDELITY_EPS", 1e-8)
 
 # Curriculum dell'orizzonte multi-step:
 # partiamo prudenti e cresciamo solo dopo plateau sul validation teacher-forced.
-MULTISTEP_H_START = _env_int("QSP_MULTISTEP_H_START", min(2, int(SEQ_LEN)))
-MULTISTEP_H_MAX = _env_int("QSP_MULTISTEP_H_MAX", min(6, int(SEQ_LEN)))
+MULTISTEP_H_START = _env_int("QSP_MULTISTEP_H_START", min(8, int(SEQ_LEN)))
+MULTISTEP_H_MAX = _env_int("QSP_MULTISTEP_H_MAX", min(100, int(SEQ_LEN)))
 # Alias retrocompatibile: rappresenta l'orizzonte massimo/evaluation horizon.
 MULTISTEP_H = _env_int("QSP_MULTISTEP_H", int(MULTISTEP_H_MAX))
 if not (1 <= MULTISTEP_H_START <= SEQ_LEN):
@@ -234,11 +235,11 @@ if MULTISTEP_TEACHER_FORCING_STEPS < 0:
         f"ricevuto: {MULTISTEP_TEACHER_FORCING_STEPS}"
     )
 MULTISTEP_EFFECTIVE_TEACHER_FORCING_STEPS = max(1, min(int(MULTISTEP_H), int(MULTISTEP_H) // 2))
-HYBRID_TEACHER_FORCING_EPOCHS = _env_int("QSP_HYBRID_TEACHER_FORCING_EPOCHS", min(int(EPOCHS), 3500))
+HYBRID_TEACHER_FORCING_EPOCHS = _env_int("QSP_HYBRID_TEACHER_FORCING_EPOCHS", min(int(EPOCHS), 600))
 MULTISTEP_TRAIN_VERBOSE = _env_bool("QSP_MULTISTEP_TRAIN_VERBOSE", False)
 MULTISTEP_H_PLATEAU_PATIENCE = _env_int("QSP_MULTISTEP_H_PLATEAU_PATIENCE", 250)
 MULTISTEP_H_PLATEAU_MIN_DELTA = _env_float("QSP_MULTISTEP_H_PLATEAU_MIN_DELTA", 1e-4)
-EARLY_STOPPING_PATIENCE = _env_int("QSP_EARLY_STOPPING_PATIENCE", 1500)
+EARLY_STOPPING_PATIENCE = _env_int("QSP_EARLY_STOPPING_PATIENCE", 600)
 EARLY_STOPPING_MIN_EPOCHS = _env_int("QSP_EARLY_STOPPING_MIN_EPOCHS", HYBRID_TEACHER_FORCING_EPOCHS)
 if MULTISTEP_H_PLATEAU_PATIENCE < 1:
     raise ValueError(
@@ -265,10 +266,10 @@ ADAPTIVE_STATS_EMA = _env_float("QSP_ADAPTIVE_STATS_EMA", 0.70)
 ADAPTIVE_WEIGHT_ALPHA = _env_float("QSP_ADAPTIVE_WEIGHT_ALPHA", 0.80)
 ADAPTIVE_WEIGHT_MIN = _env_float("QSP_ADAPTIVE_WEIGHT_MIN", 1.0)
 ADAPTIVE_WEIGHT_MAX = _env_float("QSP_ADAPTIVE_WEIGHT_MAX", 2.0)
-ADAPTIVE_H_MIN = _env_int("QSP_ADAPTIVE_H_MIN", max(1, min(6, int(MULTISTEP_H))))
+ADAPTIVE_H_MIN = _env_int("QSP_ADAPTIVE_H_MIN", max(1, min(8, int(MULTISTEP_H))))
 ADAPTIVE_H_MAX = _env_int("QSP_ADAPTIVE_H_MAX", int(MULTISTEP_H))
 ADAPTIVE_TEACHER_MIN = _env_int("QSP_ADAPTIVE_TEACHER_MIN", 1)
-ADAPTIVE_TEACHER_MAX = _env_int("QSP_ADAPTIVE_TEACHER_MAX", min(6, int(MULTISTEP_H)))
+ADAPTIVE_TEACHER_MAX = _env_int("QSP_ADAPTIVE_TEACHER_MAX", min(32, int(MULTISTEP_H)))
 ADAPTIVE_H_LOSS_THRESHOLD = _env_float("QSP_ADAPTIVE_H_LOSS_THRESHOLD", 0.95)
 ADAPTIVE_H_FIDELITY_THRESHOLD = _env_float("QSP_ADAPTIVE_H_FIDELITY_THRESHOLD", 0.58)
 ADAPTIVE_TEACHER_LOSS_THRESHOLD = _env_float("QSP_ADAPTIVE_TEACHER_LOSS_THRESHOLD", 0.85)
@@ -297,7 +298,7 @@ ROLLOUT_CURRICULUM_EPOCHS = _env_int(
 # la parte autoregressiva.
 ROLLOUT_WARMUP_STATES = _env_int(
     "QSP_ROLLOUT_WARMUP_STATES",
-    min(2, int(NUM_STATES) - 1),
+    min(4, int(NUM_STATES) - 1),
 )
 if BATCH_SIZE < 1 or EPOCHS < 1:
     raise ValueError("BATCH_SIZE e EPOCHS devono essere >= 1.")
@@ -369,6 +370,7 @@ EXPOSURE_BIAS_DROP_THRESHOLD = _env_float("QSP_EXPOSURE_BIAS_DROP_THRESHOLD", 0.
 PARTIAL_WARMUP_STEPS = _env_str("QSP_PARTIAL_WARMUP_STEPS", "auto")
 PLOT_DPI = _env_int("QSP_PLOT_DPI", 160)
 OBSERVABLES_TEST_SEQUENCE_INDEX = _env_int("QSP_OBSERVABLES_TEST_SEQUENCE_INDEX", 0)
+ENTANGLEMENT_RANDOM_CUTS = _env_int("QSP_ENTANGLEMENT_RANDOM_CUTS", 8)
 CLAMP_AUDIT_PRINT = _env_bool("QSP_CLAMP_AUDIT_PRINT", True)
 CLAMP_AUDIT_MAX_SEQUENCES = _env_int("QSP_CLAMP_AUDIT_MAX_SEQUENCES", 3)
 CLAMP_AUDIT_MAX_STATES = _env_int("QSP_CLAMP_AUDIT_MAX_STATES", min(6, int(NUM_STATES)))
@@ -386,6 +388,8 @@ if OBSERVABLES_TEST_SEQUENCE_INDEX < 0:
         "OBSERVABLES_TEST_SEQUENCE_INDEX deve essere >= 0, "
         f"ricevuto: {OBSERVABLES_TEST_SEQUENCE_INDEX}"
     )
+if ENTANGLEMENT_RANDOM_CUTS < 1:
+    raise ValueError("ENTANGLEMENT_RANDOM_CUTS deve essere >= 1.")
 
 
 NUM_WORKERS = _env_int("QSP_NUM_WORKERS", 0)
