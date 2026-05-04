@@ -32,28 +32,29 @@ export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
 export QSP_HPC_DISTRIBUTED=1
 export QSP_HPC_DISTRIBUTED_DATASET=1
 export QSP_HPC_DISTRIBUTED_TRAINING=1
-export QSP_HPC_DISTRIBUTED_BACKEND="${QSP_HPC_DISTRIBUTED_BACKEND:-auto}"
+export QSP_HPC_DISTRIBUTED_BACKEND="auto"
 
 # 100 evoluzioni per traiettoria: 101 stati totali -> 100 predizioni.
-export QSP_N_QUBITS="${QSP_N_QUBITS:-4}"
-export QSP_NUM_STATES="${QSP_NUM_STATES:-101}"
-export QSP_MULTISTEP_H="${QSP_MULTISTEP_H:-100}"
-export QSP_MULTISTEP_H_MAX="${QSP_MULTISTEP_H_MAX:-100}"
+export QSP_N_QUBITS=4
+export QSP_NUM_STATES=101
+export QSP_MULTISTEP_H=100
+export QSP_MULTISTEP_H_MAX=100
 
 # Tune dataloader workers from allocated CPU cores.
 if [[ -n "${SLURM_CPUS_PER_TASK:-}" ]]; then
-  export QSP_NUM_WORKERS="${QSP_NUM_WORKERS:-$(( SLURM_CPUS_PER_TASK > 2 ? SLURM_CPUS_PER_TASK - 2 : 0 ))}"
+  export QSP_NUM_WORKERS="$(( SLURM_CPUS_PER_TASK > 2 ? SLURM_CPUS_PER_TASK - 2 : 0 ))"
 else
-  export QSP_NUM_WORKERS="${QSP_NUM_WORKERS:-4}"
+  export QSP_NUM_WORKERS=4
 fi
-export QSP_PIN_MEMORY="${QSP_PIN_MEMORY:-1}"
+export QSP_PIN_MEMORY=1
 
 # 4 Hamiltoniane x 200 traiettorie train = 800 train totali.
-export QSP_BATCH_SIZE="${QSP_BATCH_SIZE:-32}"
-export QSP_EPOCHS="${QSP_EPOCHS:-100}"
-export QSP_HYBRID_TEACHER_FORCING_EPOCHS="${QSP_HYBRID_TEACHER_FORCING_EPOCHS:-20}"
-export QSP_TRAIN_SEQUENCES="${QSP_TRAIN_SEQUENCES:-800}"
-export QSP_TEST_SEQUENCES="${QSP_TEST_SEQUENCES:-200}"
+export QSP_BATCH_SIZE=32
+export QSP_EPOCHS=100
+export QSP_HYBRID_TEACHER_FORCING_EPOCHS=20
+export QSP_TRAIN_SEQUENCES=800
+export QSP_TEST_SEQUENCES=200
+export QSP_AUTO_RESUME=0
 
 # Under sbatch, $0 points to a temporary copy in /var/spool/slurmd/... .
 # SLURM_SUBMIT_DIR preserves the directory from which the job was submitted.
