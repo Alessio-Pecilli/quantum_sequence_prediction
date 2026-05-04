@@ -33,6 +33,13 @@ def _split_count(total: int, rank: int, world_size: int) -> int:
     rem = int(total) % int(world_size)
     return base + (1 if rank < rem else 0)
 
+
+def _dist_log(message: str, *, force: bool = False) -> None:
+    rank, world_size = _dist_rank_world()
+    if not force and world_size <= 1:
+        return
+    print(f"[dataset][rank {rank}/{world_size}] {message}", flush=True)
+
 @dataclass
 class HamiltonianData:
     couplings: list[float]
@@ -483,6 +490,18 @@ def generate_fixed_tfim_dataset(
         local_train = _split_count(int(train_sequences), rank, world_size)
         local_test = _split_count(int(test_sequences), rank, world_size)
         local_seed = int(seed) + int(config.HPC_DIST_SEED_STRIDE) * int(rank)
+        if rank == 0:
+            print(
+                (
+                    f"[dataset] distributed generation enabled | world_size={world_size} | "
+                    f"global train={int(train_sequences)} test={int(test_sequences)} | "
+                    f"n_qubits={int(n_qubits)} num_states={int(num_states)}"
+                ),
+                flush=True,
+            )
+        _dist_log(
+            f"local shard start | train={local_train} test={local_test} seed={local_seed}"
+        )
 
         if (local_train + local_test) > 0:
             local_bundle = generate_fixed_tfim_dataset(
@@ -522,6 +541,13 @@ def generate_fixed_tfim_dataset(
                 used_support_fraction=0.0,
                 initial_state_family_reason="empty shard",
             )
+        _dist_log(
+            (
+                "local shard ready | "
+                f"train_shape={tuple(local_bundle.train.states.shape)} "
+                f"test_shape={tuple(local_bundle.test.states.shape)}"
+            )
+        )
 
         gathered: list[object] = [None for _ in range(world_size)]
         payload = {
@@ -562,6 +588,18 @@ def generate_fixed_tfim_dataset(
             reason = (
                 f"distributed_generation(world_size={world_size}) | "
                 + " | ".join(str(item["initial_state_family_reason"]) for item in chunks)
+            )
+            shard_sizes = [
+                f"rank{idx}:train={int(item['train_states'].shape[0])},test={int(item['test_states'].shape[0])}"
+                for idx, item in enumerate(chunks)
+            ]
+            print(
+                (
+                    "[dataset] gathered distributed shards | "
+                    + " | ".join(shard_sizes)
+                    + f" | final train={int(train_sequences)} test={int(test_sequences)}"
+                ),
+                flush=True,
             )
             reconstructed = QuantumDatasetBundle(
                 train=DatasetSplit(
