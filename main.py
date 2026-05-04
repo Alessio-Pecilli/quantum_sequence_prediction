@@ -12,6 +12,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.distributed as dist
 
 torch.set_num_threads(1)
 
@@ -184,7 +185,16 @@ def _print_per_h_metrics(split_name: str, multistep, rollout):
         print(f"  {label:14s} | multistep={ms:.6f} | rollout={ro:.6f}")
 
 
+def _dist_is_initialized() -> bool:
+    return bool(dist.is_available() and dist.is_initialized())
+
+
+def _is_main_process() -> bool:
+    return not _dist_is_initialized() or int(dist.get_rank()) == 0
+
+
 def main():
+    main_process = _is_main_process()
     set_seed(config.SEED)
     config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     dataset = generate_fixed_tfim_dataset()
@@ -194,37 +204,40 @@ def main():
         "reason": "eval-only attivo" if config.EVAL_ONLY else "auto-resume disattivato",
     }
 
-    print("=" * 78)
-    print("Quantum Sequence Prediction | hybrid teacher-forced + multistep pipeline")
-    print("=" * 78)
-    print(f"Device:                {config.DEVICE}")
-    print(f"Qubits:                {config.N_QUBITS} (dim={config.DIM_2N})")
-    print(f"Stati per traiettoria: {config.NUM_STATES} (predizioni={config.SEQ_LEN})")
-    print(f"Dataset:               train={dataset.train.num_sequences}, test={dataset.test.num_sequences}")
-    print(
-        f"Transformer:           d_model={config.D_MODEL}, layers={config.NUM_LAYERS}, "
-        f"heads={config.NUM_HEADS}, ff={config.DIM_FEEDFORWARD}, dropout={config.DROPOUT}"
-    )
-    print(
-        f"Training:              batch_size={config.BATCH_SIZE}, lr={config.LEARNING_RATE:.2e}, "
-        f"epochs={config.EPOCHS}, tf_only={config.HYBRID_TEACHER_FORCING_EPOCHS}, "
-        f"early_stop_patience={config.EARLY_STOPPING_PATIENCE}"
-    )
-    print(f"Stati iniziali:        {dataset.train.initial_state_family}")
-    print(f"Motivo famiglia:       {dataset.initial_state_family_reason}")
-    print(f"Force X basis only:    {config.FORCE_X_BASIS_ONLY}")
-    print(
-        f"Checkpoint best:       "
-        f"{'trovato' if config.CHECKPOINT_PATH.exists() else 'assente'} | {config.CHECKPOINT_PATH}"
-    )
-    print(
-        f"Checkpoint last:       "
-        f"{'trovato' if config.LAST_CHECKPOINT_PATH.exists() else 'assente'} | {config.LAST_CHECKPOINT_PATH}"
-    )
-    print("=" * 78)
+    if main_process:
+        print("=" * 78)
+        print("Quantum Sequence Prediction | hybrid teacher-forced + multistep pipeline")
+        print("=" * 78)
+        print(f"Device:                {config.DEVICE}")
+        print(f"Qubits:                {config.N_QUBITS} (dim={config.DIM_2N})")
+        print(f"Stati per traiettoria: {config.NUM_STATES} (predizioni={config.SEQ_LEN})")
+        print(f"Dataset:               train={dataset.train.num_sequences}, test={dataset.test.num_sequences}")
+        print(
+            f"Transformer:           d_model={config.D_MODEL}, layers={config.NUM_LAYERS}, "
+            f"heads={config.NUM_HEADS}, ff={config.DIM_FEEDFORWARD}, dropout={config.DROPOUT}"
+        )
+        print(
+            f"Training:              batch_size={config.BATCH_SIZE}, lr={config.LEARNING_RATE:.2e}, "
+            f"epochs={config.EPOCHS}, tf_only={config.HYBRID_TEACHER_FORCING_EPOCHS}, "
+            f"early_stop_patience={config.EARLY_STOPPING_PATIENCE}"
+        )
+        print(f"Stati iniziali:        {dataset.train.initial_state_family}")
+        print(f"Motivo famiglia:       {dataset.initial_state_family_reason}")
+        print(f"Force X basis only:    {config.FORCE_X_BASIS_ONLY}")
+        print(
+            f"Checkpoint best:       "
+            f"{'trovato' if config.CHECKPOINT_PATH.exists() else 'assente'} | {config.CHECKPOINT_PATH}"
+        )
+        print(
+            f"Checkpoint last:       "
+            f"{'trovato' if config.LAST_CHECKPOINT_PATH.exists() else 'assente'} | {config.LAST_CHECKPOINT_PATH}"
+        )
+        print("=" * 78)
 
     model = build_model()
     if config.EVAL_ONLY:
+        if not main_process:
+            return
         history = _load_trained_model(model)
         adaptive_trace = AdaptiveTrainingTrace(
             enabled=False,
@@ -256,9 +269,9 @@ def main():
                 "resumed": bool(resume_state.resumed),
                 "reason": str(resume_state.reason),
             }
-            if resume_state.resumed:
+            if main_process and resume_state.resumed:
                 print(f"Auto-resume:           {resume_state.reason}")
-            else:
+            elif main_process:
                 print(f"Auto-resume saltato:   {resume_state.reason}")
         history, adaptive_trace, selection_trace = train_model(
             model,
@@ -273,7 +286,11 @@ def main():
             best_objective=resume_state.best_objective,
             best_state=resume_state.best_state,
         )
-        plot_training_curves(history)
+        if main_process:
+            plot_training_curves(history)
+
+    if not main_process:
+        return
 
     train_teacher = evaluate_teacher_forced(model, dataset.train.states, dataset.train.params)
     test_teacher = evaluate_teacher_forced(model, dataset.test.states, dataset.test.params)
