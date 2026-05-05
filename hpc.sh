@@ -33,27 +33,33 @@ export QSP_HPC_DISTRIBUTED=1
 export QSP_HPC_DISTRIBUTED_DATASET=1
 export QSP_HPC_DISTRIBUTED_TRAINING=1
 export QSP_HPC_DISTRIBUTED_BACKEND="auto"
-export QSP_TRAIN_DIAGNOSTICS=1
-export QSP_TRAIN_DIAG_BATCH_PRINTS=2
+# Profilo "paper run": meno rumore log, piu' stabilita' nel training.
+export QSP_TRAIN_DIAGNOSTICS=0
+export QSP_TRAIN_DIAG_BATCH_PRINTS=0
 
 # 100 evoluzioni per traiettoria: 101 stati totali -> 100 predizioni.
 export QSP_N_QUBITS=4
 export QSP_NUM_STATES=101
+# H fisso a 100 (sia eval che training multistep).
 export QSP_MULTISTEP_H=100
 export QSP_MULTISTEP_H_MAX=100
+export QSP_MULTISTEP_H_START=100
 
 # Tune dataloader workers from allocated CPU cores.
 if [[ -n "${SLURM_CPUS_PER_TASK:-}" ]]; then
-  export QSP_NUM_WORKERS="$(( SLURM_CPUS_PER_TASK > 2 ? SLURM_CPUS_PER_TASK - 2 : 0 ))"
+  export QSP_NUM_WORKERS="$(( SLURM_CPUS_PER_TASK >= 4 ? 2 : 0 ))"
 else
-  export QSP_NUM_WORKERS=4
+  export QSP_NUM_WORKERS=2
 fi
 export QSP_PIN_MEMORY=1
 
 # 4 Hamiltoniane x 200 traiettorie train = 800 train totali.
-export QSP_BATCH_SIZE=32
-export QSP_EPOCHS=100
-export QSP_HYBRID_TEACHER_FORCING_EPOCHS=20
+export QSP_BATCH_SIZE=64
+export QSP_EPOCHS=120
+export QSP_HYBRID_TEACHER_FORCING_EPOCHS=40
+export QSP_LEARNING_RATE=2e-4
+export QSP_WEIGHT_DECAY=5e-5
+export QSP_GRAD_CLIP_MAX_NORM=0.5
 export QSP_TRAIN_SEQUENCES=800
 export QSP_TEST_SEQUENCES=200
 export QSP_AUTO_RESUME=0
