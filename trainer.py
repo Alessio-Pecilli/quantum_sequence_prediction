@@ -729,6 +729,7 @@ def train_model(
     best_state: dict | None = None,
 ) -> tuple[TrainingHistory, AdaptiveTrainingTrace, ModelSelectionTrace]:
     history = history or TrainingHistory(epochs=[], train_loss=[], train_fidelity=[])
+    rank, world_size = _dist_rank_world()
     if (
         config.HPC_DISTRIBUTED
         and config.HPC_DISTRIBUTED_TRAINING
@@ -749,6 +750,22 @@ def train_model(
     )
     loader, distributed_sampler = build_loader(train_states, train_params, shuffle=True)
     steps_per_epoch = len(loader)
+    local_batch_size = max(1, int(config.BATCH_SIZE) // 2)
+    if config.TRAIN_DIAGNOSTICS:
+        if torch.cuda.is_available():
+            current_device = int(torch.cuda.current_device())
+            device_name = torch.cuda.get_device_name(current_device)
+        else:
+            current_device = -1
+            device_name = "cpu"
+        sampler_kind = "DistributedSampler" if distributed_sampler is not None else "None"
+        print(
+            f"[diag][rank {rank}/{world_size}] loader ready | "
+            f"device={config.DEVICE}:{current_device} ({device_name}) | "
+            f"steps_per_epoch={steps_per_epoch} | local_batch_size={local_batch_size} | "
+            f"sampler={sampler_kind} | num_workers={config.NUM_WORKERS}",
+            flush=True,
+        )
     use_amp = config.DEVICE == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     total_scheduler_steps = _scheduler_total_steps(steps_per_epoch)
@@ -794,6 +811,7 @@ def train_model(
     interrupted = False
     try:
         for epoch in range(max(1, start_epoch), config.EPOCHS + 1):
+            epoch_start = time.perf_counter()
             model.train()
             if distributed_sampler is not None:
                 distributed_sampler.set_epoch(int(epoch))
@@ -815,6 +833,7 @@ def train_model(
             offset_counts = np.zeros(epoch_horizon, dtype=np.float64)
 
             for batch_idx, (inputs, targets, params) in enumerate(loader, start=1):
+                batch_start = time.perf_counter()
                 inputs = inputs.to(config.DEVICE)
                 targets = targets.to(config.DEVICE)
                 params = params.to(config.DEVICE)
@@ -873,6 +892,16 @@ def train_model(
                 loss_sum += float(total_loss.item()) * weighted_batch_count
                 fidelity_sum += float(total_fidelity.item()) * weighted_batch_count
                 sample_weight += weighted_batch_count
+                batch_elapsed = time.perf_counter() - batch_start
+                if config.TRAIN_DIAGNOSTICS and batch_idx <= int(config.TRAIN_DIAG_BATCH_PRINTS):
+                    print(
+                        f"[diag][rank {rank}/{world_size}] ep={epoch} b={batch_idx}/{steps_per_epoch} | "
+                        f"phase={phase} | bs={batch_size} | "
+                        f"loss(tf/ms/tot)=({float(teacher_loss.item()):.4f}/{float(multistep_loss.item()):.4f}/{float(total_loss.item()):.4f}) | "
+                        f"fid(tf/ms/tot)=({float(teacher_fidelity.item()):.4f}/{float(multistep_fidelity.item()):.4f}/{float(total_fidelity.item()):.4f}) | "
+                        f"dt={batch_elapsed:.3f}s",
+                        flush=True,
+                    )
                 offset_loss_sums += np.asarray(batch_stats.mean_offset_losses, dtype=np.float64) * batch_size
                 offset_fidelity_sums += np.asarray(batch_stats.mean_offset_fidelities, dtype=np.float64) * batch_size
                 offset_weight_sums += np.asarray(batch_stats.mean_offset_weights, dtype=np.float64) * batch_size
@@ -899,6 +928,9 @@ def train_model(
             global_offset_fidelity_sums = _allreduce_array(offset_fidelity_sums)
             global_offset_weight_sums = _allreduce_array(offset_weight_sums)
             global_offset_counts = _allreduce_array(offset_counts)
+            local_epoch_seconds = time.perf_counter() - epoch_start
+            min_epoch_seconds = _allreduce_scalar(local_epoch_seconds, op=dist.ReduceOp.MIN)
+            max_epoch_seconds = _allreduce_scalar(local_epoch_seconds, op=dist.ReduceOp.MAX)
 
             epoch_loss = global_loss_sum / max(1.0, global_sample_weight)
             epoch_fidelity = global_fidelity_sum / max(1.0, global_sample_weight)
@@ -915,6 +947,14 @@ def train_model(
             history.epochs.append(epoch)
             history.train_loss.append(epoch_loss)
             history.train_fidelity.append(epoch_fidelity)
+            prev_epoch_fidelity = (
+                float(history.train_fidelity[-2]) if len(history.train_fidelity) > 1 else float("nan")
+            )
+            epoch_fidelity_delta = (
+                float(epoch_fidelity - prev_epoch_fidelity)
+                if np.isfinite(prev_epoch_fidelity)
+                else float("nan")
+            )
             last_completed_epoch = epoch
             teacher_metric = None
             multistep_metric = None
@@ -972,24 +1012,35 @@ def train_model(
             log_every = max(1, min(10, config.EPOCHS // 20 if config.EPOCHS > 20 else 1))
             if _is_main_process() and (epoch <= 3 or epoch == config.EPOCHS or epoch % log_every == 0):
                 phase_label = "teacher-forced" if phase == "teacher_forced" else "hybrid-50/50"
+                global_samples = int(round(global_sample_weight))
+                samples_per_second = global_sample_weight / max(1e-9, max_epoch_seconds)
+                epoch_time_info = (
+                    f"epoch_t(min/max)={min_epoch_seconds:.2f}/{max_epoch_seconds:.2f}s | "
+                    f"samples={global_samples} | samples/s={samples_per_second:.2f}"
+                )
                 if teacher_metric is not None and multistep_metric is not None:
                     print(
                         f"  Epoca {epoch:4d}/{config.EPOCHS} | "
                         f"fase={phase_label:14s} | "
                         f"loss={epoch_loss:.6f} | fidelity={epoch_fidelity:.6f} | "
+                        f"delta_fid={epoch_fidelity_delta:+.6f} | "
                         f"H_train={epoch_horizon:2d} | H_eval={eval_horizon:2d} | "
                         f"teacher_steps={epoch_teacher_steps:2d} | "
                         f"val(tf/ms)=({teacher_metric.mean_fidelity:.3f}/{multistep_metric.mean_fidelity:.3f}) | "
+                        f"head/tail_fid=({adaptive_summary.head_fidelity:.3f}/{adaptive_summary.tail_fidelity:.3f}) | "
                         f"score={epoch_objective:.3f} | plateau={plateau_epochs:4d} | "
-                        f"es={early_stop_counter:4d} | lr={optimizer.param_groups[0]['lr']:.2e}"
+                        f"es={early_stop_counter:4d} | lr={optimizer.param_groups[0]['lr']:.2e} | "
+                        f"{epoch_time_info}"
                     )
                 else:
                     print(
                         f"  Epoca {epoch:4d}/{config.EPOCHS} | "
                         f"fase={phase_label:14s} | "
                         f"loss={epoch_loss:.6f} | fidelity={epoch_fidelity:.6f} | "
+                        f"delta_fid={epoch_fidelity_delta:+.6f} | "
                         f"H={epoch_horizon:2d} | teacher_steps={epoch_teacher_steps:2d} | "
-                        f"lr={optimizer.param_groups[0]['lr']:.2e}"
+                        f"head/tail_fid=({adaptive_summary.head_fidelity:.3f}/{adaptive_summary.tail_fidelity:.3f}) | "
+                        f"lr={optimizer.param_groups[0]['lr']:.2e} | {epoch_time_info}"
                     )
 
             if (

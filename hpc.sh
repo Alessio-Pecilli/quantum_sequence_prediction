@@ -33,6 +33,8 @@ export QSP_HPC_DISTRIBUTED=1
 export QSP_HPC_DISTRIBUTED_DATASET=1
 export QSP_HPC_DISTRIBUTED_TRAINING=1
 export QSP_HPC_DISTRIBUTED_BACKEND="auto"
+export QSP_TRAIN_DIAGNOSTICS=1
+export QSP_TRAIN_DIAG_BATCH_PRINTS=2
 
 # 100 evoluzioni per traiettoria: 101 stati totali -> 100 predizioni.
 export QSP_N_QUBITS=4
