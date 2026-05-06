@@ -821,7 +821,9 @@ def train_model(
             phase = _training_phase_for_epoch(epoch)
             hybrid_teacher_weight = 1.0 if phase == "teacher_forced" else 0.5
             hybrid_multistep_weight = 0.0 if phase == "teacher_forced" else 0.5
-            epoch_horizon = int(config.SEQ_LEN if phase == "teacher_forced" else current_horizon)
+            # Usa davvero il curriculum anche durante teacher-forced:
+            # partire da H piccoli evita il crollo precoce della fidelity.
+            epoch_horizon = int(current_horizon)
             epoch_teacher_steps = int(
                 epoch_horizon
                 if phase == "teacher_forced"
@@ -837,6 +839,8 @@ def train_model(
                 inputs = inputs.to(config.DEVICE)
                 targets = targets.to(config.DEVICE)
                 params = params.to(config.DEVICE)
+                tf_inputs = inputs[:, :epoch_horizon, :]
+                tf_targets = targets[:, :epoch_horizon, :]
 
                 batch_size = int(inputs.shape[0])
                 optimizer.zero_grad(set_to_none=True)
@@ -848,8 +852,8 @@ def train_model(
                     teacher_loss, teacher_fidelity, teacher_stats = _teacher_forced_training_loss(
                         model=model,
                         criterion=criterion,
-                        inputs=inputs,
-                        targets=targets,
+                        inputs=tf_inputs,
+                        targets=tf_targets,
                         params=params,
                     )
                     if phase == "teacher_forced":
@@ -1044,8 +1048,7 @@ def train_model(
                     )
 
             if (
-                phase == "hybrid"
-                and validation_states is not None
+                validation_states is not None
                 and current_horizon < int(config.MULTISTEP_H_MAX)
                 and plateau_epochs >= int(config.MULTISTEP_H_PLATEAU_PATIENCE)
             ):
