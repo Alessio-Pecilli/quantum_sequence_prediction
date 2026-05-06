@@ -44,8 +44,8 @@ export QSP_NUM_STATES=101
 # Profilo "tanti H": curriculum multi-step da orizzonti piccoli a H=100.
 export QSP_MULTISTEP_H=100
 export QSP_MULTISTEP_H_MAX=100
-export QSP_MULTISTEP_H_START=20
-export QSP_MULTISTEP_H_PLATEAU_PATIENCE=3
+export QSP_MULTISTEP_H_START=30
+export QSP_MULTISTEP_H_PLATEAU_PATIENCE=2
 export QSP_MULTISTEP_H_PLATEAU_MIN_DELTA=5e-4
 
 # Tune dataloader workers from allocated CPU cores.
@@ -58,7 +58,7 @@ export QSP_PIN_MEMORY=1
 
 # 4 Hamiltoniane x 200 traiettorie train = 800 train totali.
 export QSP_BATCH_SIZE=64
-export QSP_EPOCHS=2000
+export QSP_EPOCHS=1200
 export QSP_HYBRID_TEACHER_FORCING_EPOCHS=80
 export QSP_LEARNING_RATE=1e-5
 export QSP_WEIGHT_DECAY=1e-5
@@ -66,7 +66,7 @@ export QSP_GRAD_CLIP_MAX_NORM=0.3
 export QSP_TRAIN_SEQUENCES=1600
 export QSP_TEST_SEQUENCES=400
 export QSP_EARLY_STOPPING_MIN_EPOCHS=300
-export QSP_EARLY_STOPPING_PATIENCE=300
+export QSP_EARLY_STOPPING_PATIENCE=150
 export QSP_AUTO_RESUME=0
 
 # Under sbatch, $0 points to a temporary copy in /var/spool/slurmd/... .
