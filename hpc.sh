@@ -9,7 +9,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:4
-#SBATCH --time=03:00:00
+#SBATCH --time=06:00:00
 
 set -euo pipefail
 
@@ -40,10 +40,12 @@ export QSP_TRAIN_DIAG_BATCH_PRINTS=0
 # 100 evoluzioni per traiettoria: 101 stati totali -> 100 predizioni.
 export QSP_N_QUBITS=4
 export QSP_NUM_STATES=101
-# H fisso a 100 (sia eval che training multistep).
+# Profilo "tanti H": curriculum multi-step da orizzonti piccoli a H=100.
 export QSP_MULTISTEP_H=100
 export QSP_MULTISTEP_H_MAX=100
-export QSP_MULTISTEP_H_START=100
+export QSP_MULTISTEP_H_START=8
+export QSP_MULTISTEP_H_PLATEAU_PATIENCE=8
+export QSP_MULTISTEP_H_PLATEAU_MIN_DELTA=5e-4
 
 # Tune dataloader workers from allocated CPU cores.
 if [[ -n "${SLURM_CPUS_PER_TASK:-}" ]]; then
@@ -55,13 +57,15 @@ export QSP_PIN_MEMORY=1
 
 # 4 Hamiltoniane x 200 traiettorie train = 800 train totali.
 export QSP_BATCH_SIZE=64
-export QSP_EPOCHS=120
-export QSP_HYBRID_TEACHER_FORCING_EPOCHS=40
-export QSP_LEARNING_RATE=2e-4
-export QSP_WEIGHT_DECAY=5e-5
-export QSP_GRAD_CLIP_MAX_NORM=0.5
-export QSP_TRAIN_SEQUENCES=800
-export QSP_TEST_SEQUENCES=200
+export QSP_EPOCHS=140
+export QSP_HYBRID_TEACHER_FORCING_EPOCHS=20
+export QSP_LEARNING_RATE=1e-4
+export QSP_WEIGHT_DECAY=1e-5
+export QSP_GRAD_CLIP_MAX_NORM=0.3
+export QSP_TRAIN_SEQUENCES=1600
+export QSP_TEST_SEQUENCES=400
+export QSP_EARLY_STOPPING_MIN_EPOCHS=40
+export QSP_EARLY_STOPPING_PATIENCE=120
 export QSP_AUTO_RESUME=0
 
 # Under sbatch, $0 points to a temporary copy in /var/spool/slurmd/... .
