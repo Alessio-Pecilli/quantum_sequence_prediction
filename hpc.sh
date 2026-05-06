@@ -9,7 +9,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:4
-#SBATCH --time=06:00:00
+#SBATCH --time=12:00:00
 
 set -euo pipefail
 
@@ -58,15 +58,15 @@ export QSP_PIN_MEMORY=1
 
 # 4 Hamiltoniane x 200 traiettorie train = 800 train totali.
 export QSP_BATCH_SIZE=64
-export QSP_EPOCHS=220
-export QSP_HYBRID_TEACHER_FORCING_EPOCHS=10
+export QSP_EPOCHS=2000
+export QSP_HYBRID_TEACHER_FORCING_EPOCHS=80
 export QSP_LEARNING_RATE=1e-5
 export QSP_WEIGHT_DECAY=1e-5
 export QSP_GRAD_CLIP_MAX_NORM=0.3
 export QSP_TRAIN_SEQUENCES=1600
 export QSP_TEST_SEQUENCES=400
-export QSP_EARLY_STOPPING_MIN_EPOCHS=60
-export QSP_EARLY_STOPPING_PATIENCE=120
+export QSP_EARLY_STOPPING_MIN_EPOCHS=300
+export QSP_EARLY_STOPPING_PATIENCE=300
 export QSP_AUTO_RESUME=0
 
 # Under sbatch, $0 points to a temporary copy in /var/spool/slurmd/... .
