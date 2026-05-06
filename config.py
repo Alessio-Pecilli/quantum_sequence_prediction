@@ -66,9 +66,8 @@ def get_active_env_overrides() -> dict[str, dict[str, object]]:
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-# Directory risultati separata per il profilo multi-H a 4 qubit con
-# orizzonte lungo, così non sovrascriviamo checkpoint e plot 6-qubit.
-RESULTS_DIR = PROJECT_ROOT / "results_multi_4q_h100"
+# Directory risultati configurabile via env per separare run/ablation.
+RESULTS_DIR = PROJECT_ROOT / os.getenv("QSP_RESULTS_DIR_NAME", "results_multi_4q_h100")
 CHECKPOINT_PATH = RESULTS_DIR / "best_model.pt"
 LAST_CHECKPOINT_PATH = RESULTS_DIR / "last_checkpoint.pt"
 SUMMARY_PATH = RESULTS_DIR / "run_summary.json"
