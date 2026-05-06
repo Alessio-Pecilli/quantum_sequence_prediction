@@ -354,7 +354,11 @@ def _training_phase_for_epoch(epoch: int) -> str:
 
 
 def _scheduler_total_steps(num_batches: int) -> int:
-    return max(1, int(config.EPOCHS) * int(num_batches))
+    total = max(1, int(config.EPOCHS) * int(num_batches))
+    cap = int(config.SCHEDULER_TOTAL_STEPS_CAP)
+    if cap > 0:
+        return max(1, min(total, cap))
+    return total
 
 
 def _effective_multistep_teacher_steps(horizon: int, requested_steps: int | None = None) -> int:
@@ -769,6 +773,12 @@ def train_model(
     use_amp = config.DEVICE == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     total_scheduler_steps = _scheduler_total_steps(steps_per_epoch)
+    if _is_main_process() and int(config.SCHEDULER_TOTAL_STEPS_CAP) > 0:
+        print(
+            f"[scheduler] total_steps={total_scheduler_steps} "
+            f"(cap={int(config.SCHEDULER_TOTAL_STEPS_CAP)}, "
+            f"uncapped={int(config.EPOCHS) * int(steps_per_epoch)})"
+        )
 
     # OneCycleLR sul numero reale di update del training ibrido.
     scheduler = torch.optim.lr_scheduler.OneCycleLR(

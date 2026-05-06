@@ -200,6 +200,13 @@ LEARNING_RATE = _env_float("QSP_LEARNING_RATE", 5e-4)
 WEIGHT_DECAY = _env_float("QSP_WEIGHT_DECAY", 1e-4)
 GRAD_CLIP_MAX_NORM = _env_float("QSP_GRAD_CLIP_MAX_NORM", 1.0)
 LOG_FIDELITY_EPS = _env_float("QSP_LOG_FIDELITY_EPS", 1e-8)
+# Cap opzionale per evitare warmup eccessivamente lenti in run con molte epoche.
+# 0 disattiva il cap.
+SCHEDULER_TOTAL_STEPS_CAP = _env_int("QSP_SCHEDULER_TOTAL_STEPS_CAP", 0)
+if SCHEDULER_TOTAL_STEPS_CAP < 0:
+    raise ValueError(
+        f"SCHEDULER_TOTAL_STEPS_CAP deve essere >= 0, ricevuto: {SCHEDULER_TOTAL_STEPS_CAP}"
+    )
 
 # Curriculum dell'orizzonte multi-step:
 # partiamo prudenti e cresciamo solo dopo plateau sul validation teacher-forced.
