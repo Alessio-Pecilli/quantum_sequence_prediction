@@ -37,6 +37,7 @@ export QSP_RESULTS_DIR_NAME="results_multi_4q_h100_fast_curriculum"
 # Profilo "paper run": meno rumore log, piu' stabilita' nel training.
 export QSP_TRAIN_DIAGNOSTICS=0
 export QSP_TRAIN_DIAG_BATCH_PRINTS=0
+export QSP_USE_AMP=0
 
 # 100 evoluzioni per traiettoria: 101 stati totali -> 100 predizioni.
 export QSP_N_QUBITS=4
@@ -67,7 +68,7 @@ export QSP_TRAIN_SEQUENCES=1600
 export QSP_TEST_SEQUENCES=400
 export QSP_EARLY_STOPPING_MIN_EPOCHS=80
 export QSP_EARLY_STOPPING_PATIENCE=150
-export QSP_SCHEDULER_TOTAL_STEPS_CAP=2400
+export QSP_SCHEDULER_TOTAL_STEPS_CAP=0
 export QSP_AUTO_RESUME=0
 
 # Under sbatch, $0 points to a temporary copy in /var/spool/slurmd/... .

@@ -246,6 +246,8 @@ def _checkpoint_config_snapshot() -> dict[str, object]:
         "EPOCHS": int(config.EPOCHS),
         "LEARNING_RATE": float(config.LEARNING_RATE),
         "WEIGHT_DECAY": float(config.WEIGHT_DECAY),
+        "USE_AMP": bool(config.USE_AMP),
+        "SCHEDULER_TOTAL_STEPS_CAP": int(config.SCHEDULER_TOTAL_STEPS_CAP),
         "D_MODEL": int(config.D_MODEL),
         "NUM_HEADS": int(config.NUM_HEADS),
         "NUM_LAYERS": int(config.NUM_LAYERS),
@@ -770,7 +772,7 @@ def train_model(
             f"sampler={sampler_kind} | num_workers={config.NUM_WORKERS}",
             flush=True,
         )
-    use_amp = config.DEVICE == "cuda"
+    use_amp = bool(config.USE_AMP) and config.DEVICE == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     total_scheduler_steps = _scheduler_total_steps(steps_per_epoch)
     if _is_main_process() and int(config.SCHEDULER_TOTAL_STEPS_CAP) > 0:

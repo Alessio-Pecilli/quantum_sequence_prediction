@@ -200,6 +200,8 @@ LEARNING_RATE = _env_float("QSP_LEARNING_RATE", 5e-4)
 WEIGHT_DECAY = _env_float("QSP_WEIGHT_DECAY", 1e-4)
 GRAD_CLIP_MAX_NORM = _env_float("QSP_GRAD_CLIP_MAX_NORM", 1.0)
 LOG_FIDELITY_EPS = _env_float("QSP_LOG_FIDELITY_EPS", 1e-8)
+# I tensori complessi in float16 finiscono in ComplexHalf, ancora sperimentale in PyTorch.
+USE_AMP = _env_bool("QSP_USE_AMP", False)
 # Cap opzionale per evitare warmup eccessivamente lenti in run con molte epoche.
 # 0 disattiva il cap.
 SCHEDULER_TOTAL_STEPS_CAP = _env_int("QSP_SCHEDULER_TOTAL_STEPS_CAP", 0)
