@@ -46,7 +46,7 @@ export QSP_NUM_STATES=101
 export QSP_MULTISTEP_H=100
 export QSP_MULTISTEP_H_MAX=100
 export QSP_MULTISTEP_H_START=20
-export QSP_MULTISTEP_H_PLATEAU_PATIENCE=3
+export QSP_MULTISTEP_H_PLATEAU_PATIENCE=2
 export QSP_MULTISTEP_H_PLATEAU_MIN_DELTA=5e-4
 
 # Tune dataloader workers from allocated CPU cores.
@@ -59,17 +59,22 @@ export QSP_PIN_MEMORY=1
 
 # 4 Hamiltoniane x 200 traiettorie train = 800 train totali.
 export QSP_BATCH_SIZE=64
-export QSP_EPOCHS=280
+export QSP_EPOCHS=900
 export QSP_HYBRID_TEACHER_FORCING_EPOCHS=30
-export QSP_LEARNING_RATE=1e-4
+export QSP_LEARNING_RATE=8e-5
 export QSP_WEIGHT_DECAY=1e-5
 export QSP_GRAD_CLIP_MAX_NORM=0.3
 export QSP_TRAIN_SEQUENCES=1600
 export QSP_TEST_SEQUENCES=400
-export QSP_EARLY_STOPPING_MIN_EPOCHS=80
-export QSP_EARLY_STOPPING_PATIENCE=150
-export QSP_SCHEDULER_TOTAL_STEPS_CAP=0
-export QSP_AUTO_RESUME=0
+export QSP_EARLY_STOPPING_MIN_EPOCHS=300
+export QSP_EARLY_STOPPING_PATIENCE=260
+export QSP_SCHEDULER_TOTAL_STEPS_CAP=4200
+export QSP_SCHEDULER_PCT_START=0.05
+export QSP_AUTO_RESUME=1
+export QSP_RESET_OPTIMIZER_ON_RESUME=1
+# Bootstrap per il checkpoint esistente: il run buono era arrivato circa a H=47.
+# I prossimi checkpoint salveranno automaticamente current_horizon.
+export QSP_RESUME_HORIZON_OVERRIDE=47
 
 # Under sbatch, $0 points to a temporary copy in /var/spool/slurmd/... .
 # SLURM_SUBMIT_DIR preserves the directory from which the job was submitted.

@@ -202,12 +202,23 @@ GRAD_CLIP_MAX_NORM = _env_float("QSP_GRAD_CLIP_MAX_NORM", 1.0)
 LOG_FIDELITY_EPS = _env_float("QSP_LOG_FIDELITY_EPS", 1e-8)
 # I tensori complessi in float16 finiscono in ComplexHalf, ancora sperimentale in PyTorch.
 USE_AMP = _env_bool("QSP_USE_AMP", False)
+RESET_OPTIMIZER_ON_RESUME = _env_bool("QSP_RESET_OPTIMIZER_ON_RESUME", False)
+RESUME_HORIZON_OVERRIDE = _env_int("QSP_RESUME_HORIZON_OVERRIDE", 0)
+if RESUME_HORIZON_OVERRIDE < 0:
+    raise ValueError(
+        f"RESUME_HORIZON_OVERRIDE deve essere >= 0, ricevuto: {RESUME_HORIZON_OVERRIDE}"
+    )
 # Cap opzionale per evitare warmup eccessivamente lenti in run con molte epoche.
 # 0 disattiva il cap.
 SCHEDULER_TOTAL_STEPS_CAP = _env_int("QSP_SCHEDULER_TOTAL_STEPS_CAP", 0)
 if SCHEDULER_TOTAL_STEPS_CAP < 0:
     raise ValueError(
         f"SCHEDULER_TOTAL_STEPS_CAP deve essere >= 0, ricevuto: {SCHEDULER_TOTAL_STEPS_CAP}"
+    )
+SCHEDULER_PCT_START = _env_float("QSP_SCHEDULER_PCT_START", 0.10)
+if not (0.0 < SCHEDULER_PCT_START < 1.0):
+    raise ValueError(
+        f"SCHEDULER_PCT_START deve stare in (0,1), ricevuto: {SCHEDULER_PCT_START}"
     )
 
 # Curriculum dell'orizzonte multi-step:

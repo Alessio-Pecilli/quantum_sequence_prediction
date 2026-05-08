@@ -285,6 +285,7 @@ def main():
             scheduler_state_dict=resume_state.scheduler_state_dict,
             best_objective=resume_state.best_objective,
             best_state=resume_state.best_state,
+            current_horizon_state=resume_state.current_horizon,
         )
         if main_process:
             plot_training_curves(history)

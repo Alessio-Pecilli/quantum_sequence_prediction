@@ -112,6 +112,7 @@ class ResumeCheckpointState:
     scheduler_state_dict: dict | None
     best_objective: float | None
     best_state: dict | None
+    current_horizon: int | None
     resumed: bool
     reason: str
 
@@ -226,6 +227,7 @@ def _empty_resume_state(reason: str) -> ResumeCheckpointState:
         scheduler_state_dict=None,
         best_objective=None,
         best_state=None,
+        current_horizon=None,
         resumed=False,
         reason=reason,
     )
@@ -248,6 +250,7 @@ def _checkpoint_config_snapshot() -> dict[str, object]:
         "WEIGHT_DECAY": float(config.WEIGHT_DECAY),
         "USE_AMP": bool(config.USE_AMP),
         "SCHEDULER_TOTAL_STEPS_CAP": int(config.SCHEDULER_TOTAL_STEPS_CAP),
+        "SCHEDULER_PCT_START": float(config.SCHEDULER_PCT_START),
         "D_MODEL": int(config.D_MODEL),
         "NUM_HEADS": int(config.NUM_HEADS),
         "NUM_LAYERS": int(config.NUM_LAYERS),
@@ -280,8 +283,20 @@ def _checkpoint_config_snapshot() -> dict[str, object]:
 def _checkpoint_config_mismatches(saved_config: dict[str, object]) -> list[str]:
     current_config = _checkpoint_config_snapshot()
     mismatches: list[str] = []
+    schedule_keys = {
+        "EPOCHS",
+        "HYBRID_TEACHER_FORCING_EPOCHS",
+        "MULTISTEP_H_PLATEAU_PATIENCE",
+        "MULTISTEP_H_PLATEAU_MIN_DELTA",
+        "EARLY_STOPPING_PATIENCE",
+        "EARLY_STOPPING_MIN_EPOCHS",
+        "SCHEDULER_TOTAL_STEPS_CAP",
+        "SCHEDULER_PCT_START",
+    }
+    if config.RESET_OPTIMIZER_ON_RESUME:
+        schedule_keys.update({"LEARNING_RATE", "WEIGHT_DECAY"})
     for key, current_value in current_config.items():
-        if key == "EPOCHS":
+        if key in schedule_keys:
             continue
         if key not in saved_config:
             continue
@@ -335,15 +350,27 @@ def try_resume_from_last_checkpoint(model: torch.nn.Module) -> ResumeCheckpointS
         last_completed_epoch = max(last_completed_epoch, int(history.epochs[-1]))
 
     best_objective = payload.get("best_objective", payload.get("best_loss"))
+    optimizer_state = payload.get("optimizer_state_dict")
+    scheduler_state = payload.get("scheduler_state_dict")
+    resume_note = f"resume da {config.LAST_CHECKPOINT_PATH} (ultima epoca completa: {last_completed_epoch})"
+    if config.RESET_OPTIMIZER_ON_RESUME:
+        optimizer_state = None
+        scheduler_state = None
+        resume_note += "; optimizer/scheduler reinizializzati"
     return ResumeCheckpointState(
         start_epoch=max(1, last_completed_epoch + 1),
         history=history,
-        optimizer_state_dict=payload.get("optimizer_state_dict"),
-        scheduler_state_dict=payload.get("scheduler_state_dict"),
+        optimizer_state_dict=optimizer_state,
+        scheduler_state_dict=scheduler_state,
         best_objective=None if best_objective is None else float(best_objective),
         best_state=payload.get("best_state_dict"),
+        current_horizon=(
+            int(payload["current_horizon"])
+            if "current_horizon" in payload and payload["current_horizon"] is not None
+            else None
+        ),
         resumed=True,
-        reason=f"resume da {config.LAST_CHECKPOINT_PATH} (ultima epoca completa: {last_completed_epoch})",
+        reason=resume_note,
     )
 
 
@@ -693,6 +720,7 @@ def _save_last_checkpoint(
     epoch: int,
     best_objective: float,
     best_state: dict | None,
+    current_horizon: int | None = None,
 ):
     if not config.SAVE_MODEL or not _is_main_process():
         return
@@ -710,6 +738,7 @@ def _save_last_checkpoint(
         "best_objective": float(best_objective),
         "best_loss": float(best_objective),
         "best_state_dict": best_state,
+        "current_horizon": None if current_horizon is None else int(current_horizon),
         "config": {
             **_checkpoint_config_snapshot(),
         },
@@ -733,6 +762,7 @@ def train_model(
     scheduler_state_dict: dict | None = None,
     best_objective: float | None = None,
     best_state: dict | None = None,
+    current_horizon_state: int | None = None,
 ) -> tuple[TrainingHistory, AdaptiveTrainingTrace, ModelSelectionTrace]:
     history = history or TrainingHistory(epochs=[], train_loss=[], train_fidelity=[])
     rank, world_size = _dist_rank_world()
@@ -787,7 +817,7 @@ def train_model(
         optimizer,
         max_lr=config.LEARNING_RATE,
         total_steps=total_scheduler_steps,
-        pct_start=0.1,  # 10% warmup
+        pct_start=float(config.SCHEDULER_PCT_START),
         anneal_strategy="cos",
     )
     criterion = NegativeLogFidelityLoss()
@@ -798,7 +828,16 @@ def train_model(
         scheduler.load_state_dict(scheduler_state_dict)
 
     best_objective = float("-inf") if best_objective is None else float(best_objective)
-    current_horizon = int(config.MULTISTEP_H_START)
+    if current_horizon_state is not None:
+        current_horizon = int(current_horizon_state)
+    elif start_epoch > 1 and int(config.RESUME_HORIZON_OVERRIDE) > 0:
+        current_horizon = int(config.RESUME_HORIZON_OVERRIDE)
+    else:
+        current_horizon = int(config.MULTISTEP_H_START)
+    current_horizon = max(
+        int(config.MULTISTEP_H_START),
+        min(int(current_horizon), int(config.MULTISTEP_H_MAX)),
+    )
     eval_horizon = int(config.MULTISTEP_H_MAX)
     plateau_best_tf_loss = float("inf")
     plateau_epochs = 0
@@ -935,6 +974,7 @@ def train_model(
                         epoch=last_completed_epoch,
                         best_objective=best_objective,
                         best_state=best_state,
+                        current_horizon=current_horizon,
                     )
 
             global_loss_sum = _allreduce_scalar(loss_sum)
@@ -1081,6 +1121,7 @@ def train_model(
                     epoch=epoch,
                     best_objective=best_objective,
                     best_state=best_state,
+                    current_horizon=current_horizon,
                 )
             if (
                 validation_states is not None
@@ -1108,6 +1149,7 @@ def train_model(
             epoch=last_completed_epoch,
             best_objective=best_objective,
             best_state=best_state,
+            current_horizon=current_horizon,
         )
 
     if best_state is not None:
@@ -1128,6 +1170,7 @@ def train_model(
             epoch=last_completed_epoch,
             best_objective=best_objective,
             best_state=best_state,
+            current_horizon=current_horizon,
         )
 
     adaptive_trace = AdaptiveTrainingTrace(
