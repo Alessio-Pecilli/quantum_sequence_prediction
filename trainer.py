@@ -1641,13 +1641,18 @@ def compute_per_h_observable_curves(
                 elif h_id == 2:
                     probs_t = torch.abs(true_h[:, t, :]) ** 2
                     probs_p = torch.abs(pred_h[:, t, :]) ** 2
-                    n0 = (1.0 - z_eigs[0]) * 0.5
-                    n1 = (1.0 - z_eigs[1]) * 0.5
-                    n2 = (1.0 - z_eigs[2]) * 0.5
-                    n3 = (1.0 - z_eigs[3]) * 0.5
-                    n4 = (1.0 - z_eigs[4]) * 0.5
-                    n5 = (1.0 - z_eigs[5]) * 0.5
-                    d = torch.stack([n0 * n1, n2 * n3, n4 * n5], dim=0).mean(dim=0)
+                    # Doublon-density style observable on consecutive spinful pairs:
+                    # (0,1), (2,3), ... . This matches the 4-qubit Fermi-Hubbard
+                    # generator and avoids hardcoded indices tied to a specific N.
+                    occupation = (1.0 - z_eigs) * 0.5
+                    doublon_terms = [
+                        occupation[pair_start] * occupation[pair_start + 1]
+                        for pair_start in range(0, n_qubits - 1, 2)
+                    ]
+                    if doublon_terms:
+                        d = torch.stack(doublon_terms, dim=0).mean(dim=0)
+                    else:
+                        d = torch.zeros_like(z_eigs[0])
                     obs_true = probs_t @ d
                     obs_pred = probs_p @ d
                 else:
