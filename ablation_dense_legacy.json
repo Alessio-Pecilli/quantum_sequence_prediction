@@ -1,0 +1,18 @@
+{
+  "backend": "dense_legacy",
+  "num_parameters": 720287,
+  "epochs": 1,
+  "epoch_time_seconds": 1.3917624999994587,
+  "train_loss": 2.792266845703125,
+  "validation_loss": 2.717806577682495,
+  "train_fidelity_mean": 0.06012027710676193,
+  "validation_fidelity_mean": 0.06603070348501205,
+  "validation_fidelity_median": 0.0505044162273407,
+  "validation_fidelity_p10": 0.013981956988573074,
+  "validation_fidelity_p90": 0.10271070897579193,
+  "train_teacher_forced_mean": 0.06012027710676193,
+  "validation_teacher_forced_mean": 0.06603070348501205,
+  "reconstruction_fidelity_autoencoder_initial": 0.05228399485349655,
+  "reconstruction_fidelity_autoencoder_final": 0.7737730145454407,
+  "reconstruction_fidelity_autoencoder_gain": 0.7214890196919441
+}

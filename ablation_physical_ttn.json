@@ -1,0 +1,18 @@
+{
+  "backend": "physical_ttn",
+  "num_parameters": 688224,
+  "epochs": 1,
+  "epoch_time_seconds": 1.3827846000021964,
+  "train_loss": 2.949287176132202,
+  "validation_loss": 3.1573474407196045,
+  "train_fidelity_mean": 0.05446946620941162,
+  "validation_fidelity_mean": 0.04624491184949875,
+  "validation_fidelity_median": 0.042912185192108154,
+  "validation_fidelity_p10": 0.005724640563130379,
+  "validation_fidelity_p90": 0.09465297311544418,
+  "train_teacher_forced_mean": 0.05446946620941162,
+  "validation_teacher_forced_mean": 0.04624491184949875,
+  "reconstruction_fidelity_autoencoder_initial": 0.0876636728644371,
+  "reconstruction_fidelity_autoencoder_final": 0.17592808604240417,
+  "reconstruction_fidelity_autoencoder_gain": 0.08826441317796707
+}
