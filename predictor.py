@@ -6,7 +6,8 @@ import torch
 import torch.nn as nn
 
 import config
-from embedding import ComplexEmbedding, TTNEncoder, unpack_clamped_state_features
+from embedding import ComplexEmbedding, FlatCoefficientTTNEncoder, unpack_clamped_state_features
+from physical_ttn import PhysicalQubitTTNDecoder, PhysicalQubitTTNEncoder, infer_num_qubits_from_dim
 
 
 def normalize_state(states: torch.Tensor) -> torch.Tensor:
@@ -37,6 +38,23 @@ def quantum_fidelity(predicted: torch.Tensor, target: torch.Tensor) -> torch.Ten
     return fidelity.clamp(0.0, 1.0)
 
 
+def align_global_phase_to_target(
+    predicted: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    if not torch.is_complex(predicted) or not torch.is_complex(target):
+        raise ValueError("align_global_phase_to_target richiede tensori complessi.")
+    pred_norm = normalize_state(predicted)
+    target_norm = normalize_state(target)
+    overlap = torch.sum(target_norm.conj() * pred_norm, dim=-1, keepdim=True)
+    overlap_abs = torch.abs(overlap)
+    unit_phase = overlap / overlap_abs.clamp(min=eps)
+    unit_phase = torch.where(overlap_abs > eps, unit_phase, torch.ones_like(unit_phase))
+    return predicted * unit_phase.conj()
+
+
 class NegativeLogFidelityLoss(nn.Module):
     def __init__(self, epsilon: float = config.LOG_FIDELITY_EPS):
         super().__init__()
@@ -54,7 +72,8 @@ class ComplexMSELoss(nn.Module):
         self.mse = nn.MSELoss()
 
     def forward(self, predicted: torch.Tensor, target: torch.Tensor):
-        pred_real = torch.view_as_real(predicted)
+        predicted_aligned = align_global_phase_to_target(predicted, target)
+        pred_real = torch.view_as_real(predicted_aligned)
         target_real = torch.view_as_real(target)
         loss = self.mse(pred_real, target_real)
         with torch.no_grad():
@@ -160,6 +179,9 @@ class TTNDecoder(nn.Module):
         return out_complex.reshape(*leading_shape, self.dim_2n)
 
 
+FlatCoefficientTTNDecoder = TTNDecoder
+
+
 class DenseLegacyDecoder(nn.Module):
     def __init__(self, dim_2n: int, d_model: int):
         super().__init__()
@@ -191,27 +213,42 @@ class QuantumSequencePredictor(nn.Module):
         self.dim_2n = int(dim_2n)
         if self.dim_2n < 2:
             raise ValueError(f"dim_2n deve essere >= 2, ricevuto: {self.dim_2n}")
-        inferred_qubits = int(math.log2(self.dim_2n))
-        if 2 ** inferred_qubits != self.dim_2n:
-            raise ValueError(
-                f"dim_2n={self.dim_2n} non e' una potenza di 2, impossibile costruire TTN perfetto."
-            )
+        inferred_qubits = infer_num_qubits_from_dim(self.dim_2n)
 
         self.embedding_backend = str(config.EMBEDDING_BACKEND)
-        if self.embedding_backend == "ttn":
-            self.embedding = TTNEncoder(
+        if self.embedding_backend == "physical_ttn":
+            self.embedding = PhysicalQubitTTNEncoder(
+                num_qubits=inferred_qubits,
+                d_model=d_model,
+                bond_dim=config.TTN_BOND_DIM,
+                root_dim=config.TTN_ROOT_DIM,
+                use_bond_cap=config.TTN_USE_BOND_CAP,
+                pairing=config.TTN_TREE_PAIRING,
+            )
+            self.decoder = PhysicalQubitTTNDecoder(
+                num_qubits=inferred_qubits,
+                d_model=d_model,
+                bond_dim=config.TTN_BOND_DIM,
+                root_dim=config.TTN_ROOT_DIM,
+                use_bond_cap=config.TTN_USE_BOND_CAP,
+                pairing=config.TTN_TREE_PAIRING,
+            )
+        elif self.embedding_backend == "flat_ttn":
+            self.embedding = FlatCoefficientTTNEncoder(
                 num_qubits=inferred_qubits,
                 latent_dim=config.TTN_LATENT_DIM,
                 d_model=d_model,
             )
-            self.decoder = TTNDecoder(
+            self.decoder = FlatCoefficientTTNDecoder(
                 num_qubits=inferred_qubits,
                 latent_dim=config.TTN_LATENT_DIM,
                 d_model=d_model,
             )
-        else:
+        elif self.embedding_backend == "dense_legacy":
             self.embedding = ComplexEmbedding(dim_2n=self.dim_2n, d_model=d_model)
             self.decoder = DenseLegacyDecoder(dim_2n=self.dim_2n, d_model=d_model)
+        else:
+            raise ValueError(f"Unsupported embedding backend: {self.embedding_backend}")
         self.param_embedding = nn.Sequential(
             nn.Linear(6, d_model),
             nn.GELU(),

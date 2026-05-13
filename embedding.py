@@ -130,3 +130,6 @@ class TTNEncoder(nn.Module):
         x = self.pre_output_norm(x)
         x = self.output_projection(x)
         return x.reshape(*leading_shape, x.shape[-1])
+
+
+FlatCoefficientTTNEncoder = TTNEncoder

@@ -67,7 +67,7 @@ def get_active_env_overrides() -> dict[str, dict[str, object]]:
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 # Directory risultati configurabile via env per separare run/ablation.
-RESULTS_DIR = PROJECT_ROOT / os.getenv("QSP_RESULTS_DIR_NAME", "results_8q_ttn_sanity")
+RESULTS_DIR = PROJECT_ROOT / os.getenv("QSP_RESULTS_DIR_NAME", "results")
 CHECKPOINT_PATH = RESULTS_DIR / "best_model.pt"
 LAST_CHECKPOINT_PATH = RESULTS_DIR / "last_checkpoint.pt"
 SUMMARY_PATH = RESULTS_DIR / "run_summary.json"
@@ -170,6 +170,10 @@ X_BASIS_SAMPLE_WITH_REPLACEMENT = INITIAL_STATE_SAMPLE_WITH_REPLACEMENT
 
 D_MODEL = _env_int("QSP_D_MODEL", 128)
 TTN_LATENT_DIM = _env_int("QSP_TTN_LATENT_DIM", 96)
+TTN_BOND_DIM = _env_int("QSP_TTN_BOND_DIM", TTN_LATENT_DIM)
+TTN_ROOT_DIM = _env_int("QSP_TTN_ROOT_DIM", TTN_BOND_DIM)
+TTN_USE_BOND_CAP = _env_bool("QSP_TTN_USE_BOND_CAP", True)
+TTN_TREE_PAIRING = _env_str("QSP_TTN_TREE_PAIRING", "adjacent")
 NUM_HEADS = _env_int("QSP_NUM_HEADS", 8)
 NUM_LAYERS = _env_int("QSP_NUM_LAYERS", 4)
 DIM_FEEDFORWARD = _env_int("QSP_DIM_FEEDFORWARD", 384)
@@ -180,6 +184,34 @@ if D_MODEL % NUM_HEADS != 0:
     raise ValueError("D_MODEL deve essere divisibile per NUM_HEADS.")
 if not (0.0 <= DROPOUT < 1.0):
     raise ValueError(f"DROPOUT deve stare in [0,1), ricevuto: {DROPOUT}")
+if TTN_BOND_DIM < 1 or TTN_ROOT_DIM < 1:
+    raise ValueError("TTN_BOND_DIM e TTN_ROOT_DIM devono essere >= 1.")
+if TTN_TREE_PAIRING not in {"adjacent"}:
+    raise ValueError(
+        f"TTN_TREE_PAIRING={TTN_TREE_PAIRING!r} non valida. "
+        "Valori ammessi: adjacent."
+    )
+
+
+def bond_dim_for_block(
+    num_physical_qubits_in_block: int,
+    *,
+    base_dim: int | None = None,
+    use_bond_cap: bool | None = None,
+) -> int:
+    num_physical_qubits_in_block = int(num_physical_qubits_in_block)
+    if num_physical_qubits_in_block < 1:
+        raise ValueError(
+            "num_physical_qubits_in_block deve essere >= 1, "
+            f"ricevuto: {num_physical_qubits_in_block}"
+        )
+    resolved_base_dim = int(TTN_BOND_DIM if base_dim is None else base_dim)
+    resolved_use_bond_cap = TTN_USE_BOND_CAP if use_bond_cap is None else bool(use_bond_cap)
+    if resolved_base_dim < 1:
+        raise ValueError(f"base_dim deve essere >= 1, ricevuto: {resolved_base_dim}")
+    if resolved_use_bond_cap:
+        return min(resolved_base_dim, 2 ** num_physical_qubits_in_block)
+    return resolved_base_dim
 
 
 def _default_power_batch_size() -> int:
@@ -474,10 +506,12 @@ if OUTPUT_PARAMETRIZATION not in {"direct_complex", "logamp_phase"}:
 
 # Backend embedding/decoder:
 # - "dense_legacy": percorso storico flat Re/Im clampato (2*2^N-1)
-# - "ttn": Tree Tensor Network encoder/decoder
-EMBEDDING_BACKEND = _env_str("QSP_EMBEDDING_BACKEND", "ttn")
-if EMBEDDING_BACKEND not in {"dense_legacy", "ttn"}:
+# - "flat_ttn": vecchio TTN sui coefficienti flattenati
+# - "physical_ttn": nuovo TTN sui veri assi fisici dei qubit
+_embedding_backend_raw = _env_str("QSP_EMBEDDING_BACKEND", "physical_ttn")
+EMBEDDING_BACKEND = "flat_ttn" if _embedding_backend_raw == "ttn" else _embedding_backend_raw
+if EMBEDDING_BACKEND not in {"dense_legacy", "flat_ttn", "physical_ttn"}:
     raise ValueError(
         f"EMBEDDING_BACKEND={EMBEDDING_BACKEND!r} non valido. "
-        "Valori ammessi: dense_legacy, ttn."
+        "Valori ammessi: dense_legacy, flat_ttn, physical_ttn."
     )
