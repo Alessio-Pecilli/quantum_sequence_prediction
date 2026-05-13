@@ -20,7 +20,7 @@ from torch.utils.data.distributed import DistributedSampler
 import config
 from input import QuantumSequenceDataset
 from observables import batch_observables_tfim, precompute_observables
-from predictor import NegativeLogFidelityLoss, QuantumSequencePredictor, quantum_fidelity
+from predictor import CompositeQuantumLoss, NegativeLogFidelityLoss, QuantumSequencePredictor, quantum_fidelity
 
 H_LABELS = {0: "TFIM", 1: "XXZ", 2: "Fermi-Hubbard", 3: "Max-3-SAT"}
 
@@ -187,7 +187,7 @@ def build_loader(
     shuffle: bool,
 ) -> tuple[DataLoader, DistributedSampler | None]:
     dataset = QuantumSequenceDataset(states, params)
-    safe_batch_size = max(1, int(config.BATCH_SIZE) // 2)
+    safe_batch_size = max(1, int(config.BATCH_SIZE))
     _, world_size = _dist_rank_world()
     if (
         shuffle
@@ -217,6 +217,12 @@ def build_loader(
 
 def build_model() -> QuantumSequencePredictor:
     return QuantumSequencePredictor().to(config.DEVICE)
+
+
+def build_training_criterion():
+    if str(config.LOSS_TYPE) == "composite":
+        return CompositeQuantumLoss(fidelity_weight=float(config.COMPOSITE_FIDELITY_WEIGHT))
+    return NegativeLogFidelityLoss()
 
 
 def _empty_resume_state(reason: str) -> ResumeCheckpointState:
@@ -786,7 +792,7 @@ def train_model(
     )
     loader, distributed_sampler = build_loader(train_states, train_params, shuffle=True)
     steps_per_epoch = len(loader)
-    local_batch_size = max(1, int(config.BATCH_SIZE) // 2)
+    local_batch_size = max(1, int(config.BATCH_SIZE))
     if config.TRAIN_DIAGNOSTICS:
         if torch.cuda.is_available():
             current_device = int(torch.cuda.current_device())
@@ -820,7 +826,7 @@ def train_model(
         pct_start=float(config.SCHEDULER_PCT_START),
         anneal_strategy="cos",
     )
-    criterion = NegativeLogFidelityLoss()
+    criterion = build_training_criterion()
 
     if optimizer_state_dict is not None:
         optimizer.load_state_dict(optimizer_state_dict)
@@ -1193,7 +1199,7 @@ def evaluate_teacher_forced(
     params: torch.Tensor,
 ) -> EvaluationResult:
     model.eval()
-    criterion = NegativeLogFidelityLoss()
+    criterion = build_training_criterion()
     loader, _ = build_loader(states, params, shuffle=False)
 
     total_loss = 0.0

@@ -168,7 +168,8 @@ def sample_hamiltonian_instance(
     n_qubits: int,
     rng: random.Random,
 ) -> tuple[int, torch.Tensor, torch.Tensor]:
-    h_id = int(rng.choice([0, 1, 2, 3]))
+    supported_ids = [0, 1, 2, 3] if int(n_qubits) == 4 else [0, 1]
+    h_id = int(rng.choice(supported_ids))
     if h_id == 0:
         p1 = float(rng.uniform(0.2, 2.0))
         p2 = float(rng.uniform(0.2, 2.0))

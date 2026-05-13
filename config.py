@@ -67,7 +67,7 @@ def get_active_env_overrides() -> dict[str, dict[str, object]]:
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 # Directory risultati configurabile via env per separare run/ablation.
-RESULTS_DIR = PROJECT_ROOT / os.getenv("QSP_RESULTS_DIR_NAME", "results_multi_4q_h100")
+RESULTS_DIR = PROJECT_ROOT / os.getenv("QSP_RESULTS_DIR_NAME", "results_8q_ttn_sanity")
 CHECKPOINT_PATH = RESULTS_DIR / "best_model.pt"
 LAST_CHECKPOINT_PATH = RESULTS_DIR / "last_checkpoint.pt"
 SUMMARY_PATH = RESULTS_DIR / "run_summary.json"
@@ -83,7 +83,7 @@ PER_H_OBSERVABLES_PLOT_PATH = RESULTS_DIR / "per_h_observables_vs_time.png"
 SEED = _env_int("QSP_SEED", 7)
 
 
-N_QUBITS = _env_int("QSP_N_QUBITS", 4)
+N_QUBITS = _env_int("QSP_N_QUBITS", 8)
 if N_QUBITS < 1:
     raise ValueError(f"N_QUBITS deve essere >= 1, ricevuto: {N_QUBITS}")
 
@@ -94,8 +94,8 @@ def _default_by_qubits(defaults: dict[int, int], fallback: int) -> int:
     return int(defaults.get(int(N_QUBITS), fallback))
 
 # Numero totale di stati in ogni traiettoria, incluso psi(0).
-# Con 101 stati totali otteniamo un orizzonte di 100 predizioni.
-NUM_STATES = _env_int("QSP_NUM_STATES", 101)
+# Default desktop 8-qubit: 33 stati totali -> orizzonte di 32 predizioni.
+NUM_STATES = _env_int("QSP_NUM_STATES", 17)
 if NUM_STATES < 2:
     raise ValueError(f"NUM_STATES deve essere >= 2, ricevuto: {NUM_STATES}")
 
@@ -108,8 +108,8 @@ def _is_long_horizon() -> bool:
     return int(NUM_STATES) >= 60
 
 
-TRAIN_SEQUENCES = _env_int("QSP_TRAIN_SEQUENCES", 4000)
-TEST_SEQUENCES = _env_int("QSP_TEST_SEQUENCES", 1000)
+TRAIN_SEQUENCES = _env_int("QSP_TRAIN_SEQUENCES", 1200)
+TEST_SEQUENCES = _env_int("QSP_TEST_SEQUENCES", 256)
 if TRAIN_SEQUENCES < 1 or TEST_SEQUENCES < 1:
     raise ValueError("TRAIN_SEQUENCES e TEST_SEQUENCES devono essere >= 1.")
 
@@ -131,7 +131,7 @@ if BOUNDARY_CONDITION != "open":
 COUPLING_MEAN = _env_float("QSP_COUPLING_MEAN", 1.0)
 COUPLING_STD = _env_float("QSP_COUPLING_STD", 1.0)
 FIELD_STRENGTH = _env_float("QSP_FIELD_STRENGTH", 1.0)
-TIME_STEP = _env_float("QSP_TIME_STEP", 1.0)
+TIME_STEP = _env_float("QSP_TIME_STEP", 0.25)
 DT = TIME_STEP
 if COUPLING_STD < 0.0:
     raise ValueError(f"COUPLING_STD deve essere >= 0, ricevuto: {COUPLING_STD}")
@@ -169,10 +169,11 @@ X_BASIS_SAMPLE_WITH_REPLACEMENT = INITIAL_STATE_SAMPLE_WITH_REPLACEMENT
 
 
 D_MODEL = _env_int("QSP_D_MODEL", 128)
+TTN_LATENT_DIM = _env_int("QSP_TTN_LATENT_DIM", 96)
 NUM_HEADS = _env_int("QSP_NUM_HEADS", 8)
-NUM_LAYERS = _env_int("QSP_NUM_LAYERS", 6)
-DIM_FEEDFORWARD = _env_int("QSP_DIM_FEEDFORWARD", 512)
-DROPOUT = _env_float("QSP_DROPOUT", 0.1)
+NUM_LAYERS = _env_int("QSP_NUM_LAYERS", 4)
+DIM_FEEDFORWARD = _env_int("QSP_DIM_FEEDFORWARD", 384)
+DROPOUT = _env_float("QSP_DROPOUT", 0.0)
 if D_MODEL <= 0 or NUM_HEADS <= 0 or NUM_LAYERS <= 0 or DIM_FEEDFORWARD <= 0:
     raise ValueError("D_MODEL, NUM_HEADS, NUM_LAYERS e DIM_FEEDFORWARD devono essere > 0.")
 if D_MODEL % NUM_HEADS != 0:
@@ -183,26 +184,42 @@ if not (0.0 <= DROPOUT < 1.0):
 
 def _default_power_batch_size() -> int:
     if not torch.cuda.is_available():
-        return 32 if _is_long_horizon() else 128
+        if N_QUBITS >= 8:
+            return 16
+        return 16 if _is_long_horizon() else 32
     try:
         total_memory_gib = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
     except Exception:
-        return 64
-    return 128 if total_memory_gib >= 8.0 else 64
+        return 16 if N_QUBITS >= 8 else 32
+    if N_QUBITS >= 8:
+        return 32 if total_memory_gib >= 12.0 else 16
+    return 64 if total_memory_gib >= 8.0 else 32
 
 
 BATCH_SIZE = _env_int("QSP_BATCH_SIZE", _default_power_batch_size())
 EPOCHS = _env_int(
     "QSP_EPOCHS",
-    _default_by_qubits({4: 2000, 6: 1500}, 120),
+    _default_by_qubits({4: 600, 6: 500, 8: 100}, 80),
 )
-LEARNING_RATE = _env_float("QSP_LEARNING_RATE", 5e-4)
+LEARNING_RATE = _env_float("QSP_LEARNING_RATE", 4e-4)
 WEIGHT_DECAY = _env_float("QSP_WEIGHT_DECAY", 1e-4)
 GRAD_CLIP_MAX_NORM = _env_float("QSP_GRAD_CLIP_MAX_NORM", 1.0)
 LOG_FIDELITY_EPS = _env_float("QSP_LOG_FIDELITY_EPS", 1e-8)
+LOSS_TYPE = _env_str("QSP_LOSS_TYPE", "composite")
+if LOSS_TYPE not in {"fidelity", "composite"}:
+    raise ValueError(
+        f"LOSS_TYPE={LOSS_TYPE!r} non valida. "
+        "Valori ammessi: fidelity, composite."
+    )
+COMPOSITE_FIDELITY_WEIGHT = _env_float("QSP_COMPOSITE_FIDELITY_WEIGHT", 0.85)
+if not (0.0 <= COMPOSITE_FIDELITY_WEIGHT <= 1.0):
+    raise ValueError(
+        "COMPOSITE_FIDELITY_WEIGHT deve stare in [0,1], "
+        f"ricevuto: {COMPOSITE_FIDELITY_WEIGHT}"
+    )
 # I tensori complessi in float16 finiscono in ComplexHalf, ancora sperimentale in PyTorch.
 USE_AMP = _env_bool("QSP_USE_AMP", False)
-RESET_OPTIMIZER_ON_RESUME = _env_bool("QSP_RESET_OPTIMIZER_ON_RESUME", False)
+RESET_OPTIMIZER_ON_RESUME = _env_bool("QSP_RESET_OPTIMIZER_ON_RESUME", True)
 RESUME_HORIZON_OVERRIDE = _env_int("QSP_RESUME_HORIZON_OVERRIDE", 0)
 if RESUME_HORIZON_OVERRIDE < 0:
     raise ValueError(
@@ -215,7 +232,7 @@ if SCHEDULER_TOTAL_STEPS_CAP < 0:
     raise ValueError(
         f"SCHEDULER_TOTAL_STEPS_CAP deve essere >= 0, ricevuto: {SCHEDULER_TOTAL_STEPS_CAP}"
     )
-SCHEDULER_PCT_START = _env_float("QSP_SCHEDULER_PCT_START", 0.10)
+SCHEDULER_PCT_START = _env_float("QSP_SCHEDULER_PCT_START", 0.02)
 if not (0.0 < SCHEDULER_PCT_START < 1.0):
     raise ValueError(
         f"SCHEDULER_PCT_START deve stare in (0,1), ricevuto: {SCHEDULER_PCT_START}"
@@ -224,7 +241,7 @@ if not (0.0 < SCHEDULER_PCT_START < 1.0):
 # Curriculum dell'orizzonte multi-step:
 # partiamo prudenti e cresciamo solo dopo plateau sul validation teacher-forced.
 MULTISTEP_H_START = _env_int("QSP_MULTISTEP_H_START", min(8, int(SEQ_LEN)))
-MULTISTEP_H_MAX = _env_int("QSP_MULTISTEP_H_MAX", min(100, int(SEQ_LEN)))
+MULTISTEP_H_MAX = _env_int("QSP_MULTISTEP_H_MAX", min(12, int(SEQ_LEN)))
 # Alias retrocompatibile: rappresenta l'orizzonte massimo/evaluation horizon.
 MULTISTEP_H = _env_int("QSP_MULTISTEP_H", int(MULTISTEP_H_MAX))
 if not (1 <= MULTISTEP_H_START <= SEQ_LEN):
@@ -254,17 +271,17 @@ if MULTISTEP_TEACHER_FORCING_STEPS < 0:
         f"ricevuto: {MULTISTEP_TEACHER_FORCING_STEPS}"
     )
 MULTISTEP_EFFECTIVE_TEACHER_FORCING_STEPS = max(1, min(int(MULTISTEP_H), int(MULTISTEP_H) // 2))
-HYBRID_TEACHER_FORCING_EPOCHS = _env_int("QSP_HYBRID_TEACHER_FORCING_EPOCHS", min(int(EPOCHS), 600))
+HYBRID_TEACHER_FORCING_EPOCHS = _env_int("QSP_HYBRID_TEACHER_FORCING_EPOCHS", int(EPOCHS))
 MULTISTEP_TRAIN_VERBOSE = _env_bool("QSP_MULTISTEP_TRAIN_VERBOSE", False)
 TRAIN_DIAGNOSTICS = _env_bool("QSP_TRAIN_DIAGNOSTICS", True)
-TRAIN_DIAG_BATCH_PRINTS = _env_int("QSP_TRAIN_DIAG_BATCH_PRINTS", 2)
+TRAIN_DIAG_BATCH_PRINTS = _env_int("QSP_TRAIN_DIAG_BATCH_PRINTS", 1)
 if TRAIN_DIAG_BATCH_PRINTS < 0:
     raise ValueError(
         f"TRAIN_DIAG_BATCH_PRINTS deve essere >= 0, ricevuto: {TRAIN_DIAG_BATCH_PRINTS}"
     )
-MULTISTEP_H_PLATEAU_PATIENCE = _env_int("QSP_MULTISTEP_H_PLATEAU_PATIENCE", 250)
+MULTISTEP_H_PLATEAU_PATIENCE = _env_int("QSP_MULTISTEP_H_PLATEAU_PATIENCE", 90)
 MULTISTEP_H_PLATEAU_MIN_DELTA = _env_float("QSP_MULTISTEP_H_PLATEAU_MIN_DELTA", 1e-4)
-EARLY_STOPPING_PATIENCE = _env_int("QSP_EARLY_STOPPING_PATIENCE", 600)
+EARLY_STOPPING_PATIENCE = _env_int("QSP_EARLY_STOPPING_PATIENCE", 160)
 EARLY_STOPPING_MIN_EPOCHS = _env_int("QSP_EARLY_STOPPING_MIN_EPOCHS", HYBRID_TEACHER_FORCING_EPOCHS)
 if MULTISTEP_H_PLATEAU_PATIENCE < 1:
     raise ValueError(
@@ -428,7 +445,7 @@ SAVE_MODEL = _env_bool("QSP_SAVE_MODEL", True)
 # Se attivo, salta il training e ricalcola metriche/plot da best_model.pt.
 EVAL_ONLY = _env_bool("QSP_EVAL_ONLY", False)
 # Resume automatico: riparte dall'ultimo checkpoint compatibile se presente.
-AUTO_RESUME = _env_bool("QSP_AUTO_RESUME", True)
+AUTO_RESUME = _env_bool("QSP_AUTO_RESUME", False)
 CHECKPOINT_EVERY_EPOCH = _env_int("QSP_CHECKPOINT_EVERY_EPOCH", 1)
 if CHECKPOINT_EVERY_EPOCH < 1:
     raise ValueError(
@@ -448,9 +465,19 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # Parametrizzazione dell'output:
 # - "direct_complex": la rete produce Re/Im direttamente, poi normalizziamo.
 # - "logamp_phase": la rete produce (log ampiezza, fase) e costruiamo psi = exp(log_amp + i*phase), poi normalizziamo.
-OUTPUT_PARAMETRIZATION = _env_str("QSP_OUTPUT_PARAMETRIZATION", "logamp_phase")
+OUTPUT_PARAMETRIZATION = _env_str("QSP_OUTPUT_PARAMETRIZATION", "direct_complex")
 if OUTPUT_PARAMETRIZATION not in {"direct_complex", "logamp_phase"}:
     raise ValueError(
         f"OUTPUT_PARAMETRIZATION={OUTPUT_PARAMETRIZATION!r} non valida. "
         "Valori ammessi: direct_complex, logamp_phase."
+    )
+
+# Backend embedding/decoder:
+# - "dense_legacy": percorso storico flat Re/Im clampato (2*2^N-1)
+# - "ttn": Tree Tensor Network encoder/decoder
+EMBEDDING_BACKEND = _env_str("QSP_EMBEDDING_BACKEND", "ttn")
+if EMBEDDING_BACKEND not in {"dense_legacy", "ttn"}:
+    raise ValueError(
+        f"EMBEDDING_BACKEND={EMBEDDING_BACKEND!r} non valido. "
+        "Valori ammessi: dense_legacy, ttn."
     )

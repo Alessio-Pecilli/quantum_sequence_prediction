@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 
 import config
-from embedding import ComplexEmbedding, unpack_clamped_state_features
+from embedding import ComplexEmbedding, TTNEncoder, unpack_clamped_state_features
 
 
 def normalize_state(states: torch.Tensor) -> torch.Tensor:
@@ -63,6 +63,26 @@ class ComplexMSELoss(nn.Module):
         return loss, mean_fidelity, fidelity
 
 
+class CompositeQuantumLoss(nn.Module):
+    """
+    Loss composita per stabilizzare l'ottimizzazione TTN:
+    L = w * L_fidelity + (1 - w) * L_complex_mse
+    """
+
+    def __init__(self, fidelity_weight: float = 0.85):
+        super().__init__()
+        self.fidelity_weight = float(fidelity_weight)
+        self.fidelity_loss = NegativeLogFidelityLoss()
+        self.mse_loss = ComplexMSELoss()
+
+    def forward(self, predicted: torch.Tensor, target: torch.Tensor):
+        fid_loss, _, fidelity = self.fidelity_loss(predicted, target)
+        mse_loss, _, _ = self.mse_loss(predicted, target)
+        total = self.fidelity_weight * fid_loss + (1.0 - self.fidelity_weight) * mse_loss
+        mean_fidelity = fidelity.mean()
+        return total, mean_fidelity, fidelity
+
+
 class SinusoidalPositionalEncoding(nn.Module):
     def __init__(self, d_model: int, max_len: int):
         super().__init__()
@@ -79,6 +99,83 @@ class SinusoidalPositionalEncoding(nn.Module):
         return hidden + self.encoding[: hidden.shape[1]]
 
 
+class TTNDecoder(nn.Module):
+    def __init__(
+        self,
+        num_qubits: int,
+        latent_dim: int,
+        d_model: int,
+    ):
+        super().__init__()
+        self.num_qubits = int(num_qubits)
+        if self.num_qubits < 1:
+            raise ValueError(f"num_qubits deve essere >= 1, ricevuto: {self.num_qubits}")
+
+        self.dim_2n = 2 ** self.num_qubits
+        self.num_layers = int(math.log2(self.dim_2n))
+        if 2 ** self.num_layers != self.dim_2n:
+            raise ValueError(
+                f"dim_2n={self.dim_2n} non e' una potenza di 2, impossibile costruire TTN perfetto."
+            )
+
+        self.latent_dim = int(latent_dim)
+        self.initial_projection = nn.Linear(int(d_model), self.latent_dim)
+        self.initial_norm = nn.LayerNorm(self.latent_dim)
+        self.tree_layers = nn.ModuleList(
+            nn.Linear(self.latent_dim, 2 * self.latent_dim) for _ in range(self.num_layers - 1)
+        )
+        self.tree_norms = nn.ModuleList(nn.LayerNorm(self.latent_dim) for _ in range(self.num_layers - 1))
+        self.pre_final_norm = nn.LayerNorm(self.latent_dim)
+        self.final_layer = nn.Linear(self.latent_dim, 4)
+        self.activation = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[-1] != self.initial_projection.in_features:
+            raise ValueError(
+                f"Ultima dimensione non valida: atteso d_model={self.initial_projection.in_features}, "
+                f"ricevuto {x.shape[-1]}"
+            )
+
+        leading_shape = x.shape[:-1]
+        x = x.reshape(-1, x.shape[-1]).to(torch.float32)
+        x = self.activation(self.initial_projection(x))
+        x = self.initial_norm(x)
+        x = x.unsqueeze(1)
+
+        for layer_idx, layer in enumerate(self.tree_layers):
+            batch_size, length, latent_dim = x.shape
+            parent = x
+            x = self.activation(layer(x))
+            x = x.reshape(batch_size, length * 2, latent_dim)
+            skip = parent.unsqueeze(2).expand(batch_size, length, 2, latent_dim).reshape(
+                batch_size, length * 2, latent_dim
+            )
+            x = x + skip
+            x = self.tree_norms[layer_idx](x)
+
+        x = self.pre_final_norm(x)
+        x = self.final_layer(x)
+        x = x.reshape(x.shape[0], self.dim_2n, 2)
+        out_complex = torch.complex(x[..., 0], x[..., 1])
+        return out_complex.reshape(*leading_shape, self.dim_2n)
+
+
+class DenseLegacyDecoder(nn.Module):
+    def __init__(self, dim_2n: int, d_model: int):
+        super().__init__()
+        self.dim_2n = int(dim_2n)
+        self.feature_dim = 2 * self.dim_2n - 1
+        self.output_head = nn.Sequential(
+            nn.Linear(int(d_model), int(d_model)),
+            nn.GELU(),
+            nn.Linear(int(d_model), self.feature_dim),
+        )
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        raw_features = self.output_head(hidden)
+        return unpack_clamped_state_features(raw_features, dim_2n=self.dim_2n)
+
+
 class QuantumSequencePredictor(nn.Module):
     def __init__(
         self,
@@ -92,8 +189,29 @@ class QuantumSequencePredictor(nn.Module):
     ):
         super().__init__()
         self.dim_2n = int(dim_2n)
-        self.feature_dim = 2 * self.dim_2n - 1
-        self.embedding = ComplexEmbedding(dim_2n=dim_2n, d_model=d_model)
+        if self.dim_2n < 2:
+            raise ValueError(f"dim_2n deve essere >= 2, ricevuto: {self.dim_2n}")
+        inferred_qubits = int(math.log2(self.dim_2n))
+        if 2 ** inferred_qubits != self.dim_2n:
+            raise ValueError(
+                f"dim_2n={self.dim_2n} non e' una potenza di 2, impossibile costruire TTN perfetto."
+            )
+
+        self.embedding_backend = str(config.EMBEDDING_BACKEND)
+        if self.embedding_backend == "ttn":
+            self.embedding = TTNEncoder(
+                num_qubits=inferred_qubits,
+                latent_dim=config.TTN_LATENT_DIM,
+                d_model=d_model,
+            )
+            self.decoder = TTNDecoder(
+                num_qubits=inferred_qubits,
+                latent_dim=config.TTN_LATENT_DIM,
+                d_model=d_model,
+            )
+        else:
+            self.embedding = ComplexEmbedding(dim_2n=self.dim_2n, d_model=d_model)
+            self.decoder = DenseLegacyDecoder(dim_2n=self.dim_2n, d_model=d_model)
         self.param_embedding = nn.Sequential(
             nn.Linear(6, d_model),
             nn.GELU(),
@@ -112,11 +230,6 @@ class QuantumSequencePredictor(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.output_norm = nn.LayerNorm(d_model)
-        self.output_head = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
-            nn.Linear(d_model, self.feature_dim),
-        )
         self.register_buffer(
             "causal_mask",
             torch.triu(torch.ones(max_seq_len, max_seq_len, dtype=torch.bool), diagonal=1),
@@ -141,8 +254,7 @@ class QuantumSequencePredictor(nn.Module):
             src_key_padding_mask=padding_mask,
         )
         hidden = self.output_norm(hidden)
-        raw_features = self.output_head(hidden)
-        predicted = unpack_clamped_state_features(raw_features, dim_2n=self.dim_2n)
+        predicted = self.decoder(hidden)
         predicted = normalize_state(predicted)
         predicted = clamp_global_phase(predicted)
         return predicted

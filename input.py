@@ -717,8 +717,8 @@ def generate_haar_tfim_dataset(
     *,
     enable_distributed: bool = True,
 ) -> QuantumDatasetBundle:
-    if int(n_qubits) != 4:
-        raise ValueError("Il setup multi-H richiesto e' definito per 4 qubit.")
+    if int(n_qubits) < 1:
+        raise ValueError(f"n_qubits deve essere >= 1, ricevuto: {n_qubits}")
     if int(num_states) < 2:
         raise ValueError("Il setup richiesto usa almeno 2 stati per traiettoria.")
 
@@ -754,10 +754,17 @@ def generate_haar_tfim_dataset(
     all_states = torch.stack(trajectories, dim=0).contiguous()
     params = torch.stack(params_list, dim=0).to(torch.float32).contiguous()
     initial_state_codes = list(range(total_sequences))
+    class_names = {
+        0: "TFIM",
+        1: "XXZ",
+        2: "Fermi-Hubbard",
+        3: "Max-3-SAT",
+    }
+    active_class_names = [class_names[h_id] for h_id, count in class_counts.items() if count > 0]
     reason = (
         "stati iniziali Haar random da gaussiane complesse normalizzate; "
-        "4 classi Hamiltoniane con campionamento per traiettoria "
-        "(TFIM, XXZ, Fermi-Hubbard, Max-3-SAT), "
+        "classi Hamiltoniane campionate per traiettoria tra quelle supportate "
+        f"(active={active_class_names}), "
         "params=[H_ID,p1,p2,0,0,0], "
         f"n_qubits={int(n_qubits)}, num_states={int(num_states)}, "
         f"dt={float(config.TIME_STEP):.6g}, class_counts={class_counts}"
