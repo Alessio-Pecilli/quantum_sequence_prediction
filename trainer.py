@@ -52,6 +52,168 @@ def _load_model_state_dict(model: torch.nn.Module, state_dict: dict):
     _unwrap_model(model).load_state_dict(state_dict)
 
 
+def _first_nonfinite_parameter_name(model: torch.nn.Module) -> str | None:
+    for name, parameter in _unwrap_model(model).named_parameters():
+        if not torch.isfinite(parameter.detach()).all():
+            return name
+    return None
+
+
+def _first_nonfinite_grad_name(model: torch.nn.Module) -> str | None:
+    for name, parameter in _unwrap_model(model).named_parameters():
+        if parameter.grad is None:
+            continue
+        if not torch.isfinite(parameter.grad.detach()).all():
+            return name
+    return None
+
+
+def _gradient_topk_stats(model: torch.nn.Module, *, top_k: int = 10) -> list[tuple[str, float, float, tuple[int, ...]]]:
+    stats: list[tuple[str, float, float, tuple[int, ...]]] = []
+    for name, parameter in _unwrap_model(model).named_parameters():
+        grad = parameter.grad
+        if grad is None:
+            continue
+        grad_detached = grad.detach()
+        grad_abs_max = float(torch.abs(grad_detached).amax().item())
+        grad_norm64 = float(torch.linalg.vector_norm(grad_detached.to(torch.float64)).item())
+        stats.append((name, grad_abs_max, grad_norm64, tuple(int(dim) for dim in grad_detached.shape)))
+    stats.sort(key=lambda item: (item[1], item[2]), reverse=True)
+    return stats[: max(1, int(top_k))]
+
+
+def _print_gradient_topk(model: torch.nn.Module, *, top_k: int = 10):
+    top_stats = _gradient_topk_stats(model, top_k=top_k)
+    if not top_stats:
+        print("[safe-grad] nessun gradiente disponibile per top-k.", flush=True)
+        return
+    print(f"[safe-grad] top {len(top_stats)} gradienti per ampiezza:", flush=True)
+    for idx, (name, grad_abs_max, grad_norm64, shape) in enumerate(top_stats, start=1):
+        print(
+            f"[safe-grad] #{idx:02d} name={name} | grad_abs_max={grad_abs_max:.6e} | "
+            f"grad_norm64={grad_norm64:.6e} | shape={shape}",
+            flush=True,
+        )
+
+
+def _global_grad_norm_float64(model: torch.nn.Module) -> float:
+    grad_sq_sum = 0.0
+    for _, parameter in _unwrap_model(model).named_parameters():
+        grad = parameter.grad
+        if grad is None:
+            continue
+        grad64 = grad.detach().to(torch.float64)
+        grad_sq_sum += float(torch.sum(grad64 * grad64).item())
+    return float(grad_sq_sum ** 0.5)
+
+
+def safe_clip_gradients(
+    model: torch.nn.Module,
+    *,
+    max_norm: float,
+    grad_value_clip: float,
+    log_grad_norm: bool = False,
+) -> tuple[float, float, str | None]:
+    unwrapped = _unwrap_model(model)
+    first_bad_grad: str | None = None
+    for name, parameter in unwrapped.named_parameters():
+        grad = parameter.grad
+        if grad is None:
+            continue
+        if not torch.isfinite(grad.detach()).all():
+            if first_bad_grad is None:
+                first_bad_grad = name
+            print(f"[safe-grad] gradiente non finito rilevato nel parametro: {name}", flush=True)
+
+    if first_bad_grad is not None:
+        return float("nan"), float("nan"), first_bad_grad
+
+    if grad_value_clip > 0.0:
+        for _, parameter in unwrapped.named_parameters():
+            grad = parameter.grad
+            if grad is None:
+                continue
+            grad.detach().clamp_(-float(grad_value_clip), float(grad_value_clip))
+
+    global_norm_before = _global_grad_norm_float64(unwrapped)
+    global_norm_after = global_norm_before
+    if max_norm > 0.0 and np.isfinite(global_norm_before) and global_norm_before > float(max_norm):
+        scale = float(max_norm) / (global_norm_before + 1e-12)
+        for _, parameter in unwrapped.named_parameters():
+            grad = parameter.grad
+            if grad is None:
+                continue
+            grad.detach().mul_(scale)
+        global_norm_after = _global_grad_norm_float64(unwrapped)
+
+    if log_grad_norm:
+        print(
+            f"[safe-grad] global_grad_norm_before={global_norm_before:.6e} "
+            f"global_grad_norm_after={global_norm_after:.6e}",
+            flush=True,
+        )
+
+    if (not np.isfinite(global_norm_after)) and first_bad_grad is None:
+        _print_gradient_topk(unwrapped, top_k=10)
+    return global_norm_before, global_norm_after, None
+
+
+def _scalar_to_float(value: torch.Tensor | float | int) -> float:
+    if isinstance(value, torch.Tensor):
+        return float(value.detach().item())
+    return float(value)
+
+
+def _predicted_state_stats(states: torch.Tensor | None) -> tuple[float, float, float]:
+    if states is None:
+        return float("nan"), float("nan"), float("nan")
+    detached = states.detach()
+    abs_states = torch.abs(detached)
+    finite_abs = abs_states[torch.isfinite(abs_states)]
+    if finite_abs.numel() == 0:
+        amp_min = float("nan")
+        amp_max = float("nan")
+    else:
+        amp_min = float(finite_abs.min().item())
+        amp_max = float(finite_abs.max().item())
+    norms = torch.linalg.vector_norm(detached, dim=-1)
+    finite_norms = norms[torch.isfinite(norms)]
+    if finite_norms.numel() == 0:
+        norm_mean = float("nan")
+    else:
+        norm_mean = float(finite_norms.mean().item())
+    return amp_min, amp_max, norm_mean
+
+
+def _report_nonfinite_training_state(
+    *,
+    model: torch.nn.Module,
+    epoch: int,
+    batch_idx: int,
+    phase: str,
+    tf_loss: torch.Tensor,
+    ms_loss: torch.Tensor,
+    total_loss: torch.Tensor,
+    predicted_states: torch.Tensor | None,
+    reason: str,
+):
+    amp_min, amp_max, norm_mean = _predicted_state_stats(predicted_states)
+    bad_param = _first_nonfinite_parameter_name(model)
+    bad_grad = _first_nonfinite_grad_name(model)
+    print(
+        f"[nan-guard] {reason} | epoca={epoch} batch={batch_idx} fase={phase} | "
+        f"loss(tf/ms/tot)=({_scalar_to_float(tf_loss):.6e}/{_scalar_to_float(ms_loss):.6e}/{_scalar_to_float(total_loss):.6e}) | "
+        f"pred|min|max|norm=({amp_min:.6e}/{amp_max:.6e}/{norm_mean:.6e}) | "
+        f"first_bad_param={bad_param} | first_bad_grad={bad_grad}",
+        flush=True,
+    )
+
+
+def _maybe_abort_on_nonfinite(message: str):
+    if bool(config.ABORT_ON_NAN):
+        raise FloatingPointError(message)
+
+
 def _allreduce_scalar(value: float, *, op=dist.ReduceOp.SUM) -> float:
     if not _dist_is_initialized():
         return float(value)
@@ -161,6 +323,8 @@ class ModelSelectionTrace:
     rollout_weight: float
     multistep_weight: float
     teacher_forced_weight: float
+    checkpoint_mode: str = "best_val"
+    checkpoint_path: str = ""
 
 
 @dataclass
@@ -254,6 +418,9 @@ def _checkpoint_config_snapshot() -> dict[str, object]:
         "EPOCHS": int(config.EPOCHS),
         "LEARNING_RATE": float(config.LEARNING_RATE),
         "WEIGHT_DECAY": float(config.WEIGHT_DECAY),
+        "GRAD_CLIP_NORM": float(config.GRAD_CLIP_NORM),
+        "GRAD_VALUE_CLIP": float(config.GRAD_VALUE_CLIP),
+        "ABORT_ON_NAN": bool(config.ABORT_ON_NAN),
         "USE_AMP": bool(config.USE_AMP),
         "SCHEDULER_TOTAL_STEPS_CAP": int(config.SCHEDULER_TOTAL_STEPS_CAP),
         "SCHEDULER_PCT_START": float(config.SCHEDULER_PCT_START),
@@ -275,6 +442,9 @@ def _checkpoint_config_snapshot() -> dict[str, object]:
         "MULTISTEP_H": int(config.MULTISTEP_H),
         "MULTISTEP_TEACHER_FORCING_STEPS": int(config.MULTISTEP_TEACHER_FORCING_STEPS),
         "MULTISTEP_EFFECTIVE_TEACHER_FORCING_STEPS": int(config.MULTISTEP_EFFECTIVE_TEACHER_FORCING_STEPS),
+        "MULTISTEP_LOSS_WEIGHT": float(config.MULTISTEP_LOSS_WEIGHT),
+        "ROLLOUT_DETACH_EVERY": int(config.ROLLOUT_DETACH_EVERY),
+        "HYBRID_LR_MULT": float(config.HYBRID_LR_MULT),
         "HYBRID_TEACHER_FORCING_EPOCHS": int(config.HYBRID_TEACHER_FORCING_EPOCHS),
         "MULTISTEP_H_PLATEAU_PATIENCE": int(config.MULTISTEP_H_PLATEAU_PATIENCE),
         "MULTISTEP_H_PLATEAU_MIN_DELTA": float(config.MULTISTEP_H_PLATEAU_MIN_DELTA),
@@ -392,6 +562,25 @@ def _teacher_forcing_epochs() -> int:
 
 def _training_phase_for_epoch(epoch: int) -> str:
     return "teacher_forced" if int(epoch) <= _teacher_forcing_epochs() else "hybrid"
+
+
+def _lr_multiplier_for_phase(phase: str) -> float:
+    if phase == "hybrid":
+        return float(config.HYBRID_LR_MULT)
+    return 1.0
+
+
+def _apply_phase_learning_rate(
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    *,
+    phase: str,
+) -> float:
+    multiplier = _lr_multiplier_for_phase(phase)
+    base_lrs = scheduler.get_last_lr()
+    for param_group, base_lr in zip(optimizer.param_groups, base_lrs):
+        param_group["lr"] = float(base_lr) * multiplier
+    return float(base_lrs[0]) * multiplier
 
 
 def _scheduler_total_steps(num_batches: int) -> int:
@@ -570,9 +759,10 @@ def _teacher_forced_training_loss(
 ):
     predicted = model(inputs, params)
     loss, mean_fidelity, fidelity_matrix = criterion(predicted, targets)
-    per_step_losses = -torch.log(fidelity_matrix.clamp(min=config.LOG_FIDELITY_EPS))
+    stable_fidelity = fidelity_matrix.clamp_min(config.LOG_FIDELITY_EPS).clamp_max(1.0)
+    per_step_losses = -torch.log(stable_fidelity)
     mean_losses = per_step_losses.mean(dim=0)
-    mean_fidelities = fidelity_matrix.mean(dim=0)
+    mean_fidelities = stable_fidelity.mean(dim=0)
     unit_weights = torch.ones_like(mean_losses)
     stats = BatchAdaptiveStats(
         horizon=int(inputs.shape[1]),
@@ -581,7 +771,7 @@ def _teacher_forced_training_loss(
         mean_offset_fidelities=[float(value) for value in mean_fidelities.detach().cpu().tolist()],
         mean_offset_weights=[float(value) for value in unit_weights.detach().cpu().tolist()],
     )
-    return loss, mean_fidelity, stats
+    return loss, mean_fidelity, stats, predicted
 
 
 def compute_multistep_loss(
@@ -592,7 +782,11 @@ def compute_multistep_loss(
     current_h: int,
     loss_fn: NegativeLogFidelityLoss,
     teacher_steps_override: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, BatchAdaptiveStats]:
+    epoch: int | None = None,
+    batch_idx: int | None = None,
+    phase: str = "hybrid",
+    detach_every: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, BatchAdaptiveStats, torch.Tensor | None]:
     batch_size, seq_len, _ = x.shape
     if batch_size < 1:
         raise ValueError("Il batch multi-step deve contenere almeno una sequenza.")
@@ -607,31 +801,71 @@ def compute_multistep_loss(
     # Preserva l'intera storia vera fino a t_start, mantenendo coerenti causalita' e posizioni.
     current_context = x[:, :t_start, :].clone()
     predictions: list[torch.Tensor] = []
-    step_losses: list[float] = []
-    step_fidelities: list[float] = []
+    step_losses: list[float] = [float("nan") for _ in range(current_h)]
+    step_fidelities: list[float] = [float("nan") for _ in range(current_h)]
+    eps = max(1e-8, float(config.LOG_FIDELITY_EPS))
 
     # Nel repository y e' gia' shiftato di +1 rispetto a x:
     # il primo target dopo il contesto x[:, :t_start] e' y[:, t_start - 1].
     target_start = t_start - 1
     targets = y[:, target_start : target_start + current_h, :]
+    
+    # Se non fornito, usa il valore di default da config
+    if detach_every is None:
+        detach_every = int(config.ROLLOUT_DETACH_EVERY)
 
     for step_idx in range(current_h):
         out = model(current_context, params)
         next_pred = out[:, -1:, :]
+        step_norms = torch.linalg.vector_norm(next_pred, dim=-1, keepdim=True)
+        min_step_norm = float(step_norms.detach().amin().item())
+        if min_step_norm < eps and bool(config.TRAIN_DIAGNOSTICS):
+            print(
+                f"[rollout warning] epoca={epoch} batch={batch_idx} fase={phase} step={step_idx} | "
+                f"norma predetta minima troppo piccola ({min_step_norm:.3e})",
+                flush=True,
+            )
+        next_pred = next_pred / step_norms.clamp_min(eps)
+        if not torch.isfinite(next_pred).all():
+            print(
+                f"[rollout warning] epoca={epoch} batch={batch_idx} fase={phase} step={step_idx} | "
+                "stato predetto non finito, rollout interrotto per il batch corrente",
+                flush=True,
+            )
+            _maybe_abort_on_nonfinite("Stato non finito durante rollout multistep.")
+            break
         predictions.append(next_pred)
 
         step_target = targets[:, step_idx : step_idx + 1, :]
         step_loss, step_mean_fidelity, _ = loss_fn(next_pred, step_target)
-        step_losses.append(float(step_loss.detach().item()))
-        step_fidelities.append(float(step_mean_fidelity.detach().item()))
+        step_losses[step_idx] = float(step_loss.detach().item())
+        step_fidelities[step_idx] = float(step_mean_fidelity.detach().item())
+        if not (torch.isfinite(step_loss).all() and torch.isfinite(step_mean_fidelity).all()):
+            print(
+                f"[rollout warning] epoca={epoch} batch={batch_idx} fase={phase} step={step_idx} | "
+                "step_loss o step_fidelity non finiti, rollout interrotto per il batch corrente",
+                flush=True,
+            )
+            _maybe_abort_on_nonfinite("Loss/fidelity non finite durante rollout multistep.")
+            break
 
         if step_idx + 1 >= current_h:
             continue
 
-        current_context = torch.cat([current_context, next_pred], dim=1)
+        next_context_state = next_pred
+        if detach_every > 0 and (step_idx + 1) % detach_every == 0:
+            next_context_state = next_context_state.detach()
+        current_context = torch.cat([current_context, next_context_state], dim=1)
 
-    predictions_tensor = torch.cat(predictions, dim=1)
-    total_loss, total_fidelity, _ = loss_fn(predictions_tensor, targets)
+    valid_steps = len(predictions)
+    if valid_steps == 0:
+        total_loss = torch.full((), float("nan"), device=x.device, dtype=torch.float32)
+        total_fidelity = torch.full((), float("nan"), device=x.device, dtype=torch.float32)
+        predictions_tensor = None
+    else:
+        predictions_tensor = torch.cat(predictions, dim=1)
+        total_targets = targets[:, :valid_steps, :]
+        total_loss, total_fidelity, _ = loss_fn(predictions_tensor, total_targets)
     stats = BatchAdaptiveStats(
         horizon=current_h,
         teacher_steps=0,
@@ -639,7 +873,7 @@ def compute_multistep_loss(
         mean_offset_fidelities=step_fidelities,
         mean_offset_weights=[1.0 for _ in range(current_h)],
     )
-    return total_loss, total_fidelity, stats
+    return total_loss, total_fidelity, stats, predictions_tensor
 
 
 def _multistep_training_loss(
@@ -652,6 +886,7 @@ def _multistep_training_loss(
     teacher_steps_override: int,
     epoch: int | None = None,
     batch_idx: int | None = None,
+    detach_every: int | None = None,
 ):
     seq_len = int(inputs.shape[1])
     horizon = max(1, min(int(horizon_limit), seq_len))
@@ -663,7 +898,7 @@ def _multistep_training_loss(
             f"SEQ_LEN={seq_len} H={horizon} | pure autoregressive unroll after t_start"
         )
 
-    multistep_loss, multistep_fidelity, stats = compute_multistep_loss(
+    multistep_loss, multistep_fidelity, stats, predicted_states = compute_multistep_loss(
         model=model,
         x=inputs,
         y=targets,
@@ -671,8 +906,12 @@ def _multistep_training_loss(
         current_h=horizon,
         loss_fn=criterion,
         teacher_steps_override=teacher_steps_override,
+        epoch=epoch,
+        batch_idx=batch_idx,
+        phase="hybrid",
+        detach_every=detach_every,
     )
-    return multistep_loss, multistep_fidelity, stats, 1
+    return multistep_loss, multistep_fidelity, stats, predicted_states
 
 
 def _atomic_torch_save(payload: dict, destination: os.PathLike):
@@ -844,6 +1083,8 @@ def train_model(
         current_horizon = int(current_horizon_state)
     elif start_epoch > 1 and int(config.RESUME_HORIZON_OVERRIDE) > 0:
         current_horizon = int(config.RESUME_HORIZON_OVERRIDE)
+    elif config.MULTISTEP_H_IS_FIXED:
+        current_horizon = int(config.MULTISTEP_H)
     else:
         current_horizon = int(config.MULTISTEP_H_START)
     current_horizon = max(
@@ -854,10 +1095,15 @@ def train_model(
     plateau_best_tf_loss = float("inf")
     plateau_epochs = 0
     early_stop_counter = 0
+    huge_grad_count = 0
+    huge_grad_threshold = 1000.0
+    huge_grad_patience = 5
     best_metric_delta = max(1e-8, float(config.MULTISTEP_H_PLATEAU_MIN_DELTA))
     initial_horizon = int(current_horizon)
     initial_teacher_steps = int(_effective_multistep_teacher_steps(current_horizon))
     adaptive_epoch_summaries: list[AdaptiveEpochSummary] = []
+    
+    checkpoint_mode = str(config.CHECKPOINT_MODE)
     selection_trace = ModelSelectionTrace(
         criterion=f"maximize test_multistep mean_fidelity @ H={eval_horizon}",
         best_epoch=max(0, start_epoch - 1),
@@ -868,6 +1114,8 @@ def train_model(
         rollout_weight=0.0,
         multistep_weight=1.0,
         teacher_forced_weight=0.0,
+        checkpoint_mode=checkpoint_mode,
+        checkpoint_path=str(config.CHECKPOINT_PATH.name),
     )
 
     last_completed_epoch = history.epochs[-1] if history.epochs else max(0, start_epoch - 1)
@@ -881,12 +1129,46 @@ def train_model(
             loss_sum = 0.0
             fidelity_sum = 0.0
             sample_weight = 0
+            grad_norms_this_epoch = []
             phase = _training_phase_for_epoch(epoch)
-            hybrid_teacher_weight = 1.0 if phase == "teacher_forced" else 0.5
-            hybrid_multistep_weight = 0.0 if phase == "teacher_forced" else 0.5
-            # Usa davvero il curriculum anche durante teacher-forced:
-            # partire da H piccoli evita il crollo precoce della fidelity.
-            epoch_horizon = int(current_horizon)
+            hybrid_teacher_weight = 1.0
+            
+            # 2. Linear Annealing di ms_weight
+            if epoch <= 40:
+                hybrid_multistep_weight = 0.0
+            elif 40 < epoch <= 60:
+                # Sali linearmente da 0.0 a 0.250
+                target_ms_weight = 0.250
+                hybrid_multistep_weight = target_ms_weight * (epoch - 40) / (60 - 40)
+            else:
+                hybrid_multistep_weight = 0.250
+
+            # 3. Truncated BPTT
+            if phase == "teacher_forced":
+                epoch_detach_every = int(config.ROLLOUT_DETACH_EVERY)
+            else:
+                # Riduci detach_every a 2 all'inizio della fase multistep per stabilita'
+                epoch_detach_every = 2
+
+            # 4. Horizon Curriculum (H_train)
+            if phase == "teacher_forced":
+                epoch_horizon = int(current_horizon)
+            else:
+                # Parte da 16 all'epoca 41 e incrementa di +8 ogni 5 epoche, cap a 64
+                h_start = 16
+                h_step = 8
+                epochs_since_hybrid = epoch - 40
+                epoch_horizon = h_start + h_step * ((epochs_since_hybrid - 1) // 5)
+                epoch_horizon = min(epoch_horizon, 64)
+            
+            phase_lr_multiplier = _lr_multiplier_for_phase(phase)
+            if _is_main_process() and phase == "hybrid" and epoch == _teacher_forcing_epochs() + 1:
+                print(
+                    f"[hybrid] attivo lr multiplier: {phase_lr_multiplier:.6f} "
+                    f"(lr_effettivo = lr_scheduler * {phase_lr_multiplier:.6f})",
+                    flush=True,
+                )
+            
             epoch_teacher_steps = int(
                 epoch_horizon
                 if phase == "teacher_forced"
@@ -899,6 +1181,11 @@ def train_model(
 
             for batch_idx, (inputs, targets, params) in enumerate(loader, start=1):
                 batch_start = time.perf_counter()
+                effective_lr = _apply_phase_learning_rate(
+                    optimizer,
+                    scheduler,
+                    phase=phase,
+                )
                 inputs = inputs.to(config.DEVICE)
                 targets = targets.to(config.DEVICE)
                 params = params.to(config.DEVICE)
@@ -912,7 +1199,7 @@ def train_model(
                     dtype=torch.float16,
                     enabled=use_amp,
                 ):
-                    teacher_loss, teacher_fidelity, teacher_stats = _teacher_forced_training_loss(
+                    teacher_loss, teacher_fidelity, teacher_stats, teacher_predicted = _teacher_forced_training_loss(
                         model=model,
                         criterion=criterion,
                         inputs=tf_inputs,
@@ -923,8 +1210,9 @@ def train_model(
                         multistep_loss = torch.zeros_like(teacher_loss)
                         multistep_fidelity = torch.zeros_like(teacher_fidelity)
                         batch_stats = teacher_stats
+                        multistep_predicted = None
                     else:
-                        multistep_loss, multistep_fidelity, batch_stats, _ = _multistep_training_loss(
+                        multistep_loss, multistep_fidelity, batch_stats, multistep_predicted = _multistep_training_loss(
                             model=model,
                             criterion=criterion,
                             inputs=inputs,
@@ -934,6 +1222,7 @@ def train_model(
                             teacher_steps_override=epoch_teacher_steps,
                             epoch=epoch,
                             batch_idx=batch_idx,
+                            detach_every=epoch_detach_every,
                         )
                     total_loss = (
                         hybrid_teacher_weight * teacher_loss
@@ -944,14 +1233,95 @@ def train_model(
                         + hybrid_multistep_weight * multistep_fidelity
                     )
 
-                scaler.scale(total_loss).backward()
+                predicted_states_for_diag = (
+                    teacher_predicted if phase == "teacher_forced" else multistep_predicted
+                )
+                if not (
+                    torch.isfinite(teacher_loss).all()
+                    and torch.isfinite(multistep_loss).all()
+                    and torch.isfinite(total_loss).all()
+                    and torch.isfinite(teacher_fidelity).all()
+                    and torch.isfinite(multistep_fidelity).all()
+                    and torch.isfinite(total_fidelity).all()
+                ):
+                    _report_nonfinite_training_state(
+                        model=model,
+                        epoch=epoch,
+                        batch_idx=batch_idx,
+                        phase=phase,
+                        tf_loss=teacher_loss,
+                        ms_loss=multistep_loss,
+                        total_loss=total_loss,
+                        predicted_states=predicted_states_for_diag,
+                        reason="loss/fidelity non finite prima di backward",
+                    )
+                    _maybe_abort_on_nonfinite("Loss/fidelity non finite prima di backward.")
+                    continue
 
-                if config.GRAD_CLIP_MAX_NORM > 0.0:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.GRAD_CLIP_MAX_NORM)
+                scaler.scale(total_loss).backward()
+                scaler.unscale_(optimizer)
+                should_log_safe_grad = bool(config.TRAIN_DIAGNOSTICS) and (
+                    batch_idx <= int(config.TRAIN_DIAG_BATCH_PRINTS)
+                )
+                grad_norm_before, grad_norm_after, bad_grad_name = safe_clip_gradients(
+                    model,
+                    max_norm=float(config.GRAD_CLIP_NORM),
+                    grad_value_clip=float(config.GRAD_VALUE_CLIP),
+                    log_grad_norm=should_log_safe_grad,
+                )
+                grad_norms_this_epoch.append(grad_norm_before)
+
+                if bad_grad_name is not None:
+                    _report_nonfinite_training_state(
+                        model=model,
+                        epoch=epoch,
+                        batch_idx=batch_idx,
+                        phase=phase,
+                        tf_loss=teacher_loss,
+                        ms_loss=multistep_loss,
+                        total_loss=total_loss,
+                        predicted_states=predicted_states_for_diag,
+                        reason=f"gradiente non finito dopo backward/safe-clip ({bad_grad_name})",
+                    )
+                    _maybe_abort_on_nonfinite("Gradiente non finito dopo backward/safe-clip.")
+                    optimizer.zero_grad(set_to_none=True)
+                    scaler.update()
+                    continue
+
+                if not np.isfinite(grad_norm_after):
+                    _report_nonfinite_training_state(
+                        model=model,
+                        epoch=epoch,
+                        batch_idx=batch_idx,
+                        phase=phase,
+                        tf_loss=teacher_loss,
+                        ms_loss=multistep_loss,
+                        total_loss=total_loss,
+                        predicted_states=predicted_states_for_diag,
+                        reason=f"grad_norm non finito dopo clipping ({grad_norm_after:.6e})",
+                    )
+                    _maybe_abort_on_nonfinite("grad_norm non finito dopo clipping.")
+                    optimizer.zero_grad(set_to_none=True)
+                    scaler.update()
+                    continue
 
                 scaler.step(optimizer)
                 scaler.update()
+                bad_param_name = _first_nonfinite_parameter_name(model)
+                if bad_param_name is not None:
+                    _report_nonfinite_training_state(
+                        model=model,
+                        epoch=epoch,
+                        batch_idx=batch_idx,
+                        phase=phase,
+                        tf_loss=teacher_loss,
+                        ms_loss=multistep_loss,
+                        total_loss=total_loss,
+                        predicted_states=predicted_states_for_diag,
+                        reason=f"parametro non finito dopo optimizer.step ({bad_param_name})",
+                    )
+                    _maybe_abort_on_nonfinite("Parametro non finito dopo optimizer.step().")
+                    continue
                 if scheduler.last_epoch < scheduler.total_steps:
                     scheduler.step()
 
@@ -966,6 +1336,8 @@ def train_model(
                         f"phase={phase} | bs={batch_size} | "
                         f"loss(tf/ms/tot)=({float(teacher_loss.item()):.4f}/{float(multistep_loss.item()):.4f}/{float(total_loss.item()):.4f}) | "
                         f"fid(tf/ms/tot)=({float(teacher_fidelity.item()):.4f}/{float(multistep_fidelity.item()):.4f}/{float(total_fidelity.item()):.4f}) | "
+                        f"grad_norm(before/after)=({grad_norm_before:.3e}/{grad_norm_after:.3e}) | "
+                        f"lr_eff={effective_lr:.2e} | "
                         f"dt={batch_elapsed:.3f}s",
                         flush=True,
                     )
@@ -1002,6 +1374,19 @@ def train_model(
 
             epoch_loss = global_loss_sum / max(1.0, global_sample_weight)
             epoch_fidelity = global_fidelity_sum / max(1.0, global_sample_weight)
+            
+            mean_grad_norm = _safe_mean(grad_norms_this_epoch)
+            if phase == "hybrid" and mean_grad_norm > huge_grad_threshold:
+                huge_grad_count += 1
+                if huge_grad_count >= huge_grad_patience and _is_main_process():
+                    print(
+                        f"[grad-warning] hybrid gradients are consistently huge (mean={mean_grad_norm:.2e}); "
+                        "consider lowering ms_weight, increasing detach frequency, or enabling H curriculum.",
+                        flush=True
+                    )
+            else:
+                huge_grad_count = 0
+
             adaptive_summary = _summarize_epoch_adaptive_stats(
                 epoch=epoch,
                 horizon=epoch_horizon,
@@ -1026,6 +1411,7 @@ def train_model(
             last_completed_epoch = epoch
             teacher_metric = None
             multistep_metric = None
+            
             if validation_states is not None:
                 if validation_params is None:
                     raise ValueError("validation_params e' richiesto quando validation_states non e' None.")
@@ -1037,22 +1423,41 @@ def train_model(
                     horizon_limit=eval_horizon,
                     teacher_steps_override=_effective_multistep_teacher_steps(eval_horizon),
                 )
-                epoch_objective = float(multistep_metric.mean_fidelity)
                 if teacher_metric.loss + float(config.MULTISTEP_H_PLATEAU_MIN_DELTA) < plateau_best_tf_loss:
                     plateau_best_tf_loss = float(teacher_metric.loss)
                     plateau_epochs = 0
                 else:
                     plateau_epochs += 1
+
+            if checkpoint_mode == "best_val":
+                epoch_objective = float(multistep_metric.mean_fidelity) if multistep_metric else float("-inf")
+            elif checkpoint_mode == "best_train":
+                epoch_objective = float(epoch_fidelity)
+            elif checkpoint_mode == "best_hybrid_train":
+                epoch_objective = float(epoch_fidelity) if phase == "hybrid" else float("-inf")
+            elif checkpoint_mode == "last":
+                epoch_objective = float(epoch) # Sempre crescente, così l'ultimo è il migliore
             else:
                 epoch_objective = -float(epoch_loss)
 
             if epoch_objective > best_objective + best_metric_delta:
                 best_objective = epoch_objective
                 best_state = _model_state_dict(model)
+                
+                criterion_desc = f"mode={checkpoint_mode} | "
+                if checkpoint_mode == "best_val":
+                    criterion_desc += f"maximize test_multistep mean_fidelity @ H={eval_horizon}"
+                elif checkpoint_mode == "best_train":
+                    criterion_desc += "maximize train mean_fidelity"
+                elif checkpoint_mode == "best_hybrid_train":
+                    criterion_desc += "maximize train mean_fidelity (hybrid phase only)"
+                elif checkpoint_mode == "last":
+                    criterion_desc += "use last epoch"
+                else:
+                    criterion_desc += "minimize train loss"
+
                 selection_trace = ModelSelectionTrace(
-                    criterion=f"maximize test_multistep mean_fidelity @ H={eval_horizon}"
-                    if validation_states is not None
-                    else "minimize train loss",
+                    criterion=criterion_desc,
                     best_epoch=int(epoch),
                     best_objective=float(best_objective),
                     best_teacher_forced_fidelity=float("nan")
@@ -1065,6 +1470,8 @@ def train_model(
                     rollout_weight=0.0,
                     multistep_weight=1.0,
                     teacher_forced_weight=0.0,
+                    checkpoint_mode=checkpoint_mode,
+                    checkpoint_path=str(config.CHECKPOINT_PATH.name),
                 )
                 early_stop_counter = 0
                 if config.SAVE_MODEL and _is_main_process():
@@ -1080,39 +1487,47 @@ def train_model(
             log_every = max(1, min(10, config.EPOCHS // 20 if config.EPOCHS > 20 else 1))
             if _is_main_process() and (epoch <= 3 or epoch == config.EPOCHS or epoch % log_every == 0):
                 phase_label = "teacher-forced" if phase == "teacher_forced" else "hybrid-50/50"
+                if phase == "hybrid":
+                    phase_label = f"hybrid(tf+{hybrid_multistep_weight:.2f}*ms)"
                 global_samples = int(round(global_sample_weight))
                 samples_per_second = global_sample_weight / max(1e-9, max_epoch_seconds)
                 epoch_time_info = (
                     f"epoch_t(min/max)={min_epoch_seconds:.2f}/{max_epoch_seconds:.2f}s | "
                     f"samples={global_samples} | samples/s={samples_per_second:.2f}"
                 )
+                
+                curriculum_progress = 0.0
+                if int(config.MULTISTEP_H_MAX) > int(config.MULTISTEP_H_START):
+                    curriculum_progress = (epoch_horizon - int(config.MULTISTEP_H_START)) / (
+                        int(config.MULTISTEP_H_MAX) - int(config.MULTISTEP_H_START)
+                    )
+
+                common_log = (
+                    f"  Epoca {epoch:4d}/{config.EPOCHS} | "
+                    f"fase={phase_label:14s} | "
+                    f"loss={epoch_loss:.6f} | fidelity={epoch_fidelity:.6f} | "
+                    f"delta_fid={epoch_fidelity_delta:+.6f} | "
+                    f"H_train={epoch_horizon:2d} | H_eval={eval_horizon:2d} | "
+                    f"curr_progress={curriculum_progress:.2f} | "
+                    f"teacher_steps={epoch_teacher_steps:2d} | "
+                    f"head/tail_fid=({adaptive_summary.head_fidelity:.3f}/{adaptive_summary.tail_fidelity:.3f}) | "
+                    f"lr={optimizer.param_groups[0]['lr']:.2e} | lr_mult={phase_lr_multiplier:.2f} | "
+                    f"{epoch_time_info}"
+                )
+
                 if teacher_metric is not None and multistep_metric is not None:
                     print(
-                        f"  Epoca {epoch:4d}/{config.EPOCHS} | "
-                        f"fase={phase_label:14s} | "
-                        f"loss={epoch_loss:.6f} | fidelity={epoch_fidelity:.6f} | "
-                        f"delta_fid={epoch_fidelity_delta:+.6f} | "
-                        f"H_train={epoch_horizon:2d} | H_eval={eval_horizon:2d} | "
-                        f"teacher_steps={epoch_teacher_steps:2d} | "
+                        f"{common_log} | "
                         f"val(tf/ms)=({teacher_metric.mean_fidelity:.3f}/{multistep_metric.mean_fidelity:.3f}) | "
-                        f"head/tail_fid=({adaptive_summary.head_fidelity:.3f}/{adaptive_summary.tail_fidelity:.3f}) | "
                         f"score={epoch_objective:.3f} | plateau={plateau_epochs:4d} | "
-                        f"es={early_stop_counter:4d} | lr={optimizer.param_groups[0]['lr']:.2e} | "
-                        f"{epoch_time_info}"
+                        f"es={early_stop_counter:4d}"
                     )
                 else:
-                    print(
-                        f"  Epoca {epoch:4d}/{config.EPOCHS} | "
-                        f"fase={phase_label:14s} | "
-                        f"loss={epoch_loss:.6f} | fidelity={epoch_fidelity:.6f} | "
-                        f"delta_fid={epoch_fidelity_delta:+.6f} | "
-                        f"H={epoch_horizon:2d} | teacher_steps={epoch_teacher_steps:2d} | "
-                        f"head/tail_fid=({adaptive_summary.head_fidelity:.3f}/{adaptive_summary.tail_fidelity:.3f}) | "
-                        f"lr={optimizer.param_groups[0]['lr']:.2e} | {epoch_time_info}"
-                    )
+                    print(common_log)
 
             if (
                 validation_states is not None
+                and not config.MULTISTEP_H_IS_FIXED
                 and current_horizon < int(config.MULTISTEP_H_MAX)
                 and plateau_epochs >= int(config.MULTISTEP_H_PLATEAU_PATIENCE)
             ):
@@ -1164,15 +1579,26 @@ def train_model(
             current_horizon=current_horizon,
         )
 
-    if best_state is not None:
+    if checkpoint_mode != "last" and best_state is not None:
         _load_model_state_dict(model, best_state)
+        final_checkpoint_label = "final best model checkpoint"
+        final_checkpoint_path = config.CHECKPOINT_PATH
+    else:
+        # Per mode "last", usiamo l'ultimo stato (che è già nel modello se non abbiamo caricato best_state)
+        final_checkpoint_label = "final last model checkpoint"
+        final_checkpoint_path = config.LAST_CHECKPOINT_PATH
+        selection_trace.best_epoch = last_completed_epoch
+        selection_trace.checkpoint_path = str(config.LAST_CHECKPOINT_PATH.name)
 
     if config.SAVE_MODEL and _is_main_process():
         config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        # Se siamo in mode 'last', salviamo comunque lo stato corrente su CHECKPOINT_PATH 
+        # per coerenza con il resto della pipeline che si aspetta 'best_model.pt'
+        save_state = _model_state_dict(model)
         _safe_atomic_torch_save(
-            _model_state_dict(model),
+            save_state,
             config.CHECKPOINT_PATH,
-            label="final best model checkpoint",
+            label=final_checkpoint_label,
         )
         _save_last_checkpoint(
             model=model,
@@ -1268,12 +1694,20 @@ def evaluate_multistep(
             for step_idx in range(current_h):
                 out = model(current_context, batch_params)
                 next_pred = out[:, -1:, :]
+                next_pred = next_pred / torch.linalg.vector_norm(next_pred, dim=-1, keepdim=True).clamp_min(1e-8)
+                if not torch.isfinite(next_pred).all():
+                    print(
+                        f"[eval multistep warning] stato non finito a t_start={t_start}, step={step_idx}; "
+                        "rollout interrotto per questa traiettoria di valutazione",
+                        flush=True,
+                    )
+                    break
                 step_target = targets[:, target_start + step_idx : target_start + step_idx + 1, :]
                 step_fidelity = quantum_fidelity(next_pred[:, 0, :], step_target[:, 0, :]).cpu().double()
                 curve_index = target_start + step_idx
                 fidelity_sum[curve_index] += step_fidelity.sum()
                 loss_sum[curve_index] += (
-                    -torch.log(step_fidelity.clamp(min=config.LOG_FIDELITY_EPS))
+                    -torch.log(step_fidelity.clamp_min(config.LOG_FIDELITY_EPS).clamp_max(1.0))
                 ).sum()
                 counts[curve_index] += float(step_fidelity.shape[0])
                 for h_id in H_LABELS:
@@ -1362,10 +1796,22 @@ def evaluate_autoregressive(
 
         for target_index in range(warmup_states, true_states.shape[1]):
             predicted_next = model(context, batch_params)[:, -1, :]
+            predicted_next = predicted_next / torch.linalg.vector_norm(
+                predicted_next, dim=-1, keepdim=True
+            ).clamp_min(1e-8)
+            if not torch.isfinite(predicted_next).all():
+                print(
+                    f"[eval rollout warning] stato non finito a target_index={target_index}; "
+                    "rollout interrotto per il batch corrente",
+                    flush=True,
+                )
+                break
             fidelity = quantum_fidelity(predicted_next, true_states[:, target_index, :]).cpu().double()
             curve_index = target_index - 1
             fidelity_sum[curve_index] += fidelity.sum()
-            loss_sum[curve_index] += (-torch.log(fidelity.clamp(min=config.LOG_FIDELITY_EPS))).sum()
+            loss_sum[curve_index] += (
+                -torch.log(fidelity.clamp_min(config.LOG_FIDELITY_EPS).clamp_max(1.0))
+            ).sum()
             counts[curve_index] += float(fidelity.shape[0])
             for h_id in H_LABELS:
                 mask = batch_h_ids == int(h_id)
@@ -1783,6 +2229,16 @@ def compute_observable_curves(
             for step_offset in range(horizon):
                 target_state_index = start_index + step_offset + 1
                 predicted_next = model(context, batch_params)[:, -1, :]
+                predicted_next = predicted_next / torch.linalg.vector_norm(
+                    predicted_next, dim=-1, keepdim=True
+                ).clamp_min(1e-8)
+                if not torch.isfinite(predicted_next).all():
+                    print(
+                        f"[obs multistep warning] stato non finito a start={start_index}, step={step_offset}; "
+                        "rollout interrotto per il contesto corrente",
+                        flush=True,
+                    )
+                    break
                 mz, mx, cz = batch_observables_tfim(
                     predicted_next,
                     z_eigs,
@@ -1818,6 +2274,15 @@ def compute_observable_curves(
 
         for t in range(warmup_states, num_states):
             predicted_next = model(context, batch_params)[:, -1, :]
+            predicted_next = predicted_next / torch.linalg.vector_norm(
+                predicted_next, dim=-1, keepdim=True
+            ).clamp_min(1e-8)
+            if not torch.isfinite(predicted_next).all():
+                print(
+                    f"[obs rollout warning] stato non finito a t={t}; rollout libero interrotto nel batch corrente",
+                    flush=True,
+                )
+                break
             mz, mx, cz = batch_observables_tfim(
                 predicted_next,
                 z_eigs,

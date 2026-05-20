@@ -10,8 +10,9 @@ from embedding import ComplexEmbedding, FlatCoefficientTTNEncoder, unpack_clampe
 from physical_ttn import PhysicalQubitTTNDecoder, PhysicalQubitTTNEncoder, infer_num_qubits_from_dim
 
 
-def normalize_state(states: torch.Tensor) -> torch.Tensor:
-    return states / torch.linalg.vector_norm(states, dim=-1, keepdim=True).clamp(min=1e-8)
+def normalize_state(states: torch.Tensor, *, eps: float = 1e-8) -> torch.Tensor:
+    norms = torch.linalg.vector_norm(states, dim=-1, keepdim=True).clamp_min(float(eps))
+    return states / norms
 
 
 def clamp_global_phase(
@@ -34,8 +35,8 @@ def quantum_fidelity(predicted: torch.Tensor, target: torch.Tensor) -> torch.Ten
     pred_norm = normalize_state(predicted)
     target_norm = normalize_state(target)
     overlap = torch.sum(target_norm.conj() * pred_norm, dim=-1)
-    fidelity = torch.abs(overlap) ** 2
-    return fidelity.clamp(0.0, 1.0)
+    fidelity = torch.real(torch.abs(overlap) ** 2)
+    return fidelity.clamp_min(0.0).clamp_max(1.0)
 
 
 def align_global_phase_to_target(
@@ -62,7 +63,8 @@ class NegativeLogFidelityLoss(nn.Module):
 
     def forward(self, predicted: torch.Tensor, target: torch.Tensor):
         fidelity = quantum_fidelity(predicted, target)
-        loss = -torch.log(fidelity.clamp(min=self.epsilon)).mean()
+        fidelity = fidelity.clamp_min(self.epsilon).clamp_max(1.0)
+        loss = -torch.log(fidelity).mean()
         return loss, fidelity.mean(), fidelity
 
 

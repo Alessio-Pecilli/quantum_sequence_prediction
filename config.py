@@ -95,7 +95,7 @@ def _default_by_qubits(defaults: dict[int, int], fallback: int) -> int:
 
 # Numero totale di stati in ogni traiettoria, incluso psi(0).
 # Default desktop 8-qubit: 33 stati totali -> orizzonte di 32 predizioni.
-NUM_STATES = _env_int("QSP_NUM_STATES", 17)
+NUM_STATES = _env_int("QSP_NUM_STATES", 101)
 if NUM_STATES < 2:
     raise ValueError(f"NUM_STATES deve essere >= 2, ricevuto: {NUM_STATES}")
 
@@ -108,8 +108,8 @@ def _is_long_horizon() -> bool:
     return int(NUM_STATES) >= 60
 
 
-TRAIN_SEQUENCES = _env_int("QSP_TRAIN_SEQUENCES", 1200)
-TEST_SEQUENCES = _env_int("QSP_TEST_SEQUENCES", 256)
+TRAIN_SEQUENCES = _env_int("QSP_TRAIN_SEQUENCES", 256)
+TEST_SEQUENCES = _env_int("QSP_TEST_SEQUENCES", 64)
 if TRAIN_SEQUENCES < 1 or TEST_SEQUENCES < 1:
     raise ValueError("TRAIN_SEQUENCES e TEST_SEQUENCES devono essere >= 1.")
 
@@ -235,8 +235,12 @@ EPOCHS = _env_int(
 )
 LEARNING_RATE = _env_float("QSP_LEARNING_RATE", 4e-4)
 WEIGHT_DECAY = _env_float("QSP_WEIGHT_DECAY", 1e-4)
-GRAD_CLIP_MAX_NORM = _env_float("QSP_GRAD_CLIP_MAX_NORM", 1.0)
+GRAD_CLIP_NORM = _env_float("QSP_GRAD_CLIP_NORM", _env_float("QSP_GRAD_CLIP_MAX_NORM", 1.0))
+# Alias retrocompatibile per script che usano ancora il vecchio nome.
+GRAD_CLIP_MAX_NORM = GRAD_CLIP_NORM
+GRAD_VALUE_CLIP = _env_float("QSP_GRAD_VALUE_CLIP", 10.0)
 LOG_FIDELITY_EPS = _env_float("QSP_LOG_FIDELITY_EPS", 1e-8)
+ABORT_ON_NAN = _env_bool("QSP_ABORT_ON_NAN", True)
 LOSS_TYPE = _env_str("QSP_LOSS_TYPE", "composite")
 if LOSS_TYPE not in {"fidelity", "composite"}:
     raise ValueError(
@@ -270,10 +274,27 @@ if not (0.0 < SCHEDULER_PCT_START < 1.0):
         f"SCHEDULER_PCT_START deve stare in (0,1), ricevuto: {SCHEDULER_PCT_START}"
     )
 
+# Metodo di selezione del "best model" per salvataggio ed evaluation finale.
+# - "best_val": massimizza mean_fidelity sul validation set (default).
+# - "last": usa sempre l'ultimo checkpoint dell'ultima epoca.
+# - "best_train": massimizza mean_fidelity sul train set.
+# - "best_hybrid_train": massimizza mean_fidelity sul train set solo durante la fase hybrid.
+CHECKPOINT_MODE = _env_str("QSP_CHECKPOINT_MODE", "best_val")
+if CHECKPOINT_MODE not in {"best_val", "last", "best_train", "best_hybrid_train"}:
+    raise ValueError(
+        f"CHECKPOINT_MODE={CHECKPOINT_MODE!r} non valido. "
+        "Valori ammessi: best_val, last, best_train, best_hybrid_train."
+    )
+
 # Curriculum dell'orizzonte multi-step:
 # partiamo prudenti e cresciamo solo dopo plateau sul validation teacher-forced.
 MULTISTEP_H_START = _env_int("QSP_MULTISTEP_H_START", min(8, int(SEQ_LEN)))
-MULTISTEP_H_MAX = _env_int("QSP_MULTISTEP_H_MAX", min(12, int(SEQ_LEN)))
+MULTISTEP_H_MAX = _env_int("QSP_MULTISTEP_H_MAX", 100)
+
+# Rilevamento esplicito dell'orizzonte fisso via env per abilitare/disabilitare curriculum.
+_MULTISTEP_H_RAW = os.getenv("QSP_MULTISTEP_H")
+MULTISTEP_H_IS_FIXED = _MULTISTEP_H_RAW is not None and _MULTISTEP_H_RAW != ""
+
 # Alias retrocompatibile: rappresenta l'orizzonte massimo/evaluation horizon.
 MULTISTEP_H = _env_int("QSP_MULTISTEP_H", int(MULTISTEP_H_MAX))
 if not (1 <= MULTISTEP_H_START <= SEQ_LEN):
@@ -303,7 +324,10 @@ if MULTISTEP_TEACHER_FORCING_STEPS < 0:
         f"ricevuto: {MULTISTEP_TEACHER_FORCING_STEPS}"
     )
 MULTISTEP_EFFECTIVE_TEACHER_FORCING_STEPS = max(1, min(int(MULTISTEP_H), int(MULTISTEP_H) // 2))
-HYBRID_TEACHER_FORCING_EPOCHS = _env_int("QSP_HYBRID_TEACHER_FORCING_EPOCHS", int(EPOCHS))
+HYBRID_TEACHER_FORCING_EPOCHS = _env_int("QSP_HYBRID_TEACHER_FORCING_EPOCHS", 40)
+MULTISTEP_LOSS_WEIGHT = _env_float("QSP_MULTISTEP_LOSS_WEIGHT", 0.250)
+ROLLOUT_DETACH_EVERY = _env_int("QSP_ROLLOUT_DETACH_EVERY", 0)
+HYBRID_LR_MULT = _env_float("QSP_HYBRID_LR_MULT", 1.0)
 MULTISTEP_TRAIN_VERBOSE = _env_bool("QSP_MULTISTEP_TRAIN_VERBOSE", False)
 TRAIN_DIAGNOSTICS = _env_bool("QSP_TRAIN_DIAGNOSTICS", True)
 TRAIN_DIAG_BATCH_PRINTS = _env_int("QSP_TRAIN_DIAG_BATCH_PRINTS", 1)
@@ -378,10 +402,20 @@ if BATCH_SIZE < 1 or EPOCHS < 1:
     raise ValueError("BATCH_SIZE e EPOCHS devono essere >= 1.")
 if LEARNING_RATE <= 0.0:
     raise ValueError(f"LEARNING_RATE deve essere > 0, ricevuto: {LEARNING_RATE}")
-if WEIGHT_DECAY < 0.0 or GRAD_CLIP_MAX_NORM < 0.0:
-    raise ValueError("WEIGHT_DECAY e GRAD_CLIP_MAX_NORM devono essere >= 0.")
+if WEIGHT_DECAY < 0.0 or GRAD_CLIP_NORM < 0.0:
+    raise ValueError("WEIGHT_DECAY e GRAD_CLIP_NORM devono essere >= 0.")
+if GRAD_VALUE_CLIP <= 0.0:
+    raise ValueError(f"GRAD_VALUE_CLIP deve essere > 0, ricevuto: {GRAD_VALUE_CLIP}")
 if not (0.0 < LOG_FIDELITY_EPS < 1.0):
     raise ValueError(f"LOG_FIDELITY_EPS deve stare in (0,1), ricevuto: {LOG_FIDELITY_EPS}")
+if MULTISTEP_LOSS_WEIGHT < 0.0:
+    raise ValueError(
+        f"MULTISTEP_LOSS_WEIGHT deve essere >= 0, ricevuto: {MULTISTEP_LOSS_WEIGHT}"
+    )
+if ROLLOUT_DETACH_EVERY < 0:
+    raise ValueError(f"ROLLOUT_DETACH_EVERY deve essere >= 0, ricevuto: {ROLLOUT_DETACH_EVERY}")
+if HYBRID_LR_MULT <= 0.0:
+    raise ValueError(f"HYBRID_LR_MULT deve essere > 0, ricevuto: {HYBRID_LR_MULT}")
 if not (0.0 <= SCHEDULED_SAMPLING_MAX_PROB <= 1.0):
     raise ValueError(
         "SCHEDULED_SAMPLING_MAX_PROB deve stare in [0,1], "

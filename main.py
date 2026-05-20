@@ -122,6 +122,8 @@ def _model_selection_as_serializable(trace: ModelSelectionTrace) -> dict[str, ob
         "rollout_weight": float(trace.rollout_weight),
         "multistep_weight": float(trace.multistep_weight),
         "teacher_forced_weight": float(trace.teacher_forced_weight),
+        "checkpoint_mode": str(trace.checkpoint_mode),
+        "checkpoint_path": str(trace.checkpoint_path),
     }
 
 
@@ -221,6 +223,12 @@ def main():
             f"epochs={config.EPOCHS}, tf_only={config.HYBRID_TEACHER_FORCING_EPOCHS}, "
             f"early_stop_patience={config.EARLY_STOPPING_PATIENCE}"
         )
+        print(
+            f"Hybrid knobs:          ms_weight={config.MULTISTEP_LOSS_WEIGHT:.3f}, "
+            f"detach_every={config.ROLLOUT_DETACH_EVERY}, "
+            f"lr_mult={config.HYBRID_LR_MULT:.3f}, grad_clip=({config.GRAD_CLIP_NORM:.3f}, "
+            f"value={config.GRAD_VALUE_CLIP:.3f})"
+        )
         print(f"Stati iniziali:        {dataset.train.initial_state_family}")
         print(f"Motivo famiglia:       {dataset.initial_state_family_reason}")
         print(f"Force X basis only:    {config.FORCE_X_BASIS_ONLY}")
@@ -232,6 +240,8 @@ def main():
             f"Checkpoint last:       "
             f"{'trovato' if config.LAST_CHECKPOINT_PATH.exists() else 'assente'} | {config.LAST_CHECKPOINT_PATH}"
         )
+        if config.MULTISTEP_H_IS_FIXED:
+            print("[config-warning] QSP_MULTISTEP_H is fixed and overrides/ disables H curriculum.")
         print("=" * 78)
 
     model = build_model()
@@ -398,6 +408,9 @@ def main():
             "MULTISTEP_H_MAX": int(config.MULTISTEP_H_MAX),
             "MULTISTEP_EFFECTIVE_TEACHER_FORCING_STEPS": int(config.MULTISTEP_EFFECTIVE_TEACHER_FORCING_STEPS),
             "MULTISTEP_TEACHER_FORCING_STEPS": int(config.MULTISTEP_TEACHER_FORCING_STEPS),
+            "MULTISTEP_LOSS_WEIGHT": float(config.MULTISTEP_LOSS_WEIGHT),
+            "ROLLOUT_DETACH_EVERY": int(config.ROLLOUT_DETACH_EVERY),
+            "HYBRID_LR_MULT": float(config.HYBRID_LR_MULT),
             "HYBRID_TEACHER_FORCING_EPOCHS": int(config.HYBRID_TEACHER_FORCING_EPOCHS),
             "MULTISTEP_H_PLATEAU_PATIENCE": int(config.MULTISTEP_H_PLATEAU_PATIENCE),
             "MULTISTEP_H_PLATEAU_MIN_DELTA": float(config.MULTISTEP_H_PLATEAU_MIN_DELTA),
@@ -453,8 +466,11 @@ def main():
             "multistep_horizon_max": int(config.MULTISTEP_H_MAX),
             "multistep_horizon_eval": int(config.MULTISTEP_H),
             "multistep_teacher_steps": int(config.MULTISTEP_EFFECTIVE_TEACHER_FORCING_STEPS),
-            "hybrid_teacher_forced_weight": 0.5,
-            "hybrid_multistep_weight": 0.5,
+            "hybrid_teacher_forced_weight": 1.0,
+            "hybrid_multistep_weight": float(config.MULTISTEP_LOSS_WEIGHT),
+            "hybrid_lr_multiplier": float(config.HYBRID_LR_MULT),
+            "rollout_detach_every": int(config.ROLLOUT_DETACH_EVERY),
+            "grad_value_clip": float(config.GRAD_VALUE_CLIP),
             "multistep_step_weighting": "descending_linear_mean_normalized",
             "rollout_evaluation_warmup_states": int(config.ROLLOUT_WARMUP_STATES),
         },
@@ -501,6 +517,12 @@ def main():
         f"tf/ms=({selection_trace.best_teacher_forced_fidelity:.6f}/"
         f"{selection_trace.best_multistep_fidelity:.6f})"
     )
+
+    print("\nFinal evaluation checkpoint summary:")
+    print(f"  Checkpoint path:  {selection_trace.checkpoint_path}")
+    print(f"  Checkpoint mode:  {selection_trace.checkpoint_mode}")
+    print(f"  Checkpoint epoch: {selection_trace.best_epoch}")
+    print(f"  Selection metric: {selection_trace.criterion}")
     print(f"\nPlot fidelity:  {config.FIDELITY_PLOT_PATH}")
     print(f"Plot methods:   {methods_plot_path}")
     print(f"Plot training:  {config.TRAINING_CURVES_PATH}")
