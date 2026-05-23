@@ -22,6 +22,13 @@ module load python/3.11.7
 
 source /leonardo_work/IscrC_QuSALa/venv_py311/bin/activate
 
+# Fail fast if launched outside a SLURM allocation (e.g. login node).
+if [[ -z "${SLURM_JOB_ID:-}" ]]; then
+  echo "ERROR: nessuna allocazione SLURM rilevata." >&2
+  echo "Lancia con: sbatch hpc.sh oppure da una shell ottenuta con srun --pty ..." >&2
+  exit 2
+fi
+
 # Threading controls: avoid CPU oversubscription on HPC.
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
@@ -33,7 +40,8 @@ export QSP_HPC_DISTRIBUTED=1
 export QSP_HPC_DISTRIBUTED_DATASET=1
 export QSP_HPC_DISTRIBUTED_TRAINING=1
 export QSP_HPC_DISTRIBUTED_BACKEND="auto"
-export QSP_RESULTS_DIR_NAME="results_multi_4q_h100_fast_curriculum"
+export QSP_STRICT_BACKEND=1
+export QSP_RESULTS_DIR_NAME="${QSP_RESULTS_DIR_NAME:-results_multi_4q_h100_fast_curriculum_${SLURM_JOB_ID}}"
 # Profilo "paper run": meno rumore log, piu' stabilita' nel training.
 export QSP_TRAIN_DIAGNOSTICS=0
 export QSP_TRAIN_DIAG_BATCH_PRINTS=0
@@ -88,23 +96,39 @@ fi
 
 MAIN_SCRIPT="${PROJECT_DIR}/main_hpc.py"
 
+# GPU preflight to avoid accidental CPU-only runs on login/service nodes.
+CUDA_COUNT="$(python - <<'PY'
+import torch
+print(int(torch.cuda.device_count()) if torch.cuda.is_available() else 0)
+PY
+)"
+if [[ "${CUDA_COUNT}" -lt 1 ]]; then
+  echo "ERROR: nessuna GPU visibile (torch.cuda.device_count()=${CUDA_COUNT})." >&2
+  echo "Host: $(hostname) | SLURM_JOB_ID=${SLURM_JOB_ID:-}" >&2
+  exit 3
+fi
+
 # Infer processes from visible GPUs unless explicitly set.
 if [[ -n "${NPROC_PER_NODE:-}" ]]; then
   PROC_PER_NODE="${NPROC_PER_NODE}"
 elif [[ -n "${SLURM_GPUS_ON_NODE:-}" ]]; then
   PROC_PER_NODE="${SLURM_GPUS_ON_NODE}"
-elif [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
-  PROC_PER_NODE="$(python - <<'PY'
-import os
-v = os.getenv("CUDA_VISIBLE_DEVICES", "").strip()
-print(len([x for x in v.split(",") if x != ""]) if v else 1)
-PY
-)"
 else
+  PROC_PER_NODE="${CUDA_COUNT}"
+fi
+if [[ "${PROC_PER_NODE}" -lt 1 ]]; then
   PROC_PER_NODE=1
+fi
+if [[ "${PROC_PER_NODE}" -gt "${CUDA_COUNT}" ]]; then
+  echo "WARNING: nproc_per_node=${PROC_PER_NODE} > cuda_count=${CUDA_COUNT}; riduco a ${CUDA_COUNT}." >&2
+  PROC_PER_NODE="${CUDA_COUNT}"
 fi
 
 echo "Working directory: ${PROJECT_DIR}"
+echo "SLURM job id: ${SLURM_JOB_ID}"
+echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-<unset>}"
+echo "Torch CUDA device count: ${CUDA_COUNT}"
+echo "Results dir name: ${QSP_RESULTS_DIR_NAME}"
 echo "Launching torchrun with nproc_per_node=${PROC_PER_NODE}"
 echo "Config: qubits=${QSP_N_QUBITS} num_states=${QSP_NUM_STATES} H=${QSP_MULTISTEP_H} train=${QSP_TRAIN_SEQUENCES} test=${QSP_TEST_SEQUENCES} epochs=${QSP_EPOCHS} batch=${QSP_BATCH_SIZE}"
 echo "Main script: ${MAIN_SCRIPT}"

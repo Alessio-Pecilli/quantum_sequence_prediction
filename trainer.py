@@ -712,6 +712,15 @@ def _safe_atomic_torch_save(payload: dict, destination: os.PathLike, *, label: s
         return False
 
 
+def _ensure_results_dir_for_checkpointing() -> bool:
+    try:
+        config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        return True
+    except (PermissionError, OSError) as exc:
+        print(f"[checkpoint warning] results dir non accessibile ({config.RESULTS_DIR}): {exc}")
+        return False
+
+
 def _save_last_checkpoint(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -724,7 +733,8 @@ def _save_last_checkpoint(
 ):
     if not config.SAVE_MODEL or not _is_main_process():
         return
-    config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    if not _ensure_results_dir_for_checkpointing():
+        return
     checkpoint_payload = {
         "epoch": int(epoch),
         "model_state_dict": _model_state_dict(model),
@@ -1056,12 +1066,12 @@ def train_model(
                 )
                 early_stop_counter = 0
                 if config.SAVE_MODEL and _is_main_process():
-                    config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-                    _safe_atomic_torch_save(
-                        _model_state_dict(model),
-                        config.CHECKPOINT_PATH,
-                        label="best model checkpoint",
-                    )
+                    if _ensure_results_dir_for_checkpointing():
+                        _safe_atomic_torch_save(
+                            _model_state_dict(model),
+                            config.CHECKPOINT_PATH,
+                            label="best model checkpoint",
+                        )
             elif validation_states is not None and epoch >= int(config.EARLY_STOPPING_MIN_EPOCHS):
                 early_stop_counter += 1
 
@@ -1156,22 +1166,22 @@ def train_model(
         _load_model_state_dict(model, best_state)
 
     if config.SAVE_MODEL and _is_main_process():
-        config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-        _safe_atomic_torch_save(
-            _model_state_dict(model),
-            config.CHECKPOINT_PATH,
-            label="final best model checkpoint",
-        )
-        _save_last_checkpoint(
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            history=history,
-            epoch=last_completed_epoch,
-            best_objective=best_objective,
-            best_state=best_state,
-            current_horizon=current_horizon,
-        )
+        if _ensure_results_dir_for_checkpointing():
+            _safe_atomic_torch_save(
+                _model_state_dict(model),
+                config.CHECKPOINT_PATH,
+                label="final best model checkpoint",
+            )
+            _save_last_checkpoint(
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                history=history,
+                epoch=last_completed_epoch,
+                best_objective=best_objective,
+                best_state=best_state,
+                current_horizon=current_horizon,
+            )
 
     adaptive_trace = AdaptiveTrainingTrace(
         enabled=int(config.MULTISTEP_H_START) < int(config.MULTISTEP_H_MAX),

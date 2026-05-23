@@ -119,6 +119,17 @@ def _init_torch_distributed(mpi: _MpiInfo) -> tuple[int, int]:
     backend = os.getenv("QSP_HPC_DISTRIBUTED_BACKEND", "auto").strip().lower()
     if backend == "auto":
         backend = "nccl" if torch.cuda.is_available() else "gloo"
+    if backend == "nccl" and not torch.cuda.is_available():
+        strict_backend = _env_flag("QSP_STRICT_BACKEND", False)
+        message = (
+            "backend=nccl richiesto ma CUDA non disponibile. "
+            "Fallback automatico a gloo (imposta QSP_STRICT_BACKEND=1 per fallire)."
+        )
+        if strict_backend:
+            raise RuntimeError(message)
+        if rank == 0:
+            print(f"[dist warning] {message}")
+        backend = "gloo"
 
     if not dist.is_initialized():
         dist.init_process_group(backend=backend, init_method="env://")
@@ -182,10 +193,12 @@ def main():
 
     if dist.is_available() and dist.is_initialized():
         try:
-            dist.barrier()
+            if exit_code == 0:
+                dist.barrier()
         finally:
             dist.destroy_process_group()
-    _barrier(mpi.comm)
+    if exit_code == 0:
+        _barrier(mpi.comm)
 
     if exit_code != 0:
         sys.exit(exit_code)
