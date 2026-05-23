@@ -9,7 +9,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:4
-#SBATCH --time=12:00:00
+#SBATCH --time=24:00:00
 
 set -euo pipefail
 
@@ -41,11 +41,14 @@ export QSP_HPC_DISTRIBUTED_DATASET=1
 export QSP_HPC_DISTRIBUTED_TRAINING=1
 export QSP_HPC_DISTRIBUTED_BACKEND="auto"
 export QSP_STRICT_BACKEND=1
-export QSP_RESULTS_DIR_NAME="${QSP_RESULTS_DIR_NAME:-results_multi_4q_h100_fast_curriculum_${SLURM_JOB_ID}}"
+export QSP_RESULTS_DIR_NAME="${QSP_RESULTS_DIR_NAME:-results_multi_4q_h100_optimal_v2}"
 # Profilo "paper run": meno rumore log, piu' stabilita' nel training.
 export QSP_TRAIN_DIAGNOSTICS=0
 export QSP_TRAIN_DIAG_BATCH_PRINTS=0
 export QSP_USE_AMP=0
+# Evita warning verbosi di torchrun ereditati dall'ambiente interattivo.
+unset TORCH_DISTRIBUTED_DEBUG || true
+unset TORCH_NCCL_TRACE_BUFFER_SIZE || true
 
 # 100 evoluzioni per traiettoria: 101 stati totali -> 100 predizioni.
 export QSP_N_QUBITS=4
@@ -79,10 +82,8 @@ export QSP_EARLY_STOPPING_PATIENCE=260
 export QSP_SCHEDULER_TOTAL_STEPS_CAP=4200
 export QSP_SCHEDULER_PCT_START=0.05
 export QSP_AUTO_RESUME=1
-export QSP_RESET_OPTIMIZER_ON_RESUME=1
-# Bootstrap per il checkpoint esistente: il run buono era arrivato circa a H=47.
-# I prossimi checkpoint salveranno automaticamente current_horizon.
-export QSP_RESUME_HORIZON_OVERRIDE=47
+export QSP_RESET_OPTIMIZER_ON_RESUME=0
+export QSP_RESUME_HORIZON_OVERRIDE=0
 
 # Under sbatch, $0 points to a temporary copy in /var/spool/slurmd/... .
 # SLURM_SUBMIT_DIR preserves the directory from which the job was submitted.

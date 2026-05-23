@@ -108,8 +108,8 @@ def _is_long_horizon() -> bool:
     return int(NUM_STATES) >= 60
 
 
-TRAIN_SEQUENCES = _env_int("QSP_TRAIN_SEQUENCES", 4000)
-TEST_SEQUENCES = _env_int("QSP_TEST_SEQUENCES", 1000)
+TRAIN_SEQUENCES = _env_int("QSP_TRAIN_SEQUENCES", 1600)
+TEST_SEQUENCES = _env_int("QSP_TEST_SEQUENCES", 400)
 if TRAIN_SEQUENCES < 1 or TEST_SEQUENCES < 1:
     raise ValueError("TRAIN_SEQUENCES e TEST_SEQUENCES devono essere >= 1.")
 
@@ -191,14 +191,17 @@ def _default_power_batch_size() -> int:
     return 128 if total_memory_gib >= 8.0 else 64
 
 
-BATCH_SIZE = _env_int("QSP_BATCH_SIZE", _default_power_batch_size())
+BATCH_SIZE = _env_int(
+    "QSP_BATCH_SIZE",
+    _default_by_qubits({4: 64, 6: 32}, _default_power_batch_size()),
+)
 EPOCHS = _env_int(
     "QSP_EPOCHS",
-    _default_by_qubits({4: 2000, 6: 1500}, 120),
+    _default_by_qubits({4: 900, 6: 700}, 120),
 )
-LEARNING_RATE = _env_float("QSP_LEARNING_RATE", 5e-4)
-WEIGHT_DECAY = _env_float("QSP_WEIGHT_DECAY", 1e-4)
-GRAD_CLIP_MAX_NORM = _env_float("QSP_GRAD_CLIP_MAX_NORM", 1.0)
+LEARNING_RATE = _env_float("QSP_LEARNING_RATE", 8e-5)
+WEIGHT_DECAY = _env_float("QSP_WEIGHT_DECAY", 1e-5)
+GRAD_CLIP_MAX_NORM = _env_float("QSP_GRAD_CLIP_MAX_NORM", 0.3)
 LOG_FIDELITY_EPS = _env_float("QSP_LOG_FIDELITY_EPS", 1e-8)
 # I tensori complessi in float16 finiscono in ComplexHalf, ancora sperimentale in PyTorch.
 USE_AMP = _env_bool("QSP_USE_AMP", False)
@@ -210,12 +213,12 @@ if RESUME_HORIZON_OVERRIDE < 0:
     )
 # Cap opzionale per evitare warmup eccessivamente lenti in run con molte epoche.
 # 0 disattiva il cap.
-SCHEDULER_TOTAL_STEPS_CAP = _env_int("QSP_SCHEDULER_TOTAL_STEPS_CAP", 0)
+SCHEDULER_TOTAL_STEPS_CAP = _env_int("QSP_SCHEDULER_TOTAL_STEPS_CAP", 4200)
 if SCHEDULER_TOTAL_STEPS_CAP < 0:
     raise ValueError(
         f"SCHEDULER_TOTAL_STEPS_CAP deve essere >= 0, ricevuto: {SCHEDULER_TOTAL_STEPS_CAP}"
     )
-SCHEDULER_PCT_START = _env_float("QSP_SCHEDULER_PCT_START", 0.10)
+SCHEDULER_PCT_START = _env_float("QSP_SCHEDULER_PCT_START", 0.05)
 if not (0.0 < SCHEDULER_PCT_START < 1.0):
     raise ValueError(
         f"SCHEDULER_PCT_START deve stare in (0,1), ricevuto: {SCHEDULER_PCT_START}"
@@ -223,7 +226,7 @@ if not (0.0 < SCHEDULER_PCT_START < 1.0):
 
 # Curriculum dell'orizzonte multi-step:
 # partiamo prudenti e cresciamo solo dopo plateau sul validation teacher-forced.
-MULTISTEP_H_START = _env_int("QSP_MULTISTEP_H_START", min(8, int(SEQ_LEN)))
+MULTISTEP_H_START = _env_int("QSP_MULTISTEP_H_START", min(20, int(SEQ_LEN)))
 MULTISTEP_H_MAX = _env_int("QSP_MULTISTEP_H_MAX", min(100, int(SEQ_LEN)))
 # Alias retrocompatibile: rappresenta l'orizzonte massimo/evaluation horizon.
 MULTISTEP_H = _env_int("QSP_MULTISTEP_H", int(MULTISTEP_H_MAX))
@@ -254,18 +257,18 @@ if MULTISTEP_TEACHER_FORCING_STEPS < 0:
         f"ricevuto: {MULTISTEP_TEACHER_FORCING_STEPS}"
     )
 MULTISTEP_EFFECTIVE_TEACHER_FORCING_STEPS = max(1, min(int(MULTISTEP_H), int(MULTISTEP_H) // 2))
-HYBRID_TEACHER_FORCING_EPOCHS = _env_int("QSP_HYBRID_TEACHER_FORCING_EPOCHS", min(int(EPOCHS), 600))
+HYBRID_TEACHER_FORCING_EPOCHS = _env_int("QSP_HYBRID_TEACHER_FORCING_EPOCHS", min(int(EPOCHS), 30))
 MULTISTEP_TRAIN_VERBOSE = _env_bool("QSP_MULTISTEP_TRAIN_VERBOSE", False)
-TRAIN_DIAGNOSTICS = _env_bool("QSP_TRAIN_DIAGNOSTICS", True)
-TRAIN_DIAG_BATCH_PRINTS = _env_int("QSP_TRAIN_DIAG_BATCH_PRINTS", 2)
+TRAIN_DIAGNOSTICS = _env_bool("QSP_TRAIN_DIAGNOSTICS", False)
+TRAIN_DIAG_BATCH_PRINTS = _env_int("QSP_TRAIN_DIAG_BATCH_PRINTS", 0)
 if TRAIN_DIAG_BATCH_PRINTS < 0:
     raise ValueError(
         f"TRAIN_DIAG_BATCH_PRINTS deve essere >= 0, ricevuto: {TRAIN_DIAG_BATCH_PRINTS}"
     )
-MULTISTEP_H_PLATEAU_PATIENCE = _env_int("QSP_MULTISTEP_H_PLATEAU_PATIENCE", 250)
-MULTISTEP_H_PLATEAU_MIN_DELTA = _env_float("QSP_MULTISTEP_H_PLATEAU_MIN_DELTA", 1e-4)
-EARLY_STOPPING_PATIENCE = _env_int("QSP_EARLY_STOPPING_PATIENCE", 600)
-EARLY_STOPPING_MIN_EPOCHS = _env_int("QSP_EARLY_STOPPING_MIN_EPOCHS", HYBRID_TEACHER_FORCING_EPOCHS)
+MULTISTEP_H_PLATEAU_PATIENCE = _env_int("QSP_MULTISTEP_H_PLATEAU_PATIENCE", 2)
+MULTISTEP_H_PLATEAU_MIN_DELTA = _env_float("QSP_MULTISTEP_H_PLATEAU_MIN_DELTA", 5e-4)
+EARLY_STOPPING_PATIENCE = _env_int("QSP_EARLY_STOPPING_PATIENCE", 260)
+EARLY_STOPPING_MIN_EPOCHS = _env_int("QSP_EARLY_STOPPING_MIN_EPOCHS", min(int(EPOCHS), 300))
 if MULTISTEP_H_PLATEAU_PATIENCE < 1:
     raise ValueError(
         f"MULTISTEP_H_PLATEAU_PATIENCE deve essere >= 1, ricevuto: {MULTISTEP_H_PLATEAU_PATIENCE}"
