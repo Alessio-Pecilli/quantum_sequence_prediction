@@ -382,8 +382,9 @@ def _training_phase_for_epoch(epoch: int) -> str:
     return "teacher_forced" if int(epoch) <= _teacher_forcing_epochs() else "hybrid"
 
 
-def _scheduler_total_steps(num_batches: int) -> int:
-    total = max(1, int(config.EPOCHS) * int(num_batches))
+def _scheduler_total_steps(num_batches: int, *, start_epoch: int = 1) -> int:
+    remaining_epochs = max(1, int(config.EPOCHS) - int(start_epoch) + 1)
+    total = max(1, remaining_epochs * int(num_batches))
     cap = int(config.SCHEDULER_TOTAL_STEPS_CAP)
     if cap > 0:
         return max(1, min(total, cap))
@@ -814,12 +815,20 @@ def train_model(
         )
     use_amp = bool(config.USE_AMP) and config.DEVICE == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-    total_scheduler_steps = _scheduler_total_steps(steps_per_epoch)
-    if _is_main_process() and int(config.SCHEDULER_TOTAL_STEPS_CAP) > 0:
+    scheduler_reinitialized = scheduler_state_dict is None
+    scheduler_start_epoch = int(start_epoch) if scheduler_reinitialized else 1
+    total_scheduler_steps = _scheduler_total_steps(
+        steps_per_epoch,
+        start_epoch=scheduler_start_epoch,
+    )
+    if _is_main_process():
+        full_run_steps = max(1, int(config.EPOCHS) * int(steps_per_epoch))
+        remaining_epochs = max(1, int(config.EPOCHS) - scheduler_start_epoch + 1)
         print(
             f"[scheduler] total_steps={total_scheduler_steps} "
-            f"(cap={int(config.SCHEDULER_TOTAL_STEPS_CAP)}, "
-            f"uncapped={int(config.EPOCHS) * int(steps_per_epoch)})"
+            f"(epochs_remaining={remaining_epochs}, full_run_steps={full_run_steps}, "
+            f"cap={int(config.SCHEDULER_TOTAL_STEPS_CAP)}, "
+            f"reinit={'yes' if scheduler_reinitialized else 'no'})"
         )
 
     # OneCycleLR sul numero reale di update del training ibrido.
@@ -1039,7 +1048,7 @@ def train_model(
                 if teacher_metric.loss + float(config.MULTISTEP_H_PLATEAU_MIN_DELTA) < plateau_best_tf_loss:
                     plateau_best_tf_loss = float(teacher_metric.loss)
                     plateau_epochs = 0
-                else:
+                elif current_horizon < int(config.MULTISTEP_H_MAX):
                     plateau_epochs += 1
             else:
                 epoch_objective = -float(epoch_loss)

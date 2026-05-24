@@ -213,7 +213,8 @@ if RESUME_HORIZON_OVERRIDE < 0:
     )
 # Cap opzionale per evitare warmup eccessivamente lenti in run con molte epoche.
 # 0 disattiva il cap.
-SCHEDULER_TOTAL_STEPS_CAP = _env_int("QSP_SCHEDULER_TOTAL_STEPS_CAP", 4200)
+# 0 = nessun cap: OneCycleLR copre tutte le epoche (o quelle rimanenti in resume).
+SCHEDULER_TOTAL_STEPS_CAP = _env_int("QSP_SCHEDULER_TOTAL_STEPS_CAP", 0)
 if SCHEDULER_TOTAL_STEPS_CAP < 0:
     raise ValueError(
         f"SCHEDULER_TOTAL_STEPS_CAP deve essere >= 0, ricevuto: {SCHEDULER_TOTAL_STEPS_CAP}"

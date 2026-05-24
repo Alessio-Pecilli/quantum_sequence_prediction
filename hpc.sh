@@ -79,10 +79,12 @@ export QSP_TRAIN_SEQUENCES=1600
 export QSP_TEST_SEQUENCES=400
 export QSP_EARLY_STOPPING_MIN_EPOCHS=300
 export QSP_EARLY_STOPPING_PATIENCE=260
-export QSP_SCHEDULER_TOTAL_STEPS_CAP=4200
+export QSP_SCHEDULER_TOTAL_STEPS_CAP=0
 export QSP_SCHEDULER_PCT_START=0.05
 export QSP_AUTO_RESUME=1
-export QSP_RESET_OPTIMIZER_ON_RESUME=0
+# Al resume: reinizializza optimizer/scheduler con LR cycle sulle epoche rimanenti.
+# Dopo un run completato con successo, puoi rimettere 0 per resume "soft".
+export QSP_RESET_OPTIMIZER_ON_RESUME=1
 export QSP_RESUME_HORIZON_OVERRIDE=0
 
 # Under sbatch, $0 points to a temporary copy in /var/spool/slurmd/... .
