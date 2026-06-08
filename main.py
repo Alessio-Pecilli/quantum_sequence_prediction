@@ -232,6 +232,10 @@ def main():
             f"Checkpoint last:       "
             f"{'trovato' if config.LAST_CHECKPOINT_PATH.exists() else 'assente'} | {config.LAST_CHECKPOINT_PATH}"
         )
+        if config.EVAL_AT_START_ONLY:
+            print("Modalita:              eval@start-only (test rapido, nessun training)")
+        elif config.EVAL_AT_START:
+            print("Modalita:              eval@start + training")
         print("=" * 78)
 
     model = build_model()
@@ -423,6 +427,8 @@ def main():
             "DROPOUT": float(config.DROPOUT),
             "ROLLOUT_WARMUP_STATES": int(config.ROLLOUT_WARMUP_STATES),
             "EVAL_ONLY": bool(config.EVAL_ONLY),
+            "EVAL_AT_START": bool(config.EVAL_AT_START),
+            "EVAL_AT_START_ONLY": bool(config.EVAL_AT_START_ONLY),
             "AUTO_RESUME": bool(config.AUTO_RESUME),
             "PARTIAL_WARMUP_STEPS": config.PARTIAL_WARMUP_STEPS,
             "OBSERVABLES_TEST_SEQUENCE_INDEX": int(config.OBSERVABLES_TEST_SEQUENCE_INDEX),

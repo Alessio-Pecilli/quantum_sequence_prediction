@@ -761,6 +761,51 @@ def _save_last_checkpoint(
     )
 
 
+def _run_validation_eval(
+    model: torch.nn.Module,
+    validation_states: torch.Tensor,
+    validation_params: torch.Tensor,
+    eval_horizon: int,
+) -> tuple[EvaluationResult, EvaluationResult]:
+    teacher_metric = evaluate_teacher_forced(model, validation_states, validation_params)
+    multistep_metric = evaluate_multistep(
+        model,
+        validation_states,
+        validation_params,
+        horizon_limit=eval_horizon,
+        teacher_steps_override=_effective_multistep_teacher_steps(eval_horizon),
+    )
+    return teacher_metric, multistep_metric
+
+
+def _print_startup_validation(
+    *,
+    next_epoch: int,
+    teacher_metric: EvaluationResult,
+    multistep_metric: EvaluationResult,
+    eval_horizon: int,
+    train_horizon: int,
+    best_objective: float,
+    early_stop_counter: int,
+    learning_rate: float,
+    resumed: bool,
+    last_completed_epoch: int,
+) -> None:
+    score = float(multistep_metric.mean_fidelity)
+    resume_note = (
+        f"resume_da_ep={last_completed_epoch} | "
+        if resumed and last_completed_epoch > 0
+        else ""
+    )
+    print(
+        f"  [eval@start] {resume_note}prossima_epoca={next_epoch}/{config.EPOCHS} | "
+        f"val(tf/ms)=({teacher_metric.mean_fidelity:.3f}/{multistep_metric.mean_fidelity:.3f}) | "
+        f"score={score:.3f} | H_train={train_horizon} | H_eval={eval_horizon} | "
+        f"best_score={best_objective:.3f} | es={early_stop_counter} | lr={learning_rate:.2e}",
+        flush=True,
+    )
+
+
 def train_model(
     model: torch.nn.Module,
     train_states: torch.Tensor,
@@ -880,6 +925,47 @@ def train_model(
     last_completed_epoch = history.epochs[-1] if history.epochs else max(0, start_epoch - 1)
     interrupted = False
     try:
+        if validation_states is not None and (
+            config.EVAL_AT_START or config.EVAL_AT_START_ONLY
+        ):
+            if validation_params is None:
+                raise ValueError("validation_params e' richiesto quando validation_states non e' None.")
+            startup_teacher, startup_multistep = _run_validation_eval(
+                model,
+                validation_states,
+                validation_params,
+                eval_horizon,
+            )
+            if _is_main_process():
+                _print_startup_validation(
+                    next_epoch=max(1, start_epoch),
+                    teacher_metric=startup_teacher,
+                    multistep_metric=startup_multistep,
+                    eval_horizon=eval_horizon,
+                    train_horizon=current_horizon,
+                    best_objective=best_objective,
+                    early_stop_counter=early_stop_counter,
+                    learning_rate=float(optimizer.param_groups[0]["lr"]),
+                    resumed=start_epoch > 1,
+                    last_completed_epoch=last_completed_epoch,
+                )
+            if config.EVAL_AT_START_ONLY:
+                if _is_main_process():
+                    print(
+                        "  [eval@start] stop: QSP_EVAL_AT_START_ONLY=1, training saltato.",
+                        flush=True,
+                    )
+                adaptive_trace = AdaptiveTrainingTrace(
+                    enabled=False,
+                    initial_horizon=initial_horizon,
+                    initial_teacher_steps=initial_teacher_steps,
+                    final_horizon=int(current_horizon),
+                    final_teacher_steps=int(_effective_multistep_teacher_steps(current_horizon)),
+                    epoch_summaries=adaptive_epoch_summaries,
+                )
+                return history, adaptive_trace, selection_trace
+            model.train()
+
         for epoch in range(max(1, start_epoch), config.EPOCHS + 1):
             epoch_start = time.perf_counter()
             model.train()
@@ -1036,13 +1122,11 @@ def train_model(
             if validation_states is not None:
                 if validation_params is None:
                     raise ValueError("validation_params e' richiesto quando validation_states non e' None.")
-                teacher_metric = evaluate_teacher_forced(model, validation_states, validation_params)
-                multistep_metric = evaluate_multistep(
+                teacher_metric, multistep_metric = _run_validation_eval(
                     model,
                     validation_states,
                     validation_params,
-                    horizon_limit=eval_horizon,
-                    teacher_steps_override=_effective_multistep_teacher_steps(eval_horizon),
+                    eval_horizon,
                 )
                 epoch_objective = float(multistep_metric.mean_fidelity)
                 if teacher_metric.loss + float(config.MULTISTEP_H_PLATEAU_MIN_DELTA) < plateau_best_tf_loss:

@@ -431,6 +431,10 @@ HPC_DIST_SEED_STRIDE = _env_int("QSP_HPC_DIST_SEED_STRIDE", 1_000_003)
 SAVE_MODEL = _env_bool("QSP_SAVE_MODEL", True)
 # Se attivo, salta il training e ricalcola metriche/plot da best_model.pt.
 EVAL_ONLY = _env_bool("QSP_EVAL_ONLY", False)
+# Valuta subito il validation split prima della prima epoca di training.
+EVAL_AT_START = _env_bool("QSP_EVAL_AT_START", True)
+# Valuta all'avvio (pesi da auto-resume) e termina senza training.
+EVAL_AT_START_ONLY = _env_bool("QSP_EVAL_AT_START_ONLY", False)
 # Resume automatico: riparte dall'ultimo checkpoint compatibile se presente.
 AUTO_RESUME = _env_bool("QSP_AUTO_RESUME", True)
 CHECKPOINT_EVERY_EPOCH = _env_int("QSP_CHECKPOINT_EVERY_EPOCH", 1)
